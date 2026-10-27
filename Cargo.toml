@@ -16,3 +16,8 @@ publish = false
 gigamux-core = { path = "crates/gigamux-core" }
 eframe = "0.31"
 egui = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+rfd = "0.15"
+regex = "1"
