@@ -441,7 +441,7 @@ impl GigaMuxApp {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect()
         });
 
@@ -458,7 +458,7 @@ impl GigaMuxApp {
             let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255));
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("dnd_overlay"),
+                egui::Id::unique("dnd_overlay"),
             ));
             if target_input {
                 if let Some(r) = self.input_rect {
@@ -723,7 +723,7 @@ impl GigaMuxApp {
             self.log_open = !self.log_open;
         }
         // Skip remaining keys when a text field has focus.
-        if ctx.wants_keyboard_input() {
+        if ctx.egui_wants_keyboard_input() {
             return;
         }
         if f5 {
@@ -928,16 +928,16 @@ impl GigaMuxApp {
         });
     }
 
-    fn ui_menu(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+    fn ui_menu(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("menu").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Import profile…").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.import_profile();
                     }
                     if ui.button("Export profile…").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.export_profile();
                     }
                 });
@@ -1035,15 +1035,15 @@ impl GigaMuxApp {
                                         .clicked()
                                 {
                                     self.select_file(FileSide::Input, name.clone());
-                                    self.start_encode(Some(name.clone()));
-                                    ui.close_menu();
-                                }
+                                        self.start_encode(Some(name.clone()));
+                                        ui.close();
+                                    }
                                 if ui.button("Open in player").clicked() {
                                     self.select_file(side, name.clone());
                                     if let Err(e) = open_path_in_os(path) {
                                         self.push_session(format!("open failed: {e}"));
                                     }
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui
                                     .add_enabled(!self.busy, egui::Button::new("Delete"))
@@ -1051,7 +1051,7 @@ impl GigaMuxApp {
                                 {
                                     self.select_file(side, name.clone());
                                     self.delete_active();
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         }
@@ -1130,7 +1130,7 @@ impl GigaMuxApp {
     }
 
     /// Dual encode bars sit in their own bottom panel (above the log), so the log strip never clips them.
-    fn ui_progress_panel(&mut self, ctx: &egui::Context) {
+    fn ui_progress_panel(&mut self, ui: &mut egui::Ui) {
         let Some(prog) = self.encode_progress.as_ref() else {
             return;
         };
@@ -1152,9 +1152,9 @@ impl GigaMuxApp {
             if prog.total_files == 1 { "" } else { "s" }
         );
 
-        egui::TopBottomPanel::bottom("encode_progress")
-            .exact_height(78.0)
-            .show(ctx, |ui| {
+        egui::Panel::bottom("encode_progress")
+            .exact_size(78.0)
+            .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     let bar_w = (ui.available_width() - 24.0).clamp(160.0, 640.0);
                     ui.label(egui::RichText::new(file_caption).small());
@@ -1435,10 +1435,10 @@ impl GigaMuxApp {
             });
     }
 
-    fn ui_log_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("log_bar")
-            .exact_height(if self.log_open { 220.0 } else { 28.0 })
-            .show(ctx, |ui| {
+    fn ui_log_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("log_bar")
+            .exact_size(if self.log_open { 220.0 } else { 28.0 })
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let log_name = self.log_file_name();
                     let showing_session = self.log_show_session || log_name.is_none();
@@ -1650,7 +1650,7 @@ fn open_path_in_os(path: &Path) -> Result<(), String> {
 }
 
 impl eframe::App for GigaMuxApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events(ctx);
         // Keep elapsed / ETA labels ticking while encode bars are visible.
         if self.encode_progress.is_some() {
@@ -1658,13 +1658,18 @@ impl eframe::App for GigaMuxApp {
         }
         self.poll_preview_cache(ctx);
         self.handle_shortcuts(ctx);
-        self.handle_folder_dnd(ctx);
-        self.ui_menu(ctx);
-        // Bottom panels stack upward: log first (edge), then progress above it.
-        self.ui_log_panel(ctx);
-        self.ui_progress_panel(ctx);
+    }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        // DnD paints an overlay, so it belongs in ui (not logic).
+        self.handle_folder_dnd(&ctx);
+        self.ui_menu(ui);
+        // Bottom panels stack upward: log first (edge), then progress above it.
+        self.ui_log_panel(ui);
+        self.ui_progress_panel(ui);
+
+        egui::CentralPanel::default().show(ui, |ui| {
             let total = ui.available_size();
             let (in_w, center_w, out_w, content_w) = self.column_widths(total.x);
             let scroll = content_w > total.x + 0.5;
@@ -1711,11 +1716,11 @@ impl eframe::App for GigaMuxApp {
             }
         });
 
-        self.ui_settings(ctx);
-        self.ui_check_prompt(ctx);
+        self.ui_settings(&ctx);
+        self.ui_check_prompt(&ctx);
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         let _ = prefs::save(&self.prefs);
     }
 }

@@ -16,3 +16,7 @@ eframe = { workspace = true }
 egui = { workspace = true }
 rfd = { workspace = true }
 chrono = { workspace = true }
+
+# Force gpu-allocator onto the same `windows` as wgpu-hal (0.62); otherwise the lockfile can pick windows 0.58 for gpu-allocator and break the D3D12 build with egui/eframe 0.37.
+[target.'cfg(windows)'.dependencies]
+windows = "0.62"
