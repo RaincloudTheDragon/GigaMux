@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::gpu::GpuChoice;
 use crate::probe::{
-    audio_bitrate_k, file_info, require_tools, video_bitrate_k, video_codec_name, video_has_alpha,
+    audio_bitrate_k, file_info, require_tools, video_ceiling_k, video_codec_name, video_has_alpha,
 };
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm"];
@@ -44,6 +44,8 @@ pub struct EncodeOptions {
     pub output_dir: PathBuf,
     pub gpu: GpuChoice,
     pub preserve_obs_metadata: bool,
+    /// Ceiling from 1s video peak when true; otherwise average rate.
+    pub use_peak_bitrate: bool,
     /// When set, only encode these basenames (right-click selection). `None` = all inputs.
     pub only_names: Option<Vec<String>>,
 }
@@ -111,6 +113,7 @@ fn build_cmd(
     cmd.push(input.to_string_lossy().into_owned());
 
     if has_alpha {
+        // CRF0 visually lossless; -maxrate kept intentionally (libvpx ignores it at CRF0).
         cmd.extend([
             "-c:v".into(),
             "libvpx-vp9".into(),
@@ -133,11 +136,9 @@ fn build_cmd(
             "-row-mt".into(),
             "1".into(),
             "-crf".into(),
-            "10".into(),
-            "-b:v".into(),
-            ceiling,
-            "-overshoot-pct".into(),
             "0".into(),
+            "-maxrate".into(),
+            ceiling,
             "-c:a".into(),
             "copy".into(),
             "-map".into(),
@@ -466,7 +467,8 @@ pub fn run_batch(
             total: total_files,
             duration_s,
         });
-        let (bitrate_k, src_label) = video_bitrate_k(&input, &info);
+        let (bitrate_k, src_label) =
+            video_ceiling_k(&input, &info, opts.use_peak_bitrate);
         on_event(EncodeEvent::Log(format!(
             "{name}: {} → {}, {bitrate_k}k ({src_label}), gpu={}",
             if has_alpha { "alpha VP9" } else { "opaque HEVC" },

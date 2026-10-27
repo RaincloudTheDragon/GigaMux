@@ -1,4 +1,4 @@
-//! AppData prefs (input/output folders, GPU, OBS metadata flag).
+//! AppData prefs (folders, GPU, OBS metadata, bitrate ceiling mode).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,9 @@ pub struct Prefs {
     pub output_dir: PathBuf,
     pub gpu: GpuChoice,
     pub preserve_obs_metadata: bool,
+    /// When true, encode ceiling uses 1s video peak; default is average rate (CBR-oriented).
+    #[serde(default)]
+    pub use_peak_bitrate: bool,
 }
 
 impl Default for Prefs {
@@ -24,6 +27,7 @@ impl Default for Prefs {
             output_dir: PathBuf::new(),
             gpu: GpuChoice::Any,
             preserve_obs_metadata: false,
+            use_peak_bitrate: false,
         }
     }
 }

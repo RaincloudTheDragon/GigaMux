@@ -600,6 +600,7 @@ impl GigaMuxApp {
             output_dir: self.prefs.output_dir.clone(),
             gpu: self.prefs.gpu,
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
+            use_peak_bitrate: self.prefs.use_peak_bitrate,
             only_names: only_name.clone().map(|n| vec![n]),
         };
         let cancel = Arc::clone(&self.cancel);
@@ -1418,6 +1419,13 @@ impl GigaMuxApp {
                 )
                 .on_hover_text(
                     "Keep creation time / chapters / tags from OBS Hybrid MP4 across re-encode",
+                );
+                ui.checkbox(
+                    &mut self.prefs.use_peak_bitrate,
+                    "Ceiling from peak rate",
+                )
+                .on_hover_text(
+                    "Off (default): use average video bitrate. On: use 1s video peak.",
                 );
                 ui.separator();
                 if ui.button("Close").clicked() {

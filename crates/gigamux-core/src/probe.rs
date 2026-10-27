@@ -614,6 +614,13 @@ pub fn thumbnail_rgba(path: &Path, duration_s: f64) -> Result<RgbaThumb, String>
     })
 }
 
+fn format_duration_s(info: &Value) -> f64 {
+    info.get("format")
+        .and_then(|fmt| fmt.get("duration"))
+        .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()))
+        .unwrap_or(0.0)
+}
+
 /// Average **video-stream** kbps (v:0 only — never container/total).
 fn video_avg_bitrate_k(path: &Path, duration_s: f64) -> u32 {
     if let Some(bps) = stream_bitrate_bps(path, "v:0") {
@@ -631,25 +638,19 @@ fn video_avg_bitrate_k(path: &Path, duration_s: f64) -> u32 {
     0
 }
 
-/// Peak **video-stream** kbps for CQ0/CRF maxrate (never container/total bitrate).
-/// Audio is left alone by the encode path except WebM→MP4 AAC remux.
-pub fn video_bitrate_k(path: &Path, info: &Value) -> (u32, String) {
-    let fmt = info.get("format").cloned().unwrap_or(Value::Null);
-    let mut dur = fmt
-        .get("duration")
-        .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()))
-        .unwrap_or(0.0);
-
+fn video_duration_s(path: &Path, info: &Value) -> f64 {
+    let mut dur = format_duration_s(info);
     if dur <= 0.0 {
         if let Ok(fresh) = file_info(path) {
-            dur = fresh
-                .pointer("/format/duration")
-                .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()))
-                .unwrap_or(0.0);
+            dur = format_duration_s(&fresh);
         }
     }
+    dur
+}
 
-    // v:0 packet peak only — do not fall back to format/size (those include audio).
+/// Peak **video-stream** kbps (v:0 packet peak; never container/total).
+pub fn video_peak_bitrate_k(path: &Path, info: &Value) -> (u32, String) {
+    let dur = video_duration_s(path, info);
     if let Some(bps) = video_peak_bitrate_bps(path, dur) {
         return (
             ((bps + 500) / 1000).max(1) as u32,
@@ -662,11 +663,30 @@ pub fn video_bitrate_k(path: &Path, info: &Value) -> (u32, String) {
             "video stream bit_rate (v:0)".into(),
         );
     }
-
     (
         DEFAULT_BITRATE_K,
         format!("default ({DEFAULT_BITRATE_K}k; video probe failed)"),
     )
+}
+
+/// Encode ceiling kbps: average by default (CBR-oriented); optional 1s peak.
+pub fn video_ceiling_k(path: &Path, info: &Value, use_peak: bool) -> (u32, String) {
+    if use_peak {
+        return video_peak_bitrate_k(path, info);
+    }
+    let dur = video_duration_s(path, info);
+    let avg = video_avg_bitrate_k(path, dur);
+    if avg > 0 {
+        return (avg, "video avg (v:0)".into());
+    }
+    // Avg probe empty — fall back through peak / stream / default.
+    let (k, label) = video_peak_bitrate_k(path, info);
+    (k, format!("{label}; avg unavailable"))
+}
+
+/// Peak **video-stream** kbps for preview / legacy callers.
+pub fn video_bitrate_k(path: &Path, info: &Value) -> (u32, String) {
+    video_peak_bitrate_k(path, info)
 }
 
 /// Source audio kbps for Opus/Vorbis→AAC remux.

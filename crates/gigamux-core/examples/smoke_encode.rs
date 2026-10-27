@@ -17,6 +17,7 @@ fn main() {
         output_dir: output,
         gpu: GpuChoice::Any,
         preserve_obs_metadata: false,
+        use_peak_bitrate: false,
         only_names: None,
     };
     run_batch(opts, Arc::new(AtomicBool::new(false)), |ev| match ev {
