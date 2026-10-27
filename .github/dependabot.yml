@@ -6,6 +6,15 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    groups:
+      # egui + eframe share a version and lockfile — bump as one PR.
+      egui:
+        patterns:
+          - "egui*"
+          - "eframe"
+          - "epaint*"
+          - "ecolor"
+          - "emath"
 
   - package-ecosystem: github-actions
     directory: "/"
