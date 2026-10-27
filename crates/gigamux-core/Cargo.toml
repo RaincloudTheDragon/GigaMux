@@ -1,0 +1,9 @@
+[package]
+name = "gigamux-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "GigaMux core logic (encode, prefs, Flamenco) — no UI"
+
+[dependencies]
