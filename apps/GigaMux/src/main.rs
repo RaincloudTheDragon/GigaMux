@@ -226,7 +226,7 @@ impl GigaMuxApp {
             encode_progress: None,
         };
         app.refresh_lists();
-        let started = chrono_like_stamp();
+        let started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         app.push_session(format!("—— session start {started} ——"));
         app
     }
@@ -1592,43 +1592,6 @@ fn trim_log(lines: &mut Vec<String>) {
     if lines.len() > 500 {
         let drain = lines.len() - 500;
         lines.drain(0..drain);
-    }
-}
-
-/// Local wall-clock stamp for session separators (no chrono dependency).
-fn chrono_like_stamp() -> String {
-    #[cfg(windows)]
-    {
-        use std::mem::MaybeUninit;
-        #[repr(C)]
-        struct SystemTimeWin {
-            year: u16,
-            month: u16,
-            _day_of_week: u16,
-            day: u16,
-            hour: u16,
-            minute: u16,
-            second: u16,
-            _milliseconds: u16,
-        }
-        extern "system" {
-            fn GetLocalTime(lp: *mut SystemTimeWin);
-        }
-        let mut st = MaybeUninit::<SystemTimeWin>::uninit();
-        unsafe { GetLocalTime(st.as_mut_ptr()) };
-        let st = unsafe { st.assume_init() };
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            st.year, st.month, st.day, st.hour, st.minute, st.second
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| format!("{}s unix", d.as_secs()))
-            .unwrap_or_else(|_| "unknown".into())
     }
 }
 
