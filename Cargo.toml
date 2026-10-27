@@ -9,7 +9,7 @@ default-members = ["apps/GigaMux"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Unlicense"
 publish = false
 
 [workspace.dependencies]
