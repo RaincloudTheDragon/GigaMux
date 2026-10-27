@@ -1,0 +1,35 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Encode I/O (future)
+input/
+output/
+logs/
+tmp/
+
+# Media
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.flv
+*.webm
+*.ts
+*.m2ts
+*.mts
+*.DVR.mp4
+
+# IDE / editor
+.idea/
+.vscode/
+.specstory/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
