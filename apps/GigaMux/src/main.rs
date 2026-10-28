@@ -17,8 +17,8 @@ use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::probe::{
-    format_bytes, format_length, media_summary, thumbnail_rgba, FrameTiming, MediaSummary,
-    RgbaThumb, THUMB_W,
+    codec_tag, format_bytes, format_length, media_summary, thumbnail_rgba, FrameTiming,
+    MediaSummary, RgbaThumb, THUMB_W,
 };
 
 /// Live dual-bar encode progress (current file + whole batch).
@@ -1015,7 +1015,24 @@ impl GigaMuxApp {
                                 .active
                                 .as_ref()
                                 .is_some_and(|(s, n)| *s == side && n == &name);
-                            let resp = ui.selectable_label(selected, &name);
+                            // Codec/α tag from preview cache; muted … while the worker is still probing.
+                            let cache_key = Self::preview_key(side, &name);
+                            let tag_label: Option<String> =
+                                self.preview_cache.get(&cache_key).and_then(|e| {
+                                    if e.pending {
+                                        return Some("…".into());
+                                    }
+                                    e.summary.as_ref().and_then(|r| r.as_ref().ok()).map(codec_tag)
+                                });
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    let resp = ui.selectable_label(selected, &name);
+                                    if let Some(tag) = &tag_label {
+                                        ui.label(egui::RichText::new(tag).weak().small());
+                                    }
+                                    resp
+                                })
+                                .inner;
                             if resp.clicked() {
                                 self.select_file(side, name.clone());
                             }
@@ -1243,9 +1260,10 @@ impl GigaMuxApp {
 
     fn ui_meta_table(ui: &mut egui::Ui, s: &MediaSummary) {
         let yes_no = |b: bool| if b { "yes" } else { "no" };
+        // Same tag form as side lists (`VP9 α`), then optional profile.
         let codec_v = match &s.video_profile {
-            Some(p) => format!("{} ({p})", s.video_codec),
-            None => s.video_codec.clone(),
+            Some(p) => format!("{} ({p})", codec_tag(s)),
+            None => codec_tag(s),
         };
         let timing = match s.timing {
             FrameTiming::Cfr => "CFR",
@@ -1324,9 +1342,7 @@ impl GigaMuxApp {
                         "no".into()
                     },
                 );
-                if s.has_alpha {
-                    row(ui, "Alpha", "yes");
-                }
+                row(ui, "α", yes_no(s.has_alpha));
 
                 // Blank row between sections (no add_space — illegal inside Grid).
                 ui.label("");

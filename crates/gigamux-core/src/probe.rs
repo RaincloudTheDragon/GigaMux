@@ -7,6 +7,7 @@ use std::process::Command;
 use serde_json::Value;
 
 const DEFAULT_BITRATE_K: u32 = 20_000;
+// Explicit alpha pix_fmts; yuva*/gbra* families are also matched by prefix in video_has_alpha.
 const ALPHA_PIX_FMTS: &[&str] = &[
     "yuva420p",
     "yuva422p",
@@ -16,6 +17,15 @@ const ALPHA_PIX_FMTS: &[&str] = &[
     "bgra",
     "argb",
     "abgr",
+    "rgba64le",
+    "rgba64be",
+    "bgra64le",
+    "bgra64be",
+    "ya8",
+    "ya16le",
+    "ya16be",
+    "ayuv64le",
+    "ayuv64be",
 ];
 
 /// Run ffprobe JSON for format + streams + chapters.
@@ -107,7 +117,7 @@ fn first_video_stream(info: &Value) -> Option<&Value> {
     })
 }
 
-/// True when the first video stream has alpha (pix_fmt or alpha_mode tag).
+/// True when the first video stream has alpha (pix_fmt, ProRes 4444 profile, or alpha_mode tag).
 pub fn video_has_alpha(info: &Value) -> bool {
     let Some(stream) = first_video_stream(info) else {
         return false;
@@ -121,6 +131,22 @@ pub fn video_has_alpha(info: &Value) -> bool {
     {
         return true;
     }
+    // ProRes 4444 / 4444 XQ carry alpha even when pix_fmt probing is thin.
+    let codec = stream
+        .get("codec_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if codec.starts_with("prores") {
+        let profile = stream
+            .get("profile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if profile.contains("4444") {
+            return true;
+        }
+    }
     let tags = stream.get("tags").and_then(|t| t.as_object());
     let Some(tags) = tags else {
         return false;
@@ -132,6 +158,15 @@ pub fn video_has_alpha(info: &Value) -> bool {
         }
     }
     false
+}
+
+/// Compact list/meta tag from a summary: e.g. `VP9 α`, `HEVC`, `ProRes α`.
+pub fn codec_tag(summary: &MediaSummary) -> String {
+    if summary.has_alpha && summary.video_codec != "—" {
+        format!("{} α", summary.video_codec)
+    } else {
+        summary.video_codec.clone()
+    }
 }
 
 pub fn video_codec_name(info: &Value) -> String {
@@ -383,10 +418,25 @@ fn display_codec_name(raw: &str) -> String {
         "vp9" => "VP9".into(),
         "vp8" => "VP8".into(),
         "av1" => "AV1".into(),
+        "prores" | "prores_ks" | "prores_aw" => "ProRes".into(),
+        "ffv1" => "FFV1".into(),
+        "dnxhd" => "DNxHD".into(),
+        "dnxhr" => "DNxHR".into(),
+        "mpeg2video" | "mpeg2" => "MPEG-2".into(),
+        "mpeg4" => "MPEG-4".into(),
+        "theora" => "Theora".into(),
+        "mjpeg" => "MJPEG".into(),
+        "qtrle" => "Animation".into(),
+        "png" => "PNG".into(),
+        "hap" => "HAP".into(),
+        "cfhd" => "CineForm".into(),
+        "utvideo" => "Ut Video".into(),
+        "rawvideo" => "Raw".into(),
         "aac" => "AAC".into(),
         "opus" => "Opus".into(),
         "mp3" => "MP3".into(),
         "flac" => "FLAC".into(),
+        "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" => "PCM".into(),
         "" | "—" => "—".into(),
         other => other.to_ascii_uppercase(),
     }

@@ -13,6 +13,6 @@ pub use encode::{run_batch, EncodeEvent, EncodeOptions};
 pub use gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 pub use prefs::Prefs;
 pub use probe::{
-    format_bytes, format_length, media_summary, thumbnail_rgba, FrameTiming, MediaSummary,
-    RgbaThumb, THUMB_W,
+    codec_tag, format_bytes, format_length, media_summary, thumbnail_rgba, FrameTiming,
+    MediaSummary, RgbaThumb, THUMB_W,
 };
