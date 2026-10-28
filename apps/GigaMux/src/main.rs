@@ -2796,10 +2796,24 @@ impl GigaMuxApp {
                         if lines.is_empty() {
                             ui.label(egui::RichText::new("(no log yet)").weak());
                         } else {
-                            for line in &lines {
-                                let color = log_line_color(line);
-                                ui.label(egui::RichText::new(line).monospace().color(color));
-                            }
+                            // Read-only TextEdit: click-drag select, Ctrl+A, copy; keeps line colors via layouter.
+                            let text = lines.join("\n");
+                            let mut text_ref: &str = text.as_str();
+                            let salt = if showing_session {
+                                "session_log_text"
+                            } else {
+                                "file_log_text"
+                            };
+                            ui.add(
+                                egui::TextEdit::multiline(&mut text_ref)
+                                    .id_salt(salt)
+                                    .desired_width(ui.available_width())
+                                    .frame(egui::Frame::NONE)
+                                    .margin(egui::Margin::ZERO)
+                                    .layouter(&mut |ui, buf, wrap_width| {
+                                        layout_log_text(ui, buf.as_str(), wrap_width)
+                                    }),
+                            );
                         }
                     });
             });
@@ -3127,6 +3141,41 @@ fn heat_chip_colors(heat: f32, dark: bool) -> (egui::Color32, egui::Color32) {
     } else {
         (hsv_rgb(hue, 0.38, 0.93), hsv_rgb(hue, 0.82, 0.42))
     }
+}
+
+/// Colored monospace galley for the log TextEdit layouter.
+fn layout_log_text(
+    ui: &egui::Ui,
+    text: &str,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    use egui::text::{LayoutJob, TextFormat};
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            job.append(
+                "\n",
+                0.0,
+                TextFormat {
+                    font_id: font_id.clone(),
+                    color: ui.visuals().text_color(),
+                    ..Default::default()
+                },
+            );
+        }
+        job.append(
+            line,
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                color: log_line_color(line),
+                ..Default::default()
+            },
+        );
+    }
+    ui.fonts_mut(|f| f.layout_job(job))
 }
 
 fn log_line_color(line: &str) -> egui::Color32 {
