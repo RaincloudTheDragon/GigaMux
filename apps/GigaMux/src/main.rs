@@ -2908,17 +2908,17 @@ impl GigaMuxApp {
                 ui.horizontal(|ui| {
                     ui.monospace(format_bytes(s.file_size_bytes));
                     match size_vs_input {
-                        Some(SizeDelta::Smaller { pct }) => {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(80, 180, 100),
-                                format!("↓{pct}%"),
-                            );
+                        Some(SizeDelta::Smaller { pct, bytes }) => {
+                            let green = egui::Color32::from_rgb(80, 180, 100);
+                            ui.colored_label(green, format!("↓{pct}%"));
+                            ui.add_space(2.0);
+                            ui.colored_label(green, format!("↓{}", format_bytes(bytes)));
                         }
-                        Some(SizeDelta::Larger { pct }) => {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(220, 90, 80),
-                                format!("↑{pct}%"),
-                            );
+                        Some(SizeDelta::Larger { pct, bytes }) => {
+                            let red = egui::Color32::from_rgb(220, 90, 80);
+                            ui.colored_label(red, format!("↑{pct}%"));
+                            ui.add_space(2.0);
+                            ui.colored_label(red, format!("↑{}", format_bytes(bytes)));
                         }
                         Some(SizeDelta::Same) | None => {}
                     }

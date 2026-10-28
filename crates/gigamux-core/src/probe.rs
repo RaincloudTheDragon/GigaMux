@@ -621,10 +621,10 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Output vs same-stem input size for UI (↓ green smaller / ↑ red larger).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeDelta {
-    /// Output smaller; `pct` is reduction rounded to whole percent.
-    Smaller { pct: u32 },
-    /// Output larger; `pct` is growth rounded to whole percent.
-    Larger { pct: u32 },
+    /// Output smaller; `pct` is reduction; `bytes` is absolute savings.
+    Smaller { pct: u32, bytes: u64 },
+    /// Output larger; `pct` is growth; `bytes` is absolute increase.
+    Larger { pct: u32, bytes: u64 },
     Same,
 }
 
@@ -637,10 +637,12 @@ pub fn size_delta(input_bytes: u64, output_bytes: u64) -> Option<SizeDelta> {
     if pct >= 0.05 {
         Some(SizeDelta::Smaller {
             pct: pct.round() as u32,
+            bytes: input_bytes.saturating_sub(output_bytes),
         })
     } else if pct <= -0.05 {
         Some(SizeDelta::Larger {
             pct: (-pct).round() as u32,
+            bytes: output_bytes.saturating_sub(input_bytes),
         })
     } else {
         Some(SizeDelta::Same)
