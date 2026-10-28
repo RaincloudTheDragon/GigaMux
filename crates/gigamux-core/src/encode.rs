@@ -2,9 +2,11 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::gpu::GpuChoice;
@@ -294,8 +296,26 @@ fn parse_ffmpeg_out_time(line: &str) -> Option<f64> {
     }
 }
 
+/// Hard-stop ffmpeg. On Windows, `Child::kill` alone often leaves shim/worker trees alive.
+fn force_kill_ffmpeg(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(windows)]
+    {
+        // /T = process tree (shims + real ffmpeg.exe); /F = force.
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Run ffmpeg and stream stderr live (progress uses `\r`; other lines use `\n`).
 /// `on_line` gets `(log_text, optional out_time_seconds from time=)`.
+/// Cancel is polled on a timer (not gated on stderr), then the process tree is force-killed.
 fn run_ffmpeg(
     argv: &[String],
     cancel: &AtomicBool,
@@ -315,10 +335,41 @@ fn run_ffmpeg(
         .take()
         .ok_or_else(|| "ffmpeg stderr missing".to_string())?;
 
-    // Byte-wise so `\r` progress updates flush as lines (same as encode_VOD.py readline).
-    let mut line = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut last_cancel_check = Instant::now();
+    // Reader thread so cancel isn't stuck behind a blocking stderr read (VP9 can stall progress).
+    let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+    thread::spawn(move || {
+        let mut line = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => {
+                    if !line.is_empty() {
+                        let _ = tx.send(Ok(std::mem::take(&mut line)));
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    for &b in &buf[..n] {
+                        if b == b'\n' || b == b'\r' {
+                            if !line.is_empty() {
+                                if tx.send(Ok(std::mem::take(&mut line))).is_err() {
+                                    return;
+                                }
+                            }
+                        } else if b != 0 {
+                            line.push(b);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("ffmpeg read: {e}")));
+                    break;
+                }
+            }
+        }
+    });
+
     let emit = |raw: &[u8], on_line: &mut dyn FnMut(String, Option<f64>)| {
         let text = String::from_utf8_lossy(raw);
         let text = text.trim();
@@ -332,44 +383,51 @@ fn run_ffmpeg(
             on_line(format!("FFmpeg: {text}"), None);
         }
     };
+
+    let poll = Duration::from_millis(50);
     loop {
-        if last_cancel_check.elapsed() > Duration::from_millis(200) {
-            last_cancel_check = Instant::now();
-            if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("cancelled".into());
-            }
+        if cancel.load(Ordering::Relaxed) {
+            force_kill_ffmpeg(&mut child);
+            return Err("cancelled".into());
         }
-        match stderr.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                for &b in &buf[..n] {
-                    if b == b'\n' || b == b'\r' {
-                        emit(&line, &mut on_line);
-                        line.clear();
-                    } else if b != 0 {
-                        line.push(b);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Drain remaining stderr lines briefly so the last progress/error shows up.
+                let deadline = Instant::now() + Duration::from_millis(200);
+                while Instant::now() < deadline {
+                    match rx.recv_timeout(Duration::from_millis(20)) {
+                        Ok(Ok(raw)) => emit(&raw, &mut on_line),
+                        Ok(Err(e)) => return Err(e),
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+                if status.success() {
+                    return Ok(());
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+                return Err(format!("ffmpeg exited with {status}"));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(None) => {}
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("ffmpeg read: {e}"));
+                force_kill_ffmpeg(&mut child);
+                return Err(format!("ffmpeg wait: {e}"));
             }
         }
-    }
-    emit(&line, &mut on_line);
-
-    let status = child.wait().map_err(|e| format!("ffmpeg wait: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else if cancel.load(Ordering::Relaxed) {
-        Err("cancelled".into())
-    } else {
-        Err(format!("ffmpeg exited with {status}"))
+        match rx.recv_timeout(poll) {
+            Ok(Ok(raw)) => emit(&raw, &mut on_line),
+            Ok(Err(e)) => {
+                force_kill_ffmpeg(&mut child);
+                return Err(e);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Reader exited (EOF); keep polling try_wait for the exit status.
+                continue;
+            }
+        }
     }
 }
 

@@ -1258,7 +1258,7 @@ impl GigaMuxApp {
         });
     }
 
-    /// Request cancel of the running encode batch (honored between files).
+    /// Request cancel of the running encode (kills in-flight ffmpeg, then stops the batch).
     fn cancel_encode(&mut self) {
         if matches!(self.job, Some(JobKind::Encode)) && self.busy {
             self.cancel.store(true, Ordering::Relaxed);
