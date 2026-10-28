@@ -448,21 +448,86 @@ pub fn permanent_delete_file(path: &Path) -> Result<(), String> {
     std::fs::remove_file(path).map_err(|e| format!("{e}"))
 }
 
+/// Normalize for Recycle Bin path compares (slash + `\\?\` + case on Windows).
+fn norm_trash_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    #[cfg(windows)]
+    {
+        s.replace('/', "\\").to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s.replace('\\', "/").to_string()
+    }
+}
+
+/// Restore a previously recycled file to `original` (Windows / Linux Trash only).
+pub fn restore_trashed_file(original: &Path) -> Result<(), String> {
+    #[cfg(any(
+        windows,
+        all(
+            unix,
+            not(target_os = "macos"),
+            not(target_os = "ios"),
+            not(target_os = "android")
+        )
+    ))]
+    {
+        let want = norm_trash_path(original);
+        let items = trash::os_limited::list().map_err(|e| format!("{e}"))?;
+        let mut matches: Vec<_> = items
+            .into_iter()
+            .filter(|i| norm_trash_path(&i.original_path()) == want)
+            .collect();
+        if matches.is_empty() {
+            return Err("not in Recycle Bin".into());
+        }
+        // Prefer the most recently deleted twin if the same path was trashed more than once.
+        matches.sort_by_key(|i| i.time_deleted);
+        let item = matches.pop().expect("non-empty matches");
+        trash::os_limited::restore_all([item]).map_err(|e| format!("{e}"))
+    }
+    #[cfg(not(any(
+        windows,
+        all(
+            unix,
+            not(target_os = "macos"),
+            not(target_os = "ios"),
+            not(target_os = "android")
+        )
+    )))]
+    {
+        let _ = original;
+        Err("Recycle Bin restore is not supported on this OS".into())
+    }
+}
+
 /// Recycle output files listed on issues (skips “Missing from output”).
-pub fn delete_issue_outputs(output_dir: &Path, issues: &[CheckIssue]) -> (usize, usize) {
+/// Returns `(ok_count, fail_count, successfully trashed absolute paths)` for undo.
+pub fn delete_issue_outputs(
+    output_dir: &Path,
+    issues: &[CheckIssue],
+) -> (usize, usize, Vec<PathBuf>) {
     let mut deleted = 0usize;
     let mut failed = 0usize;
+    let mut trashed = Vec::new();
     for issue in issues {
         if !issue_has_deletable_output(output_dir, issue) {
             continue;
         }
         let name = issue.output.as_ref().expect("deletable implies output");
-        match trash_file(&output_dir.join(name)) {
-            Ok(()) => deleted += 1,
+        let path = output_dir.join(name);
+        let recorded = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        match trash_file(&path) {
+            Ok(()) => {
+                deleted += 1;
+                trashed.push(recorded);
+            }
             Err(_) => failed += 1,
         }
     }
-    (deleted, failed)
+    (deleted, failed, trashed)
 }
 
 /// List video filenames in a folder (non-recursive).

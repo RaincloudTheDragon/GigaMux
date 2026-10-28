@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use gigamux_core::check::{
-    deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, run_check,
-    trash_file, CheckIssue, CheckReport,
+    deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, restore_trashed_file,
+    run_check, trash_file, CheckIssue, CheckReport,
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
@@ -186,6 +186,10 @@ struct GigaMuxApp {
     pending_permanent_delete: Option<PermanentDeletePrompt>,
     /// One-by-one delete cascade (list shrinks between each file).
     delete_queue: Option<DeleteQueue>,
+    /// Blender-style waypoint history (delete steps + cursor); jump undoes/redoes across Recycle Bin.
+    undo_history: UndoHistory,
+    /// Active history jump (restore and/or re-trash cascades toward a waypoint).
+    history_nav: Option<HistoryNav>,
     /// Last-frame hit rects for folder drag-and-drop targeting.
     input_rect: Option<egui::Rect>,
     output_rect: Option<egui::Rect>,
@@ -197,8 +201,10 @@ struct GigaMuxApp {
     encode_progress: Option<EncodeProgress>,
 }
 
-/// Pace between one-by-one deletes so the UI can show each row vanishing.
+/// Pace between one-by-one delete / restore steps so the list visibly moves.
 const DELETE_STEP_MS: u64 = 90;
+/// Cap Ctrl+Z undo gestures (not individual files) so the stack cannot grow without bound.
+const DELETE_UNDO_CAP: usize = 50;
 
 /// Sequential Recycle Bin job — pops one basename per step so rows vanish one-by-one.
 struct DeleteQueue {
@@ -206,6 +212,81 @@ struct DeleteQueue {
     remaining: VecDeque<String>,
     next_name: Option<String>,
     next_at: Instant,
+    /// Paths successfully recycled this cascade — committed as one Ctrl+Z batch when done.
+    recycled: Vec<PathBuf>,
+}
+
+/// One Del / check-delete gesture registered as a history waypoint.
+#[derive(Clone)]
+struct DeleteUndoBatch {
+    side: FileSide,
+    /// Absolute paths as they were before trash (Recycle Bin original_path match).
+    paths: Vec<PathBuf>,
+}
+
+/// Waypoint history: `cursor == 0` is Original; `cursor == steps.len()` is the tip.
+struct UndoHistory {
+    /// Delete steps oldest → newest. Truncated when a new delete happens while not at the tip.
+    steps: Vec<DeleteUndoBatch>,
+    cursor: usize,
+}
+
+impl UndoHistory {
+    fn new() -> Self {
+        Self {
+            steps: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    fn label_at(&self, pos: usize) -> String {
+        if pos == 0 {
+            "Original".into()
+        } else {
+            self.steps[pos - 1].action_label()
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryDir {
+    /// Restore files from the Recycle Bin (move cursor down).
+    Undo,
+    /// Re-trash files (move cursor up / redo).
+    Redo,
+}
+
+/// One history jump: pending batches, then a per-file cascade for the active batch.
+struct HistoryNav {
+    target: usize,
+    pending: VecDeque<(HistoryDir, DeleteUndoBatch)>,
+    dir: HistoryDir,
+    side: FileSide,
+    remaining: VecDeque<PathBuf>,
+    next_at: Instant,
+    touched: Vec<String>,
+}
+
+impl DeleteUndoBatch {
+    /// Menu / session label for this undo step (e.g. `Delete "a.mp4"`).
+    fn action_label(&self) -> String {
+        let names: Vec<String> = self
+            .paths
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        match names.as_slice() {
+            [] => "Delete".into(),
+            [one] => format!("Delete \"{one}\""),
+            [a, b] => format!("Delete \"{a}\", \"{b}\""),
+            _ => format!(
+                "Delete \"{}\", \"{}\", … ({} files)",
+                names[0],
+                names[1],
+                names.len()
+            ),
+        }
+    }
 }
 
 /// Post-check dialog: warn about non-intact files; optional delete of bad outputs.
@@ -272,6 +353,8 @@ impl GigaMuxApp {
             pending_recycle_delete: None,
             pending_permanent_delete: None,
             delete_queue: None,
+            undo_history: UndoHistory::new(),
+            history_nav: None,
             input_rect: None,
             output_rect: None,
             cache_gen: Arc::new(AtomicU64::new(0)),
@@ -457,6 +540,38 @@ impl GigaMuxApp {
             })
     }
 
+    /// Preview keys for recycled files still on the undo / cascade stacks (keep chips + metadata).
+    fn parked_preview_keys(&self) -> HashSet<String> {
+        let mut keys = HashSet::new();
+        let mut park = |side: FileSide, path: &Path| {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                keys.insert(Self::preview_key(side, name));
+            }
+        };
+        for batch in &self.undo_history.steps {
+            for path in &batch.paths {
+                park(batch.side, path);
+            }
+        }
+        if let Some(q) = &self.delete_queue {
+            for path in &q.recycled {
+                park(q.side, path);
+            }
+        }
+        if let Some(nav) = &self.history_nav {
+            for path in &nav.remaining {
+                park(nav.side, path);
+            }
+            for (d, batch) in &nav.pending {
+                let _ = d;
+                for path in &batch.paths {
+                    park(batch.side, path);
+                }
+            }
+        }
+        keys
+    }
+
     /// Drop stale cache entries and pre-cache thumbs/metadata for input + output files.
     fn start_preview_cache(&mut self) {
         let mut jobs: Vec<(String, PathBuf)> = Vec::new();
@@ -472,8 +587,11 @@ impl GigaMuxApp {
                 jobs.push((key, dir.join(name)));
             }
         }
-        let key_set: std::collections::HashSet<_> = jobs.iter().map(|(k, _)| k.clone()).collect();
-        self.preview_cache.retain(|k, _| key_set.contains(k));
+        let key_set: HashSet<_> = jobs.iter().map(|(k, _)| k.clone()).collect();
+        let parked = self.parked_preview_keys();
+        // Keep on-disk entries and undo-parked ones so Del→Ctrl+Z does not re-probe.
+        self.preview_cache
+            .retain(|k, _| key_set.contains(k) || parked.contains(k));
 
         let mut to_fetch = Vec::new();
         for (key, path) in jobs {
@@ -677,7 +795,9 @@ impl GigaMuxApp {
         if self.input_files.is_empty() && self.output_files.is_empty() {
             self.cache_gen.fetch_add(1, Ordering::Relaxed);
             self.cache_rx = None;
-            self.preview_cache.clear();
+            // Preserve undo-parked thumbs/metadata even when both panes are empty.
+            let parked = self.parked_preview_keys();
+            self.preview_cache.retain(|k, _| parked.contains(k));
         } else {
             self.start_preview_cache();
         }
@@ -754,7 +874,7 @@ impl GigaMuxApp {
 
     /// Encode all inputs, or only `only_name` when set (context-menu selection).
     fn start_encode(&mut self, only_name: Option<String>) {
-        if self.busy || self.delete_queue.is_some() {
+        if self.busy || self.delete_queue.is_some() || self.history_nav.is_some() {
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
@@ -849,6 +969,7 @@ impl GigaMuxApp {
         if self.pending_recycle_delete.is_some()
             || self.pending_permanent_delete.is_some()
             || self.delete_queue.is_some()
+            || self.history_nav.is_some()
         {
             return;
         }
@@ -888,7 +1009,24 @@ impl GigaMuxApp {
             remaining: names.into(),
             next_name,
             next_at: Instant::now(),
+            recycled: Vec::new(),
         });
+    }
+
+    /// Commit the cascade's recycled paths as a single Ctrl+Z batch, then clear the queue.
+    fn finish_delete_queue(&mut self) {
+        let Some(q) = self.delete_queue.take() else {
+            return;
+        };
+        let side = q.side;
+        let next_name = q.next_name;
+        if !q.recycled.is_empty() {
+            self.push_delete_undo_batch(DeleteUndoBatch {
+                side,
+                paths: q.recycled,
+            });
+        }
+        self.finish_delete_selection(side, next_name);
     }
 
     /// Pop one file from the delete queue, refresh the list, then wait briefly before the next.
@@ -910,9 +1048,7 @@ impl GigaMuxApp {
             q.remaining.pop_front()
         };
         let Some(name) = name else {
-            let next_name = self.delete_queue.as_ref().unwrap().next_name.clone();
-            self.delete_queue = None;
-            self.finish_delete_selection(side, next_name);
+            self.finish_delete_queue();
             return;
         };
 
@@ -921,9 +1057,14 @@ impl GigaMuxApp {
             FileSide::Output => self.prefs.output_dir.clone(),
         };
         let path = dir.join(&name);
+        // Capture before trash — canonicalize fails once the file is gone.
+        let undo_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
 
         match trash_file(&path) {
             Ok(()) => {
+                if let Some(q) = self.delete_queue.as_mut() {
+                    q.recycled.push(undo_path);
+                }
                 self.push_session(format!("moved to Recycle Bin: {name}"));
                 self.after_one_deleted(side, &name);
             }
@@ -967,10 +1108,10 @@ impl GigaMuxApp {
         ctx.request_repaint();
     }
 
-    /// Drop one name from selection / cache and re-list so the row vanishes this frame.
+    /// Drop one name from selection and re-list so the row vanishes this frame.
+    /// Preview cache stays until the undo stack releases it (chips survive Del→restore).
     fn after_one_deleted(&mut self, side: FileSide, name: &str) {
         self.selected.remove(name);
-        self.preview_cache.remove(&Self::preview_key(side, name));
         if self.selection_anchor.as_deref() == Some(name) {
             self.selection_anchor = self.selected.iter().next().cloned();
         }
@@ -998,6 +1139,246 @@ impl GigaMuxApp {
         } else {
             self.clear_active();
         }
+    }
+
+    /// Register a completed delete at the tip (truncates any redo branch first).
+    fn push_delete_undo_batch(&mut self, batch: DeleteUndoBatch) {
+        if batch.paths.is_empty() {
+            return;
+        }
+        let h = &mut self.undo_history;
+        h.steps.truncate(h.cursor);
+        h.steps.push(batch);
+        h.cursor = h.steps.len();
+        while h.steps.len() > DELETE_UNDO_CAP {
+            h.steps.remove(0);
+            h.cursor = h.cursor.saturating_sub(1);
+        }
+    }
+
+    /// Select every touched basename on `side` (primary = last in list order).
+    fn select_restored(&mut self, side: FileSide, names: &[String]) {
+        let present: Vec<String> = self
+            .names_for(side)
+            .into_iter()
+            .filter(|n| names.iter().any(|x| x == n))
+            .collect();
+        if present.is_empty() {
+            self.clear_active();
+            return;
+        }
+        self.selected = present.iter().cloned().collect();
+        self.selection_anchor = present.first().cloned();
+        if let Some(primary) = present.last().cloned() {
+            self.set_primary(side, primary);
+        }
+    }
+
+    fn history_idle(&self) -> bool {
+        !self.busy && self.delete_queue.is_none() && self.history_nav.is_none()
+    }
+
+    fn can_undo_delete(&self) -> bool {
+        self.history_idle() && self.undo_history.cursor > 0
+    }
+
+    fn can_redo_delete(&self) -> bool {
+        self.history_idle() && self.undo_history.cursor < self.undo_history.steps.len()
+    }
+
+    /// Ctrl+Z: move one waypoint toward Original.
+    fn undo_last_delete(&mut self) {
+        if self.undo_history.cursor == 0 {
+            self.push_session("nothing to undo");
+            return;
+        }
+        self.history_jump(self.undo_history.cursor - 1);
+    }
+
+    /// Shift+Ctrl+Z: move one waypoint toward the tip.
+    fn redo_last_delete(&mut self) {
+        if self.undo_history.cursor >= self.undo_history.steps.len() {
+            self.push_session("nothing to redo");
+            return;
+        }
+        self.history_jump(self.undo_history.cursor + 1);
+    }
+
+    /// Jump to a waypoint index (`0` = Original, `steps.len()` = tip). Blender Undo History.
+    fn history_jump(&mut self, target: usize) {
+        if !self.history_idle() {
+            self.push_session("can't jump history while a job is running");
+            self.log_open = true;
+            return;
+        }
+        let target = target.min(self.undo_history.steps.len());
+        let cursor = self.undo_history.cursor;
+        if target == cursor {
+            return;
+        }
+        let mut pending = VecDeque::new();
+        if target < cursor {
+            // Undo: restore steps[target..cursor] newest-first.
+            for i in (target..cursor).rev() {
+                pending.push_back((HistoryDir::Undo, self.undo_history.steps[i].clone()));
+            }
+        } else {
+            // Redo: re-trash steps[cursor..target] oldest-first.
+            for i in cursor..target {
+                pending.push_back((HistoryDir::Redo, self.undo_history.steps[i].clone()));
+            }
+        }
+        self.history_nav = Some(HistoryNav {
+            target,
+            pending,
+            dir: HistoryDir::Undo,
+            side: FileSide::Input,
+            remaining: VecDeque::new(),
+            next_at: Instant::now(),
+            touched: Vec::new(),
+        });
+        self.history_nav_start_next_batch();
+    }
+
+    /// Pull the next pending batch into the per-file cascade (or finish the jump).
+    fn history_nav_start_next_batch(&mut self) {
+        let Some(nav) = self.history_nav.as_mut() else {
+            return;
+        };
+        let Some((dir, batch)) = nav.pending.pop_front() else {
+            let target = nav.target;
+            let touched = nav.touched.clone();
+            let side = nav.side;
+            self.history_nav = None;
+            self.undo_history.cursor = target;
+            self.refresh_lists();
+            if !touched.is_empty() {
+                self.select_restored(side, &touched);
+            }
+            return;
+        };
+        // Advance cursor as each batch completes directionally at start of batch.
+        match dir {
+            HistoryDir::Undo => {
+                self.undo_history.cursor = self.undo_history.cursor.saturating_sub(1);
+            }
+            HistoryDir::Redo => {
+                self.undo_history.cursor =
+                    (self.undo_history.cursor + 1).min(self.undo_history.steps.len());
+            }
+        }
+        let remaining: VecDeque<PathBuf> = match dir {
+            // Last-trashed file reappears first.
+            HistoryDir::Undo => batch.paths.into_iter().rev().collect(),
+            // Same order as the original delete cascade.
+            HistoryDir::Redo => batch.paths.into_iter().collect(),
+        };
+        let side = batch.side;
+        if let Some(nav) = self.history_nav.as_mut() {
+            nav.dir = dir;
+            nav.side = side;
+            nav.remaining = remaining;
+            nav.next_at = Instant::now();
+            nav.touched.clear();
+        }
+        if self
+            .history_nav
+            .as_ref()
+            .is_some_and(|n| n.remaining.is_empty())
+        {
+            self.history_nav_start_next_batch();
+        }
+    }
+
+    /// Esc: abort the jump; cursor already reflects completed batches.
+    fn cancel_history_nav(&mut self) {
+        let Some(nav) = self.history_nav.take() else {
+            return;
+        };
+        let side = nav.side;
+        let touched = nav.touched;
+        self.refresh_lists();
+        if !touched.is_empty() {
+            self.select_restored(side, &touched);
+        }
+        self.push_session("history jump cancelled");
+    }
+
+    /// Drive one file step of the active history jump.
+    fn tick_history_nav(&mut self, ctx: &egui::Context) {
+        let Some(nav) = self.history_nav.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < nav.next_at {
+            ctx.request_repaint_after(nav.next_at.saturating_duration_since(now));
+            return;
+        }
+        if nav.remaining.is_empty() && nav.pending.is_empty() {
+            self.history_nav_start_next_batch();
+            return;
+        }
+        if nav.remaining.is_empty() {
+            // Batch done — select what this batch touched, then continue.
+            let side = nav.side;
+            let touched = nav.touched.clone();
+            self.refresh_lists();
+            if !touched.is_empty() {
+                self.select_restored(side, &touched);
+            }
+            self.history_nav_start_next_batch();
+            ctx.request_repaint();
+            return;
+        }
+
+        let dir = nav.dir;
+        let side = nav.side;
+        let path = {
+            let nav = self.history_nav.as_mut().unwrap();
+            nav.remaining.pop_front().unwrap()
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        match dir {
+            HistoryDir::Undo => match restore_trashed_file(&path) {
+                Ok(()) => {
+                    self.push_session(format!("restored from Recycle Bin: {name}"));
+                    if let Some(nav) = self.history_nav.as_mut() {
+                        nav.touched.push(name.clone());
+                    }
+                    self.refresh_lists();
+                    if let Some(nav) = self.history_nav.as_ref() {
+                        let names = nav.touched.clone();
+                        self.select_restored(side, &names);
+                    }
+                }
+                Err(e) => {
+                    self.push_session(format!("undo failed ({name}): {e}"));
+                    self.log_open = true;
+                }
+            },
+            HistoryDir::Redo => match trash_file(&path) {
+                Ok(()) => {
+                    self.push_session(format!("moved to Recycle Bin: {name}"));
+                    if let Some(nav) = self.history_nav.as_mut() {
+                        nav.touched.push(name.clone());
+                    }
+                    self.after_one_deleted(side, &name);
+                }
+                Err(e) => {
+                    self.push_session(format!("redo delete failed ({name}): {e}"));
+                    self.log_open = true;
+                }
+            },
+        }
+
+        if let Some(nav) = self.history_nav.as_mut() {
+            nav.next_at = Instant::now() + Duration::from_millis(DELETE_STEP_MS);
+        }
+        ctx.request_repaint();
     }
 
     /// Permanent-delete the prompted name(s), then resume the recycle cascade if any.
@@ -1035,10 +1416,13 @@ impl GigaMuxApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (ctrl_j, f5, f12, esc, arrow_up, arrow_down, arrow_left, arrow_right, delete) =
+        let (ctrl_j, ctrl_z, ctrl_shift_z, f5, f12, esc, arrow_up, arrow_down, arrow_left, arrow_right, delete) =
             ctx.input(|i| {
+                let z = i.key_pressed(egui::Key::Z);
                 (
                     i.modifiers.command && i.key_pressed(egui::Key::J),
+                    i.modifiers.command && !i.modifiers.shift && z,
+                    i.modifiers.command && i.modifiers.shift && z,
                     i.key_pressed(egui::Key::F5),
                     i.key_pressed(egui::Key::F12),
                     i.key_pressed(egui::Key::Escape),
@@ -1057,6 +1441,11 @@ impl GigaMuxApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        if ctrl_shift_z {
+            self.redo_last_delete();
+        } else if ctrl_z {
+            self.undo_last_delete();
+        }
         if f5 {
             self.refresh_lists();
             self.push_session("reloaded file lists");
@@ -1073,8 +1462,10 @@ impl GigaMuxApp {
             } else if self.pending_recycle_delete.is_some() {
                 self.pending_recycle_delete = None;
             } else if self.delete_queue.is_some() {
-                self.delete_queue = None;
+                self.finish_delete_queue();
                 self.push_session("delete cancelled");
+            } else if self.history_nav.is_some() {
+                self.cancel_history_nav();
             } else if self.show_settings {
                 let _ = prefs::save(&self.prefs);
                 self.show_settings = false;
@@ -1287,6 +1678,75 @@ impl GigaMuxApp {
                         ui.close();
                         self.export_profile();
                     }
+                });
+                ui.menu_button("Edit", |ui| {
+                    let can_undo = self.can_undo_delete();
+                    let can_redo = self.can_redo_delete();
+                    let undo_sc = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
+                        egui::Modifiers::COMMAND,
+                        egui::Key::Z,
+                    ));
+                    let redo_sc = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        egui::Key::Z,
+                    ));
+                    // Undo names the current waypoint action; Redo names the next tipward step.
+                    let undo_label = if self.undo_history.cursor > 0 {
+                        format!(
+                            "Undo {}",
+                            self.undo_history.label_at(self.undo_history.cursor)
+                        )
+                    } else {
+                        "Undo".into()
+                    };
+                    let redo_label = if self.undo_history.cursor < self.undo_history.steps.len() {
+                        format!(
+                            "Redo {}",
+                            self.undo_history
+                                .label_at(self.undo_history.cursor + 1)
+                        )
+                    } else {
+                        "Redo".into()
+                    };
+                    if ui
+                        .add_enabled(can_undo, egui::Button::new(undo_label).shortcut_text(undo_sc))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.undo_last_delete();
+                    }
+                    if ui
+                        .add_enabled(can_redo, egui::Button::new(redo_label).shortcut_text(redo_sc))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.redo_last_delete();
+                    }
+                    // Hover submenu: waypoints newest → Original; ● = current; click jumps.
+                    ui.menu_button("Undo History", |ui| {
+                        let idle = self.history_idle();
+                        let cursor = self.undo_history.cursor;
+                        let tip = self.undo_history.steps.len();
+                        for pos in (0..=tip).rev() {
+                            let label = self.undo_history.label_at(pos);
+                            let is_here = pos == cursor;
+                            ui.horizontal(|ui| {
+                                if is_here {
+                                    ui.label("●");
+                                } else {
+                                    ui.add_space(14.0);
+                                }
+                                let enabled = idle && !is_here;
+                                if ui
+                                    .add_enabled(enabled, egui::Button::new(label))
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    self.history_jump(pos);
+                                }
+                            });
+                        }
+                    });
                 });
             });
         });
@@ -2160,8 +2620,12 @@ impl GigaMuxApp {
                     ));
                     ui.horizontal(|ui| {
                         if ui.button("Delete outputs").clicked() {
-                            let (deleted, failed) =
+                            let (deleted, failed, trashed) =
                                 delete_issue_outputs(&self.prefs.output_dir, &prompt.deletable);
+                            self.push_delete_undo_batch(DeleteUndoBatch {
+                                side: FileSide::Output,
+                                paths: trashed,
+                            });
                             self.push_session(format!(
                                 "Recycle Bin: {deleted} output(s); failed {failed}"
                             ));
@@ -2435,6 +2899,7 @@ impl eframe::App for GigaMuxApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
         self.tick_delete_queue(ctx);
+        self.tick_history_nav(ctx);
         self.poll_preview_cache(ctx);
         self.handle_shortcuts(ctx);
     }
