@@ -89,11 +89,14 @@ pub struct MediaSummary {
     /// Format `encoder` tag when present (e.g. Lavf… / obs-studio).
     pub encoder: Option<String>,
     pub has_alpha: bool,
+    /// First video stream `pix_fmt` (e.g. yuv422p); empty when unknown.
+    #[serde(default)]
+    pub pix_fmt: String,
 }
 
 impl MediaSummary {
     /// Bump when summary fields change so UI preview cache re-fetches.
-    pub const SCHEMA: u32 = 3;
+    pub const SCHEMA: u32 = 4;
 }
 
 /// RGBA thumbnail extracted via ffmpeg (fixed canvas for easy UI upload).
@@ -205,6 +208,67 @@ pub fn container_heat(ext_or_label: &str) -> f32 {
         "mxf" => 0.28,
         _ => 0.35,
     }
+}
+
+/// Compact list/meta chip for chroma (+ bit depth when not 8-bit). `None` if unknown.
+pub fn pix_fmt_chip_tag(pix: &str) -> Option<String> {
+    let p = pix.trim().to_ascii_lowercase();
+    if p.is_empty() {
+        return None;
+    }
+    let tag = match p.as_str() {
+        "yuv420p" | "yuvj420p" | "nv12" | "nv21" | "yuva420p" => "4:2:0",
+        "yuv420p10le" | "yuv420p10be" | "p010le" | "p010be" => "4:2:0 10",
+        "yuv422p" | "yuvj422p" | "yuva422p" => "4:2:2",
+        "yuv422p10le" | "yuv422p10be" => "4:2:2 10",
+        "yuv444p" | "yuvj444p" | "gbrp" | "yuva444p" | "gbrap" => "4:4:4",
+        "yuv444p10le" | "yuv444p10be" | "gbrp10le" => "4:4:4 10",
+        other => other,
+    };
+    Some(tag.into())
+}
+
+/// Cool→warm heat for chroma chips: narrower sampling cooler, wider warmer (4:2:0 → 4:4:4).
+pub fn pix_fmt_heat(chip_or_pix: &str) -> f32 {
+    let t = chip_or_pix.trim().to_ascii_lowercase();
+    // Match chip tags first, then raw pix_fmt. 10-bit sits slightly warmer than 8-bit at the same chroma.
+    if t.starts_with("4:2:0") || matches!(t.as_str(), "yuv420p" | "yuvj420p" | "nv12" | "nv21" | "yuva420p")
+    {
+        if t.contains("10") || t.contains("p10") || t.starts_with("p010") {
+            0.28
+        } else {
+            0.18
+        }
+    } else if t.starts_with("4:2:2")
+        || matches!(t.as_str(), "yuv422p" | "yuvj422p" | "yuva422p")
+        || t.contains("422p10")
+    {
+        if t.contains("10") || t.contains("p10") {
+            0.62
+        } else {
+            0.52
+        }
+    } else if t.starts_with("4:4:4")
+        || matches!(t.as_str(), "yuv444p" | "yuvj444p" | "gbrp" | "yuva444p" | "gbrap")
+        || t.contains("444p10")
+    {
+        if t.contains("10") || t.contains("p10") || t.contains("16") {
+            1.0
+        } else {
+            0.88
+        }
+    } else {
+        0.45
+    }
+}
+
+/// First video stream `pix_fmt` (lowercase), or empty.
+pub fn video_pix_fmt(info: &Value) -> String {
+    first_video_stream(info)
+        .and_then(|v| v.get("pix_fmt"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 pub fn video_codec_name(info: &Value) -> String {
@@ -667,6 +731,11 @@ pub fn media_summary_fast(path: &Path) -> Result<MediaSummary, String> {
         from_obs,
         encoder,
         has_alpha: video_has_alpha(&info),
+        pix_fmt: video
+            .and_then(|v| v.get("pix_fmt"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase(),
     })
 }
 

@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use crate::gpu::GpuChoice;
 use crate::probe::{
     audio_bitrate_k, audio_codec_name, file_info, require_tools, video_ceiling_k, video_codec_name,
-    video_has_alpha,
+    video_has_alpha, video_pix_fmt,
 };
 use crate::targets::{
-    audio_encode_for, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
+    audio_encode_for, delivery_pix_fmt, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
 };
 
 /// Same family as check `INPUT_EXTS` — what the batch encoder will pick up.
@@ -56,6 +56,8 @@ pub struct EncodeOptions {
     pub preserve_obs_metadata: bool,
     /// Ceiling from 1s video peak when true; otherwise average rate.
     pub use_peak_bitrate: bool,
+    /// NVENC for HEVC/H.264/AV1 when true; CPU (libx265/x264/aom) when false. VP8/VP9 always CPU.
+    pub use_hardware: bool,
     pub opaque_video: OpaqueVideo,
     pub opaque_container: OutContainer,
     pub alpha_video: AlphaVideo,
@@ -123,6 +125,66 @@ fn append_audio_args(cmd: &mut Vec<String>, input: &Path, info: &serde_json::Val
     }
 }
 
+fn append_libvpx_opaque_args(cmd: &mut Vec<String>, encoder: &str, ceiling: &str, bufsize: &str) {
+    // Constrained CRF0; libvpx ≥1.17 needs -b:v with -maxrate. VP8/VP9 path is 4:2:0-only here.
+    cmd.extend([
+        "-c:v".into(),
+        encoder.into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-auto-alt-ref".into(),
+        "0".into(),
+        "-deadline".into(),
+        "good".into(),
+        "-cpu-used".into(),
+        "0".into(),
+        "-threads".into(),
+        "0".into(),
+        "-tile-columns".into(),
+        "2".into(),
+        "-tile-rows".into(),
+        "1".into(),
+        "-lag-in-frames".into(),
+        "25".into(),
+        "-row-mt".into(),
+        "1".into(),
+        "-crf".into(),
+        "0".into(),
+        "-b:v".into(),
+        ceiling.into(),
+        "-maxrate".into(),
+        ceiling.into(),
+        "-bufsize".into(),
+        bufsize.into(),
+    ]);
+}
+
+/// libx264 needs an explicit profile for 4:2:2 / 4:4:4 / 10-bit.
+fn append_x264_profile(cmd: &mut Vec<String>, pix: &str) {
+    let profile = match pix {
+        "yuv420p10le" => Some("high10"),
+        "yuv422p" => Some("high422"),
+        "yuv422p10le" => Some("high422"),
+        "yuv444p" | "yuv444p10le" => Some("high444"),
+        _ => None,
+    };
+    if let Some(p) = profile {
+        cmd.extend(["-profile:v".into(), p.into()]);
+    }
+}
+
+/// NVENC profile when pix_fmt needs Main10 / High 4:4:4.
+fn append_nvenc_profile(cmd: &mut Vec<String>, opaque: OpaqueVideo, pix: &str) {
+    let profile = match (opaque, pix) {
+        (OpaqueVideo::Hevc, "p010le") => Some("main10"),
+        (OpaqueVideo::H264, "yuv444p") => Some("high444p"),
+        _ => None,
+    };
+    if let Some(p) = profile {
+        cmd.extend(["-profile:v".into(), p.into()]);
+    }
+}
+
 fn build_cmd(
     input: &Path,
     output: &Path,
@@ -131,6 +193,7 @@ fn build_cmd(
     gpu: GpuChoice,
     bitrate_k: u32,
     preserve_obs: bool,
+    use_hardware: bool,
     opaque_video: OpaqueVideo,
     opaque_container: OutContainer,
     alpha_video: AlphaVideo,
@@ -166,14 +229,17 @@ fn build_cmd(
     cmd.push("-i".into());
     cmd.push(input.to_string_lossy().into_owned());
 
+    let use_nvenc = use_hardware && opaque_video.is_nvenc() && !has_alpha;
+    let src_pix = video_pix_fmt(info);
+    let out_pix = delivery_pix_fmt(&src_pix, has_alpha, use_hardware, opaque_video);
+
     if has_alpha {
-        // CRF0 CQ capped at source ceiling. libvpx ≥1.17 rejects -maxrate without -b:v
-        // (and rejects -b:v 0 with -maxrate), so use constrained CQ: -b:v = -maxrate.
+        // Alpha is VP8/VP9 via libvpx — NVENC has no VP8/VP9 encoder (α or otherwise).
         cmd.extend([
             "-c:v".into(),
             alpha_video.ffmpeg_encoder().into(),
             "-pix_fmt".into(),
-            "yuva420p".into(),
+            out_pix.into(),
             "-auto-alt-ref".into(),
             "0".into(),
             "-deadline".into(),
@@ -201,28 +267,21 @@ fn build_cmd(
         ]);
         append_audio_args(&mut cmd, input, info, out_container);
     } else if opaque_video.is_libvpx() {
-        // Opaque VP8/VP9 — same constrained CRF0 libvpx knobs, no alpha plane.
+        append_libvpx_opaque_args(
+            &mut cmd,
+            opaque_video.ffmpeg_encoder(false),
+            &ceiling,
+            &bufsize,
+        );
+        append_audio_args(&mut cmd, input, info, out_container);
+    } else if !use_nvenc {
+        // CPU HEVC/H.264/AV1 — keep source chroma/bit-depth; CRF0 capped at source ceiling.
+        let enc = opaque_video.ffmpeg_encoder(false);
         cmd.extend([
             "-c:v".into(),
-            opaque_video.ffmpeg_encoder().into(),
+            enc.into(),
             "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-auto-alt-ref".into(),
-            "0".into(),
-            "-deadline".into(),
-            "good".into(),
-            "-cpu-used".into(),
-            "0".into(),
-            "-threads".into(),
-            "0".into(),
-            "-tile-columns".into(),
-            "2".into(),
-            "-tile-rows".into(),
-            "1".into(),
-            "-lag-in-frames".into(),
-            "25".into(),
-            "-row-mt".into(),
-            "1".into(),
+            out_pix.into(),
             "-crf".into(),
             "0".into(),
             "-b:v".into(),
@@ -232,11 +291,22 @@ fn build_cmd(
             "-bufsize".into(),
             bufsize,
         ]);
+        if enc == "libaom-av1" {
+            cmd.extend(["-cpu-used".into(), "4".into(), "-row-mt".into(), "1".into()]);
+        } else if enc == "libx265" {
+            cmd.extend(["-preset".into(), "medium".into()]);
+        } else if enc == "libx264" {
+            cmd.extend(["-preset".into(), "medium".into()]);
+            append_x264_profile(&mut cmd, out_pix);
+        }
         append_audio_args(&mut cmd, input, info, out_container);
     } else {
+        // NVENC: match source chroma/depth when the codec allows (no 4:2:2 on GeForce).
         cmd.extend([
             "-c:v".into(),
-            opaque_video.ffmpeg_encoder().into(),
+            opaque_video.ffmpeg_encoder(true).into(),
+            "-pix_fmt".into(),
+            out_pix.into(),
             "-gpu".into(),
             gpu.ffmpeg_arg(),
             "-preset".into(),
@@ -260,6 +330,7 @@ fn build_cmd(
             "-bufsize".into(),
             bufsize,
         ]);
+        append_nvenc_profile(&mut cmd, opaque_video, out_pix);
         append_audio_args(&mut cmd, input, info, out_container);
     }
 
@@ -602,6 +673,7 @@ pub fn run_batch(
         });
         let (bitrate_k, src_label) =
             video_ceiling_k(&input, &info, opts.use_peak_bitrate);
+        let use_nvenc = opts.use_hardware && opts.opaque_video.is_nvenc() && !has_alpha;
         let path_label = if has_alpha {
             format!("α {} {}", opts.alpha_video.label(), opts.alpha_container.label())
         } else {
@@ -611,13 +683,24 @@ pub fn run_batch(
                 opts.opaque_container.label()
             )
         };
+        let device = if use_nvenc {
+            format!("gpu={}", opts.gpu.ffmpeg_arg())
+        } else {
+            format!(
+                "cpu={}",
+                if has_alpha {
+                    opts.alpha_video.ffmpeg_encoder()
+                } else {
+                    opts.opaque_video.ffmpeg_encoder(false)
+                }
+            )
+        };
         on_event(EncodeEvent::Log(format!(
-            "{name}: {path_label} → {}, {bitrate_k}k ({src_label}), gpu={}",
+            "{name}: {path_label} → {}, {bitrate_k}k ({src_label}), {device}",
             output
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            opts.gpu.ffmpeg_arg(),
         )));
 
         let argv = build_cmd(
@@ -628,6 +711,7 @@ pub fn run_batch(
             opts.gpu,
             bitrate_k,
             opts.preserve_obs_metadata,
+            opts.use_hardware,
             opts.opaque_video,
             opts.opaque_container,
             opts.alpha_video,

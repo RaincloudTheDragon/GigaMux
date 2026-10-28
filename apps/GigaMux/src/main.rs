@@ -20,10 +20,12 @@ use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
-    media_summary_fast, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
+    media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, thumbnail_rgba, FrameTiming, MediaSummary,
+    RgbaThumb, THUMB_W,
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
+    pix_fmt_convert_warning,
     AudioEncode, OutContainer, OutputTargets,
 };
 
@@ -1234,6 +1236,7 @@ impl GigaMuxApp {
             gpu: self.prefs.gpu,
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
+            use_hardware: self.prefs.use_hardware,
             opaque_video: self.prefs.opaque_video,
             opaque_container: self.prefs.opaque_container,
             alpha_video: self.prefs.alpha_video,
@@ -2212,6 +2215,31 @@ impl GigaMuxApp {
         None
     }
 
+    /// Amber line when any input’s chroma/bit-depth can’t be matched for the current target.
+    fn chroma_convert_warning(&self) -> Option<String> {
+        for path in &self.input_files {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let key = Self::preview_key(FileSide::Input, &name);
+            let entry = self.preview_cache.get(&key);
+            let Some(summary) = entry.and_then(|e| e.summary.as_ref()).and_then(|r| r.as_ref().ok())
+            else {
+                continue;
+            };
+            if let Some(msg) = pix_fmt_convert_warning(
+                &summary.pix_fmt,
+                summary.has_alpha,
+                self.prefs.use_hardware,
+                self.prefs.opaque_video,
+            ) {
+                return Some(msg);
+            }
+        }
+        None
+    }
+
     fn ui_output_targets(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Targets").strong().small());
         // One cycling codec chip + one cycling container chip per path.
@@ -2248,6 +2276,19 @@ impl GigaMuxApp {
                 self.save_targets();
             }
         });
+        ui.add_space(4.0);
+        if ui
+            .checkbox(&mut self.prefs.use_hardware, "Use hardware")
+            .on_hover_text(
+                "On: NVIDIA NVENC — matches source chroma when supported (no 4:2:2; warns on fallback). Off: CPU and keep source chroma. VP8/VP9 and α stay 4:2:0.",
+            )
+            .changed()
+        {
+            self.save_targets();
+        }
+        if let Some(warn) = self.chroma_convert_warning() {
+            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+        }
         if let Some(warn) = self.audio_recode_warning() {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
         }
@@ -2337,22 +2378,30 @@ impl GigaMuxApp {
                                 .to_ascii_lowercase();
                             // Codec (+ optional α) chips from preview cache; muted … while probing.
                             let cache_key = Self::preview_key(side, &name);
+                            // Codec (+ α) + chroma chip from preview cache; muted … while probing.
                             let tags = self.preview_cache.get(&cache_key).and_then(|e| {
                                 if e.pending {
-                                    return Some((None, false));
+                                    return Some((None, false, None));
                                 }
                                 e.summary.as_ref().and_then(|r| r.as_ref().ok()).map(|s| {
-                                    (Some(codec_tag(s)), s.has_alpha)
+                                    (
+                                        Some(codec_tag(s)),
+                                        s.has_alpha,
+                                        pix_fmt_chip_tag(&s.pix_fmt),
+                                    )
                                 })
                             });
                             let row = ui.horizontal(|ui| {
                                 let resp = ui.selectable_label(selected, &name);
                                 match &tags {
-                                    Some((None, _)) => codec_chip(ui, "…"),
-                                    Some((Some(tag), has_alpha)) => {
+                                    Some((None, _, _)) => codec_chip(ui, "…"),
+                                    Some((Some(tag), has_alpha, chroma)) => {
                                         codec_chip(ui, tag);
                                         if *has_alpha {
                                             alpha_chip(ui);
+                                        }
+                                        if let Some(c) = chroma {
+                                            pix_fmt_chip(ui, c);
                                         }
                                     }
                                     None => {}
@@ -2791,6 +2840,9 @@ impl GigaMuxApp {
                     if s.has_alpha {
                         alpha_chip(ui);
                     }
+                    if let Some(c) = pix_fmt_chip_tag(&s.pix_fmt) {
+                        pix_fmt_chip(ui, &c);
+                    }
                     if let Some(p) = &s.video_profile {
                         ui.monospace(format!("({p})"));
                     }
@@ -2884,47 +2936,58 @@ impl GigaMuxApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("GPU");
-                    let mut selected = match self.prefs.gpu {
-                        GpuChoice::Any => None,
-                        GpuChoice::Index(i) => Some(i),
-                    };
-                    egui::ComboBox::from_id_salt("gpu_settings")
-                        .selected_text(match self.prefs.gpu {
-                            GpuChoice::Any => "Any".to_string(),
-                            GpuChoice::Index(i) => self
-                                .devices
-                                .iter()
-                                .find(|d| d.index == i)
-                                .map(|d| format!("#{i} {}", d.name))
-                                .unwrap_or_else(|| format!("#{i}")),
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut selected, None, "Any");
-                            for d in &self.devices {
-                                ui.selectable_value(
-                                    &mut selected,
-                                    Some(d.index),
-                                    format!("#{} {}", d.index, d.name),
-                                );
+                if ui
+                    .checkbox(&mut self.prefs.use_hardware, "Use hardware")
+                    .on_hover_text(
+                        "On: NVIDIA NVENC — match source chroma when supported; warn on fallback. Off: CPU keep source.",
+                    )
+                    .changed()
+                {
+                    let _ = prefs::save(&self.prefs);
+                }
+                ui.add_enabled_ui(self.prefs.use_hardware, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("GPU");
+                        let mut selected = match self.prefs.gpu {
+                            GpuChoice::Any => None,
+                            GpuChoice::Index(i) => Some(i),
+                        };
+                        egui::ComboBox::from_id_salt("gpu_settings")
+                            .selected_text(match self.prefs.gpu {
+                                GpuChoice::Any => "Any".to_string(),
+                                GpuChoice::Index(i) => self
+                                    .devices
+                                    .iter()
+                                    .find(|d| d.index == i)
+                                    .map(|d| format!("#{i} {}", d.name))
+                                    .unwrap_or_else(|| format!("#{i}")),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut selected, None, "Any");
+                                for d in &self.devices {
+                                    ui.selectable_value(
+                                        &mut selected,
+                                        Some(d.index),
+                                        format!("#{} {}", d.index, d.name),
+                                    );
+                                }
+                            });
+                        self.prefs.gpu = match selected {
+                            None => GpuChoice::Any,
+                            Some(i) => GpuChoice::Index(i),
+                        };
+                        if ui.button("Refresh").clicked() {
+                            match list_nvenc_devices() {
+                                Ok(d) => {
+                                    let (gpu, warn) = self.prefs.gpu.sanitize(&d);
+                                    self.prefs.gpu = gpu;
+                                    self.gpu_warn = warn;
+                                    self.devices = d;
+                                }
+                                Err(e) => self.push_session(format!("GPU probe failed: {e}")),
                             }
-                        });
-                    self.prefs.gpu = match selected {
-                        None => GpuChoice::Any,
-                        Some(i) => GpuChoice::Index(i),
-                    };
-                    if ui.button("Refresh").clicked() {
-                        match list_nvenc_devices() {
-                            Ok(d) => {
-                                let (gpu, warn) = self.prefs.gpu.sanitize(&d);
-                                self.prefs.gpu = gpu;
-                                self.gpu_warn = warn;
-                                self.devices = d;
-                            }
-                            Err(e) => self.push_session(format!("GPU probe failed: {e}")),
                         }
-                    }
+                    });
                 });
                 if let Some(w) = &self.gpu_warn {
                     ui.colored_label(egui::Color32::from_rgb(200, 140, 40), w);
@@ -3330,6 +3393,12 @@ fn alpha_chip(ui: &mut egui::Ui) {
         )
     };
     tag_chip(ui, "α", bg, fg);
+}
+
+/// Chroma / bit-depth chip from ffprobe `pix_fmt` (e.g. `4:2:2`, `4:2:0 10`).
+fn pix_fmt_chip(ui: &mut egui::Ui, tag: &str) {
+    let (bg, fg) = heat_chip_colors(pix_fmt_heat(tag), ui.visuals().dark_mode);
+    tag_chip(ui, tag, bg, fg);
 }
 
 fn chip_neutral(dark: bool) -> (egui::Color32, egui::Color32) {

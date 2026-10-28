@@ -19,6 +19,7 @@ fn main() {
         gpu: GpuChoice::Any,
         preserve_obs_metadata: false,
         use_peak_bitrate: false,
+        use_hardware: true,
         opaque_video: OpaqueVideo::Hevc,
         opaque_container: OutContainer::Mp4,
         alpha_video: AlphaVideo::Vp9,

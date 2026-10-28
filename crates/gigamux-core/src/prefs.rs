@@ -21,6 +21,9 @@ pub struct Prefs {
     /// When true, encode ceiling uses 1s video peak; default is average rate (CBR-oriented).
     #[serde(default)]
     pub use_peak_bitrate: bool,
+    /// NVENC for HEVC/H.264/AV1 when true; CPU encoders when false. Default on.
+    #[serde(default = "default_true")]
+    pub use_hardware: bool,
     #[serde(default)]
     pub opaque_video: OpaqueVideo,
     #[serde(default)]
@@ -49,6 +52,7 @@ impl Default for Prefs {
             gpu: GpuChoice::Any,
             preserve_obs_metadata: false,
             use_peak_bitrate: false,
+            use_hardware: true,
             opaque_video: OpaqueVideo::Hevc,
             opaque_container: OutContainer::Mp4,
             alpha_video: AlphaVideo::Vp9,

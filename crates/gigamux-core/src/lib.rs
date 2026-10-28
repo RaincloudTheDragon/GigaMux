@@ -17,11 +17,14 @@ pub use gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 pub use prefs::Prefs;
 pub use probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
+    pix_fmt_chip_tag, pix_fmt_heat,
     media_summary, media_summary_fast, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb,
     THUMB_W,
 };
 pub use targets::{
     alpha_pair_ok, audio_encode_for, audio_must_recode, cycle_alpha_container,
-    cycle_opaque_container, opaque_pair_ok, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
+    cycle_opaque_container, delivery_pix_fmt, nvenc_pix_fmt, opaque_pair_ok,
+    pix_fmt_convert_warning, pix_fmt_label, pix_fmt_will_convert, software_pix_fmt, AlphaVideo,
+    AudioEncode, OpaqueVideo, OutContainer,
     OutputTargets,
 };
