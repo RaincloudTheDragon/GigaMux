@@ -186,8 +186,38 @@ pub fn codec_heat(display_codec: &str) -> f32 {
     }
 }
 
+/// Cool→warm heat for container/extension chips (`0.0` cool … `1.0` warm delivery).
+/// Accepts `"mp4"`, `".mp4"`, or `"MP4"`.
+pub fn container_heat(ext_or_label: &str) -> f32 {
+    let e = ext_or_label
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    match e.as_str() {
+        "mp4" => 1.0,
+        "webm" => 0.78,
+        "mkv" => 0.55,
+        "mov" => 0.38,
+        "m4v" => 0.72,
+        "ogv" | "ogg" => 0.30,
+        "mpg" | "mpeg" => 0.22,
+        "avi" => 0.12,
+        "mxf" => 0.28,
+        _ => 0.35,
+    }
+}
+
 pub fn video_codec_name(info: &Value) -> String {
     first_video_stream(info)
+        .and_then(|s| s.get("codec_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// Raw first-audio `codec_name` (lowercase), empty if none.
+pub fn audio_codec_name(info: &Value) -> String {
+    first_audio_stream(info)
         .and_then(|s| s.get("codec_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("")

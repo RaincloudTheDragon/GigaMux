@@ -17,8 +17,12 @@ use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::probe::{
-    codec_heat, codec_tag, format_bytes, format_length, media_summary, thumbnail_rgba,
-    FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
+    codec_heat, codec_tag, container_heat, format_bytes, format_length, media_summary,
+    thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
+};
+use gigamux_core::targets::{
+    audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
+    AudioEncode, OutContainer, OutputTargets,
 };
 
 /// Live dual-bar encode progress (current file + whole batch).
@@ -568,7 +572,8 @@ impl GigaMuxApp {
             .pick_file()
         {
             match prefs::import_profile(&path) {
-                Ok(p) => {
+                Ok(mut p) => {
+                    p.sanitize_targets();
                     let (gpu, warn) = p.gpu.sanitize(&self.devices);
                     self.prefs = Prefs { gpu, ..p };
                     self.gpu_warn = warn;
@@ -601,6 +606,10 @@ impl GigaMuxApp {
             gpu: self.prefs.gpu,
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
+            opaque_video: self.prefs.opaque_video,
+            opaque_container: self.prefs.opaque_container,
+            alpha_video: self.prefs.alpha_video,
+            alpha_container: self.prefs.alpha_container,
             only_names: only_name.clone().map(|n| vec![n]),
         };
         let cancel = Arc::clone(&self.cancel);
@@ -769,6 +778,12 @@ impl GigaMuxApp {
         }
         let input = self.prefs.input_dir.clone();
         let output = self.prefs.output_dir.clone();
+        let targets = OutputTargets {
+            opaque_video: self.prefs.opaque_video,
+            opaque_container: self.prefs.opaque_container,
+            alpha_video: self.prefs.alpha_video,
+            alpha_container: self.prefs.alpha_container,
+        };
         let (tx, rx) = mpsc::channel();
         self.busy = true;
         self.job = Some(JobKind::Check);
@@ -776,7 +791,7 @@ impl GigaMuxApp {
         self.push_session("Check started…");
         self.log_open = true;
         thread::spawn(move || {
-            let result = run_check(&input, &output);
+            let result = run_check(&input, &output, targets);
             let _ = tx.send(AppEvent::CheckDone(result));
         });
     }
@@ -945,6 +960,102 @@ impl GigaMuxApp {
         });
     }
 
+    /// Persist output-target toggles after a chip click.
+    fn save_targets(&mut self) {
+        self.prefs.sanitize_targets();
+        let _ = prefs::save(&self.prefs);
+    }
+
+    /// Amber line when any input would need audio re-encode for current targets.
+    /// Opaque WebM (typically Opus) → MP4 always warns once the file is listed.
+    fn audio_recode_warning(&self) -> Option<String> {
+        for path in &self.input_files {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let key = Self::preview_key(FileSide::Input, &name);
+            let entry = self.preview_cache.get(&key);
+            let Some(summary) = entry.and_then(|e| e.summary.as_ref()).and_then(|r| r.as_ref().ok())
+            else {
+                continue;
+            };
+            let cont = self.prefs.container_for(summary.has_alpha);
+            let src_webm = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("webm"))
+                || summary.container.eq_ignore_ascii_case("webm");
+            let raw = summary.audio_codec.to_ascii_lowercase();
+            let raw = if raw == "—" { String::new() } else { raw };
+
+            // Opaque WebM → MP4: Opus (usual WebM audio) must become AAC.
+            if !summary.has_alpha && src_webm && matches!(cont, OutContainer::Mp4) {
+                return Some(format!("Opus will be recoded to AAC for {}", cont.label()));
+            }
+
+            if raw.is_empty() || !audio_must_recode(&raw, cont) {
+                continue;
+            }
+            let src = match raw.as_str() {
+                "opus" | "libopus" => "Opus",
+                "vorbis" => "Vorbis",
+                "aac" => "AAC",
+                "mp3" => "MP3",
+                "flac" => "FLAC",
+                other => other,
+            };
+            let dest = match audio_encode_for(&raw, cont) {
+                AudioEncode::Aac => "AAC",
+                AudioEncode::Opus => "Opus",
+                AudioEncode::Copy => continue,
+            };
+            return Some(format!("{src} will be recoded to {dest} for {}", cont.label()));
+        }
+        None
+    }
+
+    fn ui_output_targets(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Targets").strong().small());
+        // One cycling codec chip + one cycling container chip per path.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Opaque").weak().small());
+            let v = self.prefs.opaque_video;
+            if select_codec_chip(ui, v.label(), true, true) {
+                let next = v.next();
+                self.prefs.opaque_video = next;
+                self.prefs.opaque_container =
+                    gigamux_core::targets::clamp_opaque_container(next, self.prefs.opaque_container);
+                self.save_targets();
+            }
+            let c = self.prefs.opaque_container;
+            if select_ext_chip(ui, c.label(), true, true) {
+                self.prefs.opaque_container = cycle_opaque_container(self.prefs.opaque_video, c);
+                self.save_targets();
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("α").weak().small());
+            let v = self.prefs.alpha_video;
+            if select_codec_chip(ui, v.label(), true, true) {
+                let next = v.next();
+                self.prefs.alpha_video = next;
+                self.prefs.alpha_container =
+                    gigamux_core::targets::clamp_alpha_container(next, self.prefs.alpha_container);
+                self.save_targets();
+            }
+            let c = self.prefs.alpha_container;
+            if select_ext_chip(ui, c.label(), true, true) {
+                self.prefs.alpha_container = cycle_alpha_container(self.prefs.alpha_video, c);
+                self.save_targets();
+            }
+        });
+        if let Some(warn) = self.audio_recode_warning() {
+            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+        }
+    }
+
     fn ui_folder_pane(
         &mut self,
         ui: &mut egui::Ui,
@@ -967,6 +1078,10 @@ impl GigaMuxApp {
                     }
                 }
             });
+            // Output targets sit above the list (and above the empty-folder CTA).
+            if !is_input {
+                self.ui_output_targets(ui);
+            }
             ui.separator();
 
             if !prefs::dir_ok(dir) {
@@ -1015,6 +1130,11 @@ impl GigaMuxApp {
                                 .active
                                 .as_ref()
                                 .is_some_and(|(s, n)| *s == side && n == &name);
+                            let ext = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
                             // Codec (+ optional α) chips from preview cache; muted … while probing.
                             let cache_key = Self::preview_key(side, &name);
                             let tags = self.preview_cache.get(&cache_key).and_then(|e| {
@@ -1037,6 +1157,9 @@ impl GigaMuxApp {
                                             }
                                         }
                                         None => {}
+                                    }
+                                    if !ext.is_empty() {
+                                        ext_chip(ui, &format!(".{ext}"), true);
                                     }
                                     resp
                                 })
@@ -1609,15 +1732,86 @@ fn tag_chip(ui: &mut egui::Ui, label: &str, bg: egui::Color32, fg: egui::Color32
         });
 }
 
+/// Clickable chip; returns true when clicked while enabled.
+fn select_tag_chip(
+    ui: &mut egui::Ui,
+    label: &str,
+    bg: egui::Color32,
+    fg: egui::Color32,
+    enabled: bool,
+) -> bool {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let inner = egui::Frame::new()
+        .fill(bg)
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.add_enabled(
+                enabled,
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .monospace()
+                        .size(12.0)
+                        .color(fg),
+                )
+                .sense(sense),
+            )
+        });
+    enabled && inner.inner.clicked()
+}
+
 /// Codec chip: warm→cool spectrum tint from [`codec_heat`].
 fn codec_chip(ui: &mut egui::Ui, tag: &str) {
     let pending = tag == "…";
     let (bg, fg) = if pending {
-        codec_chip_neutral(ui.visuals().dark_mode)
+        chip_neutral(ui.visuals().dark_mode)
     } else {
-        codec_chip_colors(codec_heat(tag), ui.visuals().dark_mode)
+        heat_chip_colors(codec_heat(tag), ui.visuals().dark_mode)
     };
     tag_chip(ui, tag, bg, fg);
+}
+
+/// Extension chip (file row or target toggle).
+fn ext_chip(ui: &mut egui::Ui, label: &str, selected_or_plain: bool) {
+    let dark = ui.visuals().dark_mode;
+    let (bg, fg) = if selected_or_plain {
+        heat_chip_colors(container_heat(label), dark)
+    } else {
+        chip_neutral(dark)
+    };
+    tag_chip(ui, label, bg, fg);
+}
+
+/// Selectable codec chip for Targets row.
+fn select_codec_chip(ui: &mut egui::Ui, label: &str, selected: bool, enabled: bool) -> bool {
+    let dark = ui.visuals().dark_mode;
+    let (bg, fg) = if !enabled {
+        let (b, f) = chip_neutral(dark);
+        (b.gamma_multiply(0.7), f.gamma_multiply(0.55))
+    } else if selected {
+        heat_chip_colors(codec_heat(label), dark)
+    } else {
+        chip_neutral(dark)
+    };
+    select_tag_chip(ui, label, bg, fg, enabled)
+}
+
+/// Selectable extension chip for Targets row.
+fn select_ext_chip(ui: &mut egui::Ui, label: &str, selected: bool, enabled: bool) -> bool {
+    let dark = ui.visuals().dark_mode;
+    let (bg, fg) = if !enabled {
+        let (b, f) = chip_neutral(dark);
+        (b.gamma_multiply(0.7), f.gamma_multiply(0.55))
+    } else if selected {
+        heat_chip_colors(container_heat(label), dark)
+    } else {
+        chip_neutral(dark)
+    };
+    select_tag_chip(ui, label, bg, fg, enabled)
 }
 
 /// Separate α chip (only drawn when the stream has alpha).
@@ -1636,7 +1830,7 @@ fn alpha_chip(ui: &mut egui::Ui) {
     tag_chip(ui, "α", bg, fg);
 }
 
-fn codec_chip_neutral(dark: bool) -> (egui::Color32, egui::Color32) {
+fn chip_neutral(dark: bool) -> (egui::Color32, egui::Color32) {
     if dark {
         (
             egui::Color32::from_rgb(48, 50, 56),
@@ -1671,12 +1865,10 @@ fn hsv_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
     )
 }
 
-/// Warm→cool spectrum: efficient (heat 1) = red/orange … primitive (heat 0) = violet, via yellow/green/cyan/blue.
-fn codec_chip_colors(heat: f32, dark: bool) -> (egui::Color32, egui::Color32) {
-    let t = heat.clamp(0.0, 1.0);
-    // Slight ease so AV1/HEVC/VP9 sit clearly on the warm third of the wheel.
-    let t = t.powf(0.9);
-    // Hue sweep: 12° (warm red-orange) → 275° (cool violet), covering the full spectrum.
+/// Warm→cool spectrum: heat 1 = red/orange … heat 0 = violet (full hue sweep).
+fn heat_chip_colors(heat: f32, dark: bool) -> (egui::Color32, egui::Color32) {
+    let t = heat.clamp(0.0, 1.0).powf(0.9);
+    // Hue sweep: 12° (warm red-orange) → 275° (cool violet).
     let hue = 12.0 + (1.0 - t) * 263.0;
     if dark {
         (hsv_rgb(hue, 0.62, 0.42), hsv_rgb(hue, 0.40, 0.96))

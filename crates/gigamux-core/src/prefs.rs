@@ -1,4 +1,4 @@
-//! AppData prefs (folders, GPU, OBS metadata, bitrate ceiling mode).
+//! AppData prefs (folders, GPU, OBS metadata, bitrate ceiling mode, output targets).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,9 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::gpu::GpuChoice;
+use crate::targets::{
+    clamp_alpha_container, clamp_opaque_container, AlphaVideo, OpaqueVideo, OutContainer,
+};
 
 /// Persisted UI / encode settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +21,14 @@ pub struct Prefs {
     /// When true, encode ceiling uses 1s video peak; default is average rate (CBR-oriented).
     #[serde(default)]
     pub use_peak_bitrate: bool,
+    #[serde(default)]
+    pub opaque_video: OpaqueVideo,
+    #[serde(default)]
+    pub opaque_container: OutContainer,
+    #[serde(default)]
+    pub alpha_video: AlphaVideo,
+    #[serde(default)]
+    pub alpha_container: OutContainer,
 }
 
 impl Default for Prefs {
@@ -28,6 +39,27 @@ impl Default for Prefs {
             gpu: GpuChoice::Any,
             preserve_obs_metadata: false,
             use_peak_bitrate: false,
+            opaque_video: OpaqueVideo::Hevc,
+            opaque_container: OutContainer::Mp4,
+            alpha_video: AlphaVideo::Vp9,
+            alpha_container: OutContainer::Webm,
+        }
+    }
+}
+
+impl Prefs {
+    /// Clamp illegal codec×container pairs (load / import / toggle).
+    pub fn sanitize_targets(&mut self) {
+        self.opaque_container = clamp_opaque_container(self.opaque_video, self.opaque_container);
+        self.alpha_container = clamp_alpha_container(self.alpha_video, self.alpha_container);
+    }
+
+    /// Container for a given alpha flag.
+    pub fn container_for(&self, has_alpha: bool) -> OutContainer {
+        if has_alpha {
+            self.alpha_container
+        } else {
+            self.opaque_container
         }
     }
 }
@@ -46,10 +78,12 @@ pub fn load() -> Prefs {
     let Some(path) = prefs_path() else {
         return Prefs::default();
     };
-    match fs::read_to_string(&path) {
+    let mut prefs = match fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
         Err(_) => Prefs::default(),
-    }
+    };
+    prefs.sanitize_targets();
+    prefs
 }
 
 /// Save prefs to AppData (creates directory if needed).
@@ -79,7 +113,10 @@ pub fn export_profile(prefs: &Prefs, path: &Path) -> Result<(), String> {
 /// Import prefs from a profile JSON (does not auto-save to AppData).
 pub fn import_profile(path: &Path) -> Result<Prefs, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read profile: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("parse profile: {e}"))
+    let mut prefs: Prefs =
+        serde_json::from_str(&text).map_err(|e| format!("parse profile: {e}"))?;
+    prefs.sanitize_targets();
+    Ok(prefs)
 }
 
 /// `%APPDATA%\GigaMux\session.log` — durable UI session log.

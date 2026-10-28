@@ -8,9 +8,10 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::probe::{file_info, video_has_alpha};
+use crate::targets::OutputTargets;
 
 const INPUT_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm"];
-const OUTPUT_EXTS: &[&str] = &["mp4", "webm"];
+const OUTPUT_EXTS: &[&str] = &["mp4", "webm", "mkv"];
 const STREAM_END_SLACK_S: f64 = 1.0;
 const STREAM_END_SLACK_FRAC: f64 = 0.002;
 
@@ -71,13 +72,6 @@ fn list_named(dir: &Path, exts: &[&str]) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn expected_output_name(input_name: &str, has_alpha: bool) -> String {
-    let stem = Path::new(input_name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(input_name);
-    format!("{stem}.{}", if has_alpha { "webm" } else { "mp4" })
-}
 
 fn first_video(info: &Value) -> Option<&Value> {
     info.get("streams")?
@@ -169,6 +163,7 @@ fn check_pair_inner(
     output_path: &Path,
     input_info: &Value,
     output_info: &Value,
+    targets: OutputTargets,
 ) -> Option<String> {
     let input_duration = match format_duration(input_info) {
         Some(d) => d,
@@ -236,35 +231,35 @@ fn check_pair_inner(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-
-    if in_alpha {
-        if out_ext != "webm" {
-            return Some(format!(
-                "Container mismatch: alpha input expects .webm, got .{out_ext}"
-            ));
-        }
-        if out_codec != "vp9" {
-            return Some(format!(
-                "Codec mismatch: alpha input expects vp9, got {out_codec}"
-            ));
-        }
-        if !out_alpha {
-            return Some("Alpha mismatch: input has alpha but output does not".into());
-        }
+    let expect_ext = targets.container_for(in_alpha).ext();
+    let expect_names = if in_alpha {
+        targets.alpha_video.probe_names()
     } else {
-        if out_ext != "mp4" {
-            return Some(format!(
-                "Container mismatch: opaque input expects .mp4, got .{out_ext}"
-            ));
-        }
-        if out_codec != "hevc" && out_codec != "h265" {
-            return Some(format!(
-                "Codec mismatch: opaque input expects hevc, got {out_codec}"
-            ));
-        }
-        if out_alpha {
-            return Some("Alpha mismatch: opaque input but output has alpha".into());
-        }
+        targets.opaque_video.probe_names()
+    };
+    let expect_label = if in_alpha {
+        targets.alpha_video.label()
+    } else {
+        targets.opaque_video.label()
+    };
+
+    if out_ext != expect_ext {
+        return Some(format!(
+            "Container mismatch: {} input expects .{expect_ext}, got .{out_ext}",
+            if in_alpha { "alpha" } else { "opaque" }
+        ));
+    }
+    if !expect_names.iter().any(|n| *n == out_codec) {
+        return Some(format!(
+            "Codec mismatch: {} input expects {expect_label}, got {out_codec}",
+            if in_alpha { "alpha" } else { "opaque" }
+        ));
+    }
+    if in_alpha && !out_alpha {
+        return Some("Alpha mismatch: input has alpha but output does not".into());
+    }
+    if !in_alpha && out_alpha {
+        return Some("Alpha mismatch: opaque input but output has alpha".into());
     }
 
     let in_audio: Vec<_> = input_info
@@ -306,8 +301,12 @@ fn check_pair_inner(
     None
 }
 
-/// Check all input/output pairs under the two folders.
-pub fn run_check(input_dir: &Path, output_dir: &Path) -> Result<CheckReport, String> {
+/// Check all input/output pairs under the two folders against `targets`.
+pub fn run_check(
+    input_dir: &Path,
+    output_dir: &Path,
+    targets: OutputTargets,
+) -> Result<CheckReport, String> {
     if !input_dir.is_dir() || !output_dir.is_dir() {
         return Err("input and output directories must both exist".into());
     }
@@ -344,10 +343,10 @@ pub fn run_check(input_dir: &Path, output_dir: &Path) -> Result<CheckReport, Str
             continue;
         };
         let has_alpha = video_has_alpha(info);
-        let outp = expected_output_name(inf, has_alpha);
-        let sibling = expected_output_name(inf, !has_alpha);
+        let outp = targets.expected_name(inf, has_alpha);
+        let sibling = targets.expected_name(inf, !has_alpha);
         if output_set.contains(&outp) {
-            if output_set.contains(&sibling) {
+            if sibling != outp && output_set.contains(&sibling) {
                 report.issues.push(CheckIssue {
                     input: Some(inf.clone()),
                     output: Some(sibling.clone()),
@@ -357,18 +356,14 @@ pub fn run_check(input_dir: &Path, output_dir: &Path) -> Result<CheckReport, Str
                 });
             }
             pairs.push((inf.clone(), outp, info.clone()));
-        } else if output_set.contains(&sibling) {
+        } else if sibling != outp && output_set.contains(&sibling) {
             report.issues.push(CheckIssue {
                 input: Some(inf.clone()),
                 output: Some(sibling.clone()),
                 message: format!("Container mismatch: found {sibling}, expected {outp}"),
             });
         } else {
-            let kind = if has_alpha {
-                "VP9+α WebM"
-            } else {
-                "nvHEVC MP4"
-            };
+            let kind = targets.kind_label(has_alpha);
             report.issues.push(CheckIssue {
                 input: Some(inf.clone()),
                 output: Some(outp.clone()),
@@ -394,7 +389,7 @@ pub fn run_check(input_dir: &Path, output_dir: &Path) -> Result<CheckReport, Str
     for (inf, outp, info) in pairs {
         let out_path = output_dir.join(&outp);
         match file_info(&out_path) {
-            Ok(out_info) => match check_pair_inner(&out_path, &info, &out_info) {
+            Ok(out_info) => match check_pair_inner(&out_path, &info, &out_info, targets) {
                 None => report.ok_pairs += 1,
                 Some(msg) => report.issues.push(CheckIssue {
                     input: Some(inf),

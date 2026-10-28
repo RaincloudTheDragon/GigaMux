@@ -9,7 +9,11 @@ use std::time::{Duration, Instant};
 
 use crate::gpu::GpuChoice;
 use crate::probe::{
-    audio_bitrate_k, file_info, require_tools, video_ceiling_k, video_codec_name, video_has_alpha,
+    audio_bitrate_k, audio_codec_name, file_info, require_tools, video_ceiling_k, video_codec_name,
+    video_has_alpha,
+};
+use crate::targets::{
+    audio_encode_for, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
 };
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm"];
@@ -46,6 +50,10 @@ pub struct EncodeOptions {
     pub preserve_obs_metadata: bool,
     /// Ceiling from 1s video peak when true; otherwise average rate.
     pub use_peak_bitrate: bool,
+    pub opaque_video: OpaqueVideo,
+    pub opaque_container: OutContainer,
+    pub alpha_video: AlphaVideo,
+    pub alpha_container: OutContainer,
     /// When set, only encode these basenames (right-click selection). `None` = all inputs.
     pub only_names: Option<Vec<String>>,
 }
@@ -73,10 +81,40 @@ pub fn list_inputs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn deliver_path(input: &Path, output_dir: &Path, has_alpha: bool) -> PathBuf {
+fn deliver_path(input: &Path, output_dir: &Path, container: OutContainer) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default();
-    let ext = if has_alpha { "webm" } else { "mp4" };
-    output_dir.join(stem).with_extension(ext)
+    output_dir.join(stem).with_extension(container.ext())
+}
+
+fn append_audio_args(cmd: &mut Vec<String>, input: &Path, info: &serde_json::Value, out: OutContainer) {
+    let raw = audio_codec_name(info);
+    match audio_encode_for(&raw, out) {
+        AudioEncode::Copy => {
+            cmd.extend(["-c:a".into(), "copy".into(), "-map".into(), "0".into()]);
+        }
+        AudioEncode::Aac => {
+            let a_k = audio_bitrate_k(input);
+            cmd.extend([
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                format!("{a_k}k"),
+                "-map".into(),
+                "0".into(),
+            ]);
+        }
+        AudioEncode::Opus => {
+            let a_k = audio_bitrate_k(input);
+            cmd.extend([
+                "-c:a".into(),
+                "libopus".into(),
+                "-b:a".into(),
+                format!("{a_k}k"),
+                "-map".into(),
+                "0".into(),
+            ]);
+        }
+    }
 }
 
 fn build_cmd(
@@ -87,9 +125,18 @@ fn build_cmd(
     gpu: GpuChoice,
     bitrate_k: u32,
     preserve_obs: bool,
+    opaque_video: OpaqueVideo,
+    opaque_container: OutContainer,
+    alpha_video: AlphaVideo,
+    alpha_container: OutContainer,
 ) -> Vec<String> {
     let ceiling = format!("{bitrate_k}k");
     let bufsize = format!("{}k", bitrate_k * 2);
+    let out_container = if has_alpha {
+        alpha_container
+    } else {
+        opaque_container
+    };
     let mut cmd = vec![
         "ffmpeg".into(),
         "-v".into(),
@@ -102,6 +149,7 @@ fn build_cmd(
 
     let vcodec = video_codec_name(info);
     if has_alpha && (vcodec == "vp9" || vcodec == "vp8") {
+        // Prefer matching decoder when re-wrapping alpha VP8/VP9.
         cmd.push("-c:v".into());
         cmd.push(if vcodec == "vp9" {
             "libvpx-vp9".into()
@@ -116,7 +164,7 @@ fn build_cmd(
         // CRF0 visually lossless; -maxrate kept intentionally (libvpx ignores it at CRF0).
         cmd.extend([
             "-c:v".into(),
-            "libvpx-vp9".into(),
+            alpha_video.ffmpeg_encoder().into(),
             "-pix_fmt".into(),
             "yuva420p".into(),
             "-auto-alt-ref".into(),
@@ -139,15 +187,41 @@ fn build_cmd(
             "0".into(),
             "-maxrate".into(),
             ceiling,
-            "-c:a".into(),
-            "copy".into(),
-            "-map".into(),
-            "0".into(),
         ]);
+        append_audio_args(&mut cmd, input, info, out_container);
+    } else if opaque_video.is_libvpx() {
+        // Opaque VP8/VP9 — same CRF0 libvpx knobs, no alpha plane.
+        cmd.extend([
+            "-c:v".into(),
+            opaque_video.ffmpeg_encoder().into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-auto-alt-ref".into(),
+            "0".into(),
+            "-deadline".into(),
+            "good".into(),
+            "-cpu-used".into(),
+            "0".into(),
+            "-threads".into(),
+            "0".into(),
+            "-tile-columns".into(),
+            "2".into(),
+            "-tile-rows".into(),
+            "1".into(),
+            "-lag-in-frames".into(),
+            "25".into(),
+            "-row-mt".into(),
+            "1".into(),
+            "-crf".into(),
+            "0".into(),
+            "-maxrate".into(),
+            ceiling,
+        ]);
+        append_audio_args(&mut cmd, input, info, out_container);
     } else {
         cmd.extend([
             "-c:v".into(),
-            "hevc_nvenc".into(),
+            opaque_video.ffmpeg_encoder().into(),
             "-gpu".into(),
             gpu.ffmpeg_arg(),
             "-preset".into(),
@@ -171,24 +245,7 @@ fn build_cmd(
             "-bufsize".into(),
             bufsize,
         ]);
-        let is_webm = input
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("webm"))
-            .unwrap_or(false);
-        if is_webm {
-            let a_k = audio_bitrate_k(input);
-            cmd.extend([
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                format!("{a_k}k"),
-                "-map".into(),
-                "0".into(),
-            ]);
-        } else {
-            cmd.extend(["-c:a".into(), "copy".into(), "-map".into(), "0".into()]);
-        }
+        append_audio_args(&mut cmd, input, info, out_container);
     }
 
     if preserve_obs {
@@ -423,7 +480,12 @@ pub fn run_batch(
             }
         };
         let has_alpha = video_has_alpha(&info);
-        let output = deliver_path(&input, &opts.output_dir, has_alpha);
+        let container = if has_alpha {
+            opts.alpha_container
+        } else {
+            opts.opaque_container
+        };
+        let output = deliver_path(&input, &opts.output_dir, container);
         if output.is_file() {
             skipped += 1;
             on_event(EncodeEvent::FileSkipped { name });
@@ -469,9 +531,17 @@ pub fn run_batch(
         });
         let (bitrate_k, src_label) =
             video_ceiling_k(&input, &info, opts.use_peak_bitrate);
+        let path_label = if has_alpha {
+            format!("α {} {}", opts.alpha_video.label(), opts.alpha_container.label())
+        } else {
+            format!(
+                "opaque {} {}",
+                opts.opaque_video.label(),
+                opts.opaque_container.label()
+            )
+        };
         on_event(EncodeEvent::Log(format!(
-            "{name}: {} → {}, {bitrate_k}k ({src_label}), gpu={}",
-            if has_alpha { "alpha VP9" } else { "opaque HEVC" },
+            "{name}: {path_label} → {}, {bitrate_k}k ({src_label}), gpu={}",
             output
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -487,6 +557,10 @@ pub fn run_batch(
             opts.gpu,
             bitrate_k,
             opts.preserve_obs_metadata,
+            opts.opaque_video,
+            opts.opaque_container,
+            opts.alpha_video,
+            opts.alpha_container,
         );
         match run_ffmpeg(&argv, &cancel, |line, out_time| {
             if let Some(t) = out_time {
