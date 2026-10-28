@@ -21,7 +21,7 @@ use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewE
 use gigamux_core::probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
     media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag, rate_mode_heat,
-    thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
+    size_delta, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, SizeDelta, THUMB_W,
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
@@ -2786,10 +2786,37 @@ impl GigaMuxApp {
             ui.colored_label(egui::Color32::from_rgb(200, 100, 80), format!("thumb: {e}"));
         }
         let bitrates_ready = entry.bitrates_ready;
+        // Output meta: ↓/% green or ↑/% red vs same-stem input when both sizes are known.
+        let size_vs_input = if side == FileSide::Output {
+            self.counterpart_name(side, &name).and_then(|in_name| {
+                let in_key = Self::preview_key(FileSide::Input, &in_name);
+                let in_bytes = self.preview_cache.get(&in_key).and_then(|e| {
+                    if e.file_size > 0 {
+                        Some(e.file_size)
+                    } else {
+                        e.summary
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .map(|s| s.file_size_bytes)
+                            .filter(|&b| b > 0)
+                    }
+                })?;
+                let out_bytes = entry
+                    .summary
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map(|s| s.file_size_bytes)
+                    .filter(|&b| b > 0)
+                    .or_else(|| (entry.file_size > 0).then_some(entry.file_size))?;
+                size_delta(in_bytes, out_bytes)
+            })
+        } else {
+            None
+        };
         match &entry.summary {
             Some(Ok(s)) => {
                 ui.add_space(8.0);
-                Self::ui_meta_table(ui, s, bitrates_ready);
+                Self::ui_meta_table(ui, s, bitrates_ready, size_vs_input);
             }
             Some(Err(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(200, 100, 80), e);
@@ -2798,7 +2825,12 @@ impl GigaMuxApp {
         }
     }
 
-    fn ui_meta_table(ui: &mut egui::Ui, s: &MediaSummary, bitrates_ready: bool) {
+    fn ui_meta_table(
+        ui: &mut egui::Ui,
+        s: &MediaSummary,
+        bitrates_ready: bool,
+        size_vs_input: Option<SizeDelta>,
+    ) {
         let yes_no = |b: bool| if b { "yes" } else { "no" };
         let timing = match s.timing {
             FrameTiming::Cfr => "CFR",
@@ -2872,7 +2904,26 @@ impl GigaMuxApp {
                 ui.end_row();
                 row(ui, "Container", &s.container.to_ascii_uppercase());
                 row(ui, "Res", &res);
-                row(ui, "Size", &format_bytes(s.file_size_bytes));
+                ui.label(egui::RichText::new("Size").weak().small());
+                ui.horizontal(|ui| {
+                    ui.monospace(format_bytes(s.file_size_bytes));
+                    match size_vs_input {
+                        Some(SizeDelta::Smaller { pct }) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(80, 180, 100),
+                                format!("↓{pct}%"),
+                            );
+                        }
+                        Some(SizeDelta::Larger { pct }) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 90, 80),
+                                format!("↑{pct}%"),
+                            );
+                        }
+                        Some(SizeDelta::Same) | None => {}
+                    }
+                });
+                ui.end_row();
                 row(
                     ui,
                     "Peakrate",

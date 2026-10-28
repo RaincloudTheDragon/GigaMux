@@ -618,6 +618,35 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Output vs same-stem input size for UI (↓ green smaller / ↑ red larger).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeDelta {
+    /// Output smaller; `pct` is reduction rounded to whole percent.
+    Smaller { pct: u32 },
+    /// Output larger; `pct` is growth rounded to whole percent.
+    Larger { pct: u32 },
+    Same,
+}
+
+/// Compare output size to input. `None` if input size unknown.
+pub fn size_delta(input_bytes: u64, output_bytes: u64) -> Option<SizeDelta> {
+    if input_bytes == 0 {
+        return None;
+    }
+    let pct = (1.0 - output_bytes as f64 / input_bytes as f64) * 100.0;
+    if pct >= 0.05 {
+        Some(SizeDelta::Smaller {
+            pct: pct.round() as u32,
+        })
+    } else if pct <= -0.05 {
+        Some(SizeDelta::Larger {
+            pct: (-pct).round() as u32,
+        })
+    } else {
+        Some(SizeDelta::Same)
+    }
+}
+
 /// Collapsing length: `M:SS` or `H:MM:SS` (no frame digits).
 pub fn format_length(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {

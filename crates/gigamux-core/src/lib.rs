@@ -18,7 +18,8 @@ pub use prefs::Prefs;
 pub use probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
     media_summary, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,
-    rate_mode_heat, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
+    rate_mode_heat, size_delta, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, SizeDelta,
+    THUMB_W,
 };
 pub use targets::{
     alpha_pair_ok, audio_encode_for, audio_must_recode, cycle_alpha_container,
