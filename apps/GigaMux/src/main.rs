@@ -1,13 +1,14 @@
 //! GigaMux native desktop shell (egui/eframe — no webview).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use gigamux_core::check::{
@@ -159,8 +160,12 @@ struct GigaMuxApp {
     gpu_warn: Option<String>,
     input_files: Vec<PathBuf>,
     output_files: Vec<PathBuf>,
-    /// Selected file (basename) and which pane it lives in.
+    /// Primary selection (preview / log focus): side + basename.
     active: Option<(FileSide, String)>,
+    /// Multi-select set on the same side as `active` (always includes the primary name).
+    selected: HashSet<String>,
+    /// Shift-click range anchor (basename on the active side).
+    selection_anchor: Option<String>,
     /// Per-input-file log lines (encode progress keyed by input basename).
     file_logs: HashMap<String, Vec<String>>,
     /// Session / batch log when no file is active.
@@ -179,6 +184,8 @@ struct GigaMuxApp {
     pending_recycle_delete: Option<RecycleDeletePrompt>,
     /// Recycle Bin failed — confirm permanent delete (or proceed if warnings disabled).
     pending_permanent_delete: Option<PermanentDeletePrompt>,
+    /// One-by-one delete cascade (list shrinks between each file).
+    delete_queue: Option<DeleteQueue>,
     /// Last-frame hit rects for folder drag-and-drop targeting.
     input_rect: Option<egui::Rect>,
     output_rect: Option<egui::Rect>,
@@ -190,6 +197,17 @@ struct GigaMuxApp {
     encode_progress: Option<EncodeProgress>,
 }
 
+/// Pace between one-by-one deletes so the UI can show each row vanishing.
+const DELETE_STEP_MS: u64 = 90;
+
+/// Sequential Recycle Bin job — pops one basename per step so rows vanish one-by-one.
+struct DeleteQueue {
+    side: FileSide,
+    remaining: VecDeque<String>,
+    next_name: Option<String>,
+    next_at: Instant,
+}
+
 /// Post-check dialog: warn about non-intact files; optional delete of bad outputs.
 #[derive(Clone)]
 struct CheckPrompt {
@@ -197,12 +215,11 @@ struct CheckPrompt {
     deletable: Vec<CheckIssue>,
 }
 
-/// Shared fields for delete confirmation dialogs.
+/// Shared fields for delete confirmation dialogs (one or many basenames).
 #[derive(Clone)]
 struct DeletePromptBase {
     side: FileSide,
-    name: String,
-    path: PathBuf,
+    names: Vec<String>,
     next_name: Option<String>,
     dont_ask_again: bool,
 }
@@ -239,6 +256,8 @@ impl GigaMuxApp {
             input_files: Vec::new(),
             output_files: Vec::new(),
             active: None,
+            selected: HashSet::new(),
+            selection_anchor: None,
             file_logs: HashMap::new(),
             // Restore prior session lines from AppData (same cap as the live buffer).
             session_log: prefs::load_session_log(500),
@@ -252,6 +271,7 @@ impl GigaMuxApp {
             pending_check: None,
             pending_recycle_delete: None,
             pending_permanent_delete: None,
+            delete_queue: None,
             input_rect: None,
             output_rect: None,
             cache_gen: Arc::new(AtomicU64::new(0)),
@@ -267,7 +287,27 @@ impl GigaMuxApp {
 
     fn clear_active(&mut self) {
         self.active = None;
+        self.selected.clear();
+        self.selection_anchor = None;
         self.log_show_session = true;
+    }
+
+    fn is_selected(&self, side: FileSide, name: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|(s, _)| *s == side)
+            && self.selected.contains(name)
+    }
+
+    /// Ordered selected basenames on the active side (list order).
+    fn selected_names_ordered(&self) -> Vec<String> {
+        let Some((side, _)) = self.active else {
+            return Vec::new();
+        };
+        self.names_for(side)
+            .into_iter()
+            .filter(|n| self.selected.contains(n))
+            .collect()
     }
 
     fn preview_key(side: FileSide, name: &str) -> String {
@@ -317,21 +357,104 @@ impl GigaMuxApp {
         }
     }
 
-    /// Select a file — preview comes from the pre-cache (no re-probe on click).
+    /// Plain click: single-select `name` as primary (clears multi-select).
     fn select_file(&mut self, side: FileSide, name: String) {
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|(s, n)| *s == side && n == &name)
-        {
+        self.selected.clear();
+        self.selected.insert(name.clone());
+        self.selection_anchor = Some(name.clone());
+        self.set_primary(side, name);
+    }
+
+    /// Ctrl/Cmd-click: toggle membership; primary follows the clicked row.
+    fn select_toggle(&mut self, side: FileSide, name: String) {
+        if self.active.as_ref().is_some_and(|(s, _)| *s != side) {
+            self.select_file(side, name);
             return;
         }
+        if self.selected.contains(&name) {
+            self.selected.remove(&name);
+            if self.selected.is_empty() {
+                self.clear_active();
+                return;
+            }
+            if self.active.as_ref().is_some_and(|(_, n)| n == &name) {
+                // Primary was removed — pick another selected name (stable list order).
+                if let Some(next) = self.names_for(side).into_iter().find(|n| self.selected.contains(n))
+                {
+                    self.set_primary(side, next);
+                }
+            }
+        } else {
+            self.selected.insert(name.clone());
+            self.selection_anchor = Some(name.clone());
+            self.set_primary(side, name);
+        }
+    }
+
+    /// Shift-click: select inclusive range from anchor → `name` on the same side.
+    fn select_range(&mut self, side: FileSide, name: String) {
+        let names = self.names_for(side);
+        let Some(anchor) = self
+            .selection_anchor
+            .clone()
+            .or_else(|| self.active.as_ref().filter(|(s, _)| *s == side).map(|(_, n)| n.clone()))
+        else {
+            self.select_file(side, name);
+            return;
+        };
+        if self.active.as_ref().is_some_and(|(s, _)| *s != side) {
+            self.select_file(side, name);
+            return;
+        }
+        let Some(i0) = names.iter().position(|n| n == &anchor) else {
+            self.select_file(side, name);
+            return;
+        };
+        let Some(i1) = names.iter().position(|n| n == &name) else {
+            return;
+        };
+        let (lo, hi) = if i0 <= i1 { (i0, i1) } else { (i1, i0) };
+        self.selected = names[lo..=hi].iter().cloned().collect();
+        self.set_primary(side, name);
+    }
+
+    fn set_primary(&mut self, side: FileSide, name: String) {
         self.active = Some((side, name.clone()));
+        self.selected.insert(name.clone());
         self.log_show_session = false;
         let key = Self::preview_key(side, &name);
         self.preview_cache
             .entry(key)
             .or_insert_with(PreviewCacheEntry::pending);
+    }
+
+    /// Basename after a multi-delete (first survivor below the block, else above).
+    fn next_name_after_delete(side_names: &[String], deleting: &HashSet<String>) -> Option<String> {
+        let indices: Vec<usize> = side_names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| deleting.contains(*n))
+            .map(|(i, _)| i)
+            .collect();
+        let Some(&last) = indices.last() else {
+            return None;
+        };
+        side_names
+            .iter()
+            .skip(last + 1)
+            .find(|n| !deleting.contains(*n))
+            .cloned()
+            .or_else(|| {
+                indices
+                    .first()
+                    .and_then(|&first| {
+                        (0..first)
+                            .rev()
+                            .map(|i| &side_names[i])
+                            .find(|n| !deleting.contains(*n))
+                            .cloned()
+                    })
+            })
     }
 
     /// Drop stale cache entries and pre-cache thumbs/metadata for input + output files.
@@ -532,11 +655,23 @@ impl GigaMuxApp {
         } else {
             Vec::new()
         };
-        // Drop selection if the file vanished.
+        // Prune multi-select / primary if files vanished from disk.
         if let Some((side, name)) = self.active.clone() {
-            let still = self.names_for(side).iter().any(|n| n == &name);
-            if !still {
-                self.clear_active();
+            let alive: HashSet<String> = self.names_for(side).into_iter().collect();
+            self.selected.retain(|n| alive.contains(n));
+            if let Some(a) = self.selection_anchor.clone() {
+                if !alive.contains(&a) {
+                    self.selection_anchor = self.selected.iter().next().cloned();
+                }
+            }
+            if !alive.contains(&name) {
+                if let Some(next) = self.selected.iter().next().cloned() {
+                    self.set_primary(side, next);
+                } else {
+                    self.clear_active();
+                }
+            } else if self.selected.is_empty() {
+                self.selected.insert(name);
             }
         }
         if self.input_files.is_empty() && self.output_files.is_empty() {
@@ -619,7 +754,7 @@ impl GigaMuxApp {
 
     /// Encode all inputs, or only `only_name` when set (context-menu selection).
     fn start_encode(&mut self, only_name: Option<String>) {
-        if self.busy {
+        if self.busy || self.delete_queue.is_some() {
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
@@ -700,10 +835,10 @@ impl GigaMuxApp {
         }
     }
 
-    /// Delete the active file (Del). Refuses while a job is running.
+    /// Delete all selected files (Del). Refuses while a job / delete cascade is running.
     /// Warns before Recycle Bin / permanent delete unless the user opted out.
     fn delete_active(&mut self) {
-        let Some((side, name)) = self.active.clone() else {
+        let Some((side, _)) = self.active else {
             return;
         };
         if self.busy {
@@ -711,115 +846,192 @@ impl GigaMuxApp {
             self.log_open = true;
             return;
         }
-        if self.pending_recycle_delete.is_some() || self.pending_permanent_delete.is_some() {
+        if self.pending_recycle_delete.is_some()
+            || self.pending_permanent_delete.is_some()
+            || self.delete_queue.is_some()
+        {
             return;
         }
-        let dir = match side {
-            FileSide::Input => &self.prefs.input_dir,
-            FileSide::Output => &self.prefs.output_dir,
-        };
-        let path = dir.join(&name);
-        // Prefer selecting the next neighbor in the same list after delete.
-        let names = self.names_for(side);
-        let idx = names.iter().position(|n| n == &name);
-        let next_name = idx.and_then(|i| {
-            names
-                .get(i + 1)
-                .or_else(|| (i > 0).then(|| &names[i - 1]))
-                .cloned()
-        });
+        let names = self.selected_names_ordered();
+        if names.is_empty() {
+            return;
+        }
+        let side_names = self.names_for(side);
+        let deleting: HashSet<String> = names.iter().cloned().collect();
+        let next_name = Self::next_name_after_delete(&side_names, &deleting);
         let base = DeletePromptBase {
             side,
-            name,
-            path,
+            names,
             next_name,
             dont_ask_again: false,
         };
         if self.prefs.warn_recycle_delete {
             self.pending_recycle_delete = Some(RecycleDeletePrompt { base });
         } else {
-            self.execute_recycle_delete(base);
+            self.start_delete_queue(base);
         }
     }
 
-    /// Attempt Recycle Bin; on failure, escalate to permanent-delete warn/execute.
-    fn execute_recycle_delete(&mut self, base: DeletePromptBase) {
+    /// Begin a paced one-by-one Recycle Bin cascade.
+    fn start_delete_queue(&mut self, base: DeletePromptBase) {
         let DeletePromptBase {
             side,
-            name,
-            path,
+            names,
             next_name,
             ..
         } = base;
+        if names.is_empty() {
+            return;
+        }
+        self.delete_queue = Some(DeleteQueue {
+            side,
+            remaining: names.into(),
+            next_name,
+            next_at: Instant::now(),
+        });
+    }
+
+    /// Pop one file from the delete queue, refresh the list, then wait briefly before the next.
+    fn tick_delete_queue(&mut self, ctx: &egui::Context) {
+        if self.pending_permanent_delete.is_some() {
+            return;
+        }
+        let Some(q) = self.delete_queue.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < q.next_at {
+            ctx.request_repaint_after(q.next_at.saturating_duration_since(now));
+            return;
+        }
+        let side = q.side;
+        let name = {
+            let q = self.delete_queue.as_mut().unwrap();
+            q.remaining.pop_front()
+        };
+        let Some(name) = name else {
+            let next_name = self.delete_queue.as_ref().unwrap().next_name.clone();
+            self.delete_queue = None;
+            self.finish_delete_selection(side, next_name);
+            return;
+        };
+
+        let dir = match side {
+            FileSide::Input => self.prefs.input_dir.clone(),
+            FileSide::Output => self.prefs.output_dir.clone(),
+        };
+        let path = dir.join(&name);
+
         match trash_file(&path) {
             Ok(()) => {
                 self.push_session(format!("moved to Recycle Bin: {name}"));
-                let key = Self::preview_key(side, &name);
-                self.preview_cache.remove(&key);
-                self.finish_delete_selection(side, &name, next_name);
+                self.after_one_deleted(side, &name);
             }
             Err(e) if e == "not present on disk" => {
                 self.push_session(format!("delete failed ({name}): {e}"));
                 self.log_open = true;
-                self.finish_delete_selection(side, &name, next_name);
+                self.after_one_deleted(side, &name);
             }
             Err(e) => {
+                // Pause the cascade until permanent delete is confirmed or skipped.
                 if self.prefs.warn_permanent_delete {
+                    let next_name = self.delete_queue.as_ref().and_then(|q| q.next_name.clone());
                     self.pending_permanent_delete = Some(PermanentDeletePrompt {
                         base: DeletePromptBase {
                             side,
-                            name,
-                            path,
+                            names: vec![name],
                             next_name,
                             dont_ask_again: false,
                         },
                         trash_error: e,
                     });
-                } else {
-                    self.execute_permanent_delete(side, name, path, next_name);
+                    return;
                 }
+                match permanent_delete_file(&path) {
+                    Ok(()) => {
+                        self.push_session(format!("permanently deleted: {name}"));
+                        self.after_one_deleted(side, &name);
+                    }
+                    Err(e2) => {
+                        self.push_session(format!("permanent delete failed ({name}): {e2}"));
+                        self.log_open = true;
+                        self.after_one_deleted(side, &name);
+                    }
+                }
+            }
+        }
+
+        if let Some(q) = self.delete_queue.as_mut() {
+            q.next_at = Instant::now() + Duration::from_millis(DELETE_STEP_MS);
+        }
+        ctx.request_repaint();
+    }
+
+    /// Drop one name from selection / cache and re-list so the row vanishes this frame.
+    fn after_one_deleted(&mut self, side: FileSide, name: &str) {
+        self.selected.remove(name);
+        self.preview_cache.remove(&Self::preview_key(side, name));
+        if self.selection_anchor.as_deref() == Some(name) {
+            self.selection_anchor = self.selected.iter().next().cloned();
+        }
+        self.refresh_lists();
+        if self.active.as_ref().is_some_and(|(s, n)| *s == side && n == name) {
+            if let Some(n) = self
+                .names_for(side)
+                .into_iter()
+                .find(|n| self.selected.contains(n))
+            {
+                self.set_primary(side, n);
+            } else {
+                // Keep focus empty while the cascade continues; finish_delete_selection restores.
+                self.active = None;
+                self.log_show_session = true;
             }
         }
     }
 
-    /// Re-list from disk and move selection after a successful or aborted delete.
-    fn finish_delete_selection(
-        &mut self,
-        side: FileSide,
-        name: &str,
-        next_name: Option<String>,
-    ) {
+    /// Re-list from disk and restore selection after the cascade finishes.
+    fn finish_delete_selection(&mut self, side: FileSide, next_name: Option<String>) {
         self.refresh_lists();
         if let Some(n) = next_name.filter(|n| self.names_for(side).iter().any(|x| x == n)) {
             self.select_file(side, n);
-        } else if self
-            .active
-            .as_ref()
-            .is_some_and(|(s, n)| *s == side && n == name)
-        {
+        } else {
             self.clear_active();
         }
     }
 
+    /// Permanent-delete the prompted name(s), then resume the recycle cascade if any.
     fn execute_permanent_delete(
         &mut self,
         side: FileSide,
-        name: String,
-        path: PathBuf,
+        names: Vec<String>,
         next_name: Option<String>,
     ) {
-        match permanent_delete_file(&path) {
-            Ok(()) => {
-                self.push_session(format!("permanently deleted: {name}"));
-                let key = Self::preview_key(side, &name);
-                self.preview_cache.remove(&key);
-            }
-            Err(e) => {
-                self.push_session(format!("permanent delete failed ({name}): {e}"));
-                self.log_open = true;
+        let dir = match side {
+            FileSide::Input => self.prefs.input_dir.clone(),
+            FileSide::Output => self.prefs.output_dir.clone(),
+        };
+        for name in &names {
+            let path = dir.join(name);
+            match permanent_delete_file(&path) {
+                Ok(()) => {
+                    self.push_session(format!("permanently deleted: {name}"));
+                    self.after_one_deleted(side, name);
+                }
+                Err(e) => {
+                    self.push_session(format!("permanent delete failed ({name}): {e}"));
+                    self.log_open = true;
+                    self.after_one_deleted(side, name);
+                }
             }
         }
-        self.finish_delete_selection(side, &name, next_name);
+        if self.delete_queue.is_some() {
+            if let Some(q) = self.delete_queue.as_mut() {
+                q.next_at = Instant::now() + Duration::from_millis(DELETE_STEP_MS);
+            }
+        } else {
+            self.finish_delete_selection(side, next_name);
+        }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -855,8 +1067,14 @@ impl GigaMuxApp {
         if esc {
             if self.pending_permanent_delete.is_some() {
                 self.pending_permanent_delete = None;
+                if let Some(q) = self.delete_queue.as_mut() {
+                    q.next_at = Instant::now() + Duration::from_millis(DELETE_STEP_MS);
+                }
             } else if self.pending_recycle_delete.is_some() {
                 self.pending_recycle_delete = None;
+            } else if self.delete_queue.is_some() {
+                self.delete_queue = None;
+                self.push_session("delete cancelled");
             } else if self.show_settings {
                 let _ = prefs::save(&self.prefs);
                 self.show_settings = false;
@@ -1240,10 +1458,7 @@ impl GigaMuxApp {
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| path.display().to_string());
-                            let selected = self
-                                .active
-                                .as_ref()
-                                .is_some_and(|(s, n)| *s == side && n == &name);
+                            let selected = self.is_selected(side, &name);
                             let ext = path
                                 .extension()
                                 .and_then(|e| e.to_str())
@@ -1279,7 +1494,16 @@ impl GigaMuxApp {
                                 })
                                 .inner;
                             if resp.clicked() {
-                                self.select_file(side, name.clone());
+                                let (shift, ctrl) = ui.ctx().input(|i| {
+                                    (i.modifiers.shift, i.modifiers.command)
+                                });
+                                if shift {
+                                    self.select_range(side, name.clone());
+                                } else if ctrl {
+                                    self.select_toggle(side, name.clone());
+                                } else {
+                                    self.select_file(side, name.clone());
+                                }
                             }
                             if resp.double_clicked() {
                                 self.select_file(side, name.clone());
@@ -1297,9 +1521,9 @@ impl GigaMuxApp {
                                         .clicked()
                                 {
                                     self.select_file(FileSide::Input, name.clone());
-                                        self.start_encode(Some(name.clone()));
-                                        ui.close();
-                                    }
+                                    self.start_encode(Some(name.clone()));
+                                    ui.close();
+                                }
                                 if ui.button("Open in player").clicked() {
                                     self.select_file(side, name.clone());
                                     if let Err(e) = open_path_in_os(path) {
@@ -1307,11 +1531,20 @@ impl GigaMuxApp {
                                     }
                                     ui.close();
                                 }
+                                let del_label = if self.is_selected(side, &name)
+                                    && self.selected.len() > 1
+                                {
+                                    format!("Delete {} selected", self.selected.len())
+                                } else {
+                                    "Delete".into()
+                                };
                                 if ui
-                                    .add_enabled(!self.busy, egui::Button::new("Delete"))
+                                    .add_enabled(!self.busy, egui::Button::new(del_label))
                                     .clicked()
                                 {
-                                    self.select_file(side, name.clone());
+                                    if !self.is_selected(side, &name) {
+                                        self.select_file(side, name.clone());
+                                    }
                                     self.delete_active();
                                     ui.close();
                                 }
@@ -1794,13 +2027,24 @@ impl GigaMuxApp {
         let Some(mut prompt) = self.pending_recycle_delete.clone() else {
             return;
         };
+        let n = prompt.base.names.len();
         egui::Window::new("Move to Recycle Bin")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("Move this file to the Recycle Bin?");
-                ui.label(egui::RichText::new(&prompt.base.name).strong());
+                if n == 1 {
+                    ui.label("Move this file to the Recycle Bin?");
+                    ui.label(egui::RichText::new(&prompt.base.names[0]).strong());
+                } else {
+                    ui.label(format!("Move {n} files to the Recycle Bin?"));
+                    for name in prompt.base.names.iter().take(8) {
+                        ui.label(egui::RichText::new(name).strong());
+                    }
+                    if n > 8 {
+                        ui.label(egui::RichText::new(format!("…and {} more", n - 8)).weak());
+                    }
+                }
                 ui.add_space(6.0);
                 ui.checkbox(&mut prompt.base.dont_ask_again, "Don't ask again");
                 if let Some(p) = self.pending_recycle_delete.as_mut() {
@@ -1816,7 +2060,7 @@ impl GigaMuxApp {
                             let _ = prefs::save(&self.prefs);
                         }
                         self.pending_recycle_delete = None;
-                        self.execute_recycle_delete(prompt.base);
+                        self.start_delete_queue(prompt.base);
                     }
                 });
             });
@@ -1826,6 +2070,7 @@ impl GigaMuxApp {
         let Some(mut prompt) = self.pending_permanent_delete.clone() else {
             return;
         };
+        let n = prompt.base.names.len();
         egui::Window::new("Permanent delete")
             .collapsible(false)
             .resizable(false)
@@ -1833,9 +2078,18 @@ impl GigaMuxApp {
             .show(ctx, |ui| {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 140, 60),
-                    "Recycle Bin failed — this will permanently delete the file.",
+                    if n == 1 {
+                        "Recycle Bin failed — this will permanently delete the file."
+                    } else {
+                        "Recycle Bin failed — this will permanently delete these files."
+                    },
                 );
-                ui.label(egui::RichText::new(&prompt.base.name).strong());
+                for name in prompt.base.names.iter().take(8) {
+                    ui.label(egui::RichText::new(name).strong());
+                }
+                if n > 8 {
+                    ui.label(egui::RichText::new(format!("…and {} more", n - 8)).weak());
+                }
                 ui.label(
                     egui::RichText::new(format!("({})", prompt.trash_error))
                         .weak()
@@ -1849,6 +2103,10 @@ impl GigaMuxApp {
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         self.pending_permanent_delete = None;
+                        // Skip this file and continue the one-by-one cascade.
+                        if let Some(q) = self.delete_queue.as_mut() {
+                            q.next_at = Instant::now() + Duration::from_millis(DELETE_STEP_MS);
+                        }
                     }
                     let del = ui.add(
                         egui::Button::new("Delete permanently")
@@ -1862,8 +2120,7 @@ impl GigaMuxApp {
                         self.pending_permanent_delete = None;
                         self.execute_permanent_delete(
                             prompt.base.side,
-                            prompt.base.name,
-                            prompt.base.path,
+                            prompt.base.names,
                             prompt.base.next_name,
                         );
                     }
@@ -2177,6 +2434,7 @@ impl eframe::App for GigaMuxApp {
         if self.encode_progress.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+        self.tick_delete_queue(ctx);
         self.poll_preview_cache(ctx);
         self.handle_shortcuts(ctx);
     }
