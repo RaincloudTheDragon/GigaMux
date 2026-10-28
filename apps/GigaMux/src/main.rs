@@ -1,13 +1,12 @@
 //! GigaMux native desktop shell (egui/eframe — no webview).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -20,8 +19,8 @@ use gigamux_core::gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
-    codec_heat, codec_tag, container_heat, format_bytes, format_length, media_summary,
-    thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
+    codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
+    media_summary_fast, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
@@ -110,11 +109,25 @@ enum AppEvent {
     CheckDone(Result<CheckReport, String>),
 }
 
-struct PreviewReady {
-    gen: u64,
-    name: String,
-    summary: Result<MediaSummary, String>,
-    thumb: Result<RgbaThumb, String>,
+/// Incremental preview worker messages (fast chips first, then peeks + thumb).
+enum PreviewMsg {
+    Fast {
+        gen: u64,
+        name: String,
+        summary: Result<MediaSummary, String>,
+    },
+    Bitrates {
+        gen: u64,
+        name: String,
+        peak_video_kbps: u32,
+        avg_video_kbps: u32,
+        peak_audio_kbps: u32,
+    },
+    Thumb {
+        gen: u64,
+        name: String,
+        thumb: Result<RgbaThumb, String>,
+    },
 }
 
 /// Cached thumb + metadata for one file (RAM + optional AppData persistence).
@@ -122,8 +135,10 @@ struct PreviewCacheEntry {
     summary: Option<Result<MediaSummary, String>>,
     thumb: Option<Result<RgbaThumb, String>>,
     texture: Option<egui::TextureHandle>,
-    /// Still waiting on the pre-cache worker.
+    /// Still waiting on the fast probe.
     pending: bool,
+    /// Peak/avg packet sampling finished (meta table rates are final).
+    bitrates_ready: bool,
     /// Matches [`MediaSummary::SCHEMA`] when filled so stale shapes re-fetch.
     schema: u32,
     /// Absolute path + fingerprint for freshness checks across sessions.
@@ -139,6 +154,7 @@ impl PreviewCacheEntry {
             thumb: None,
             texture: None,
             pending: true,
+            bitrates_ready: false,
             schema: 0,
             source_path: None,
             file_size: 0,
@@ -146,6 +162,7 @@ impl PreviewCacheEntry {
         }
     }
 
+    /// Chips / basic meta are usable (bitrates + thumb may still be loading).
     fn ready(&self) -> bool {
         !self.pending && self.summary.is_some() && self.schema == MediaSummary::SCHEMA
     }
@@ -225,7 +242,7 @@ struct GigaMuxApp {
     /// Invalidates in-flight pre-cache workers when the input folder changes.
     cache_gen: Arc<AtomicU64>,
     preview_cache: HashMap<String, PreviewCacheEntry>,
-    cache_rx: Option<Receiver<PreviewReady>>,
+    cache_rx: Option<Receiver<PreviewMsg>>,
     /// Dual progress bars while an encode batch is running.
     encode_progress: Option<EncodeProgress>,
 }
@@ -618,6 +635,7 @@ impl GigaMuxApp {
                     thumb,
                     texture: None,
                     pending: false,
+                    bitrates_ready: pe.bitrates_ready,
                     schema: MediaSummary::SCHEMA,
                     source_path: Some(pe.path),
                     file_size: pe.size,
@@ -659,6 +677,7 @@ impl GigaMuxApp {
                     thumb_width,
                     thumb_height,
                     thumb_err,
+                    bitrates_ready: e.bitrates_ready,
                 },
             );
         }
@@ -698,7 +717,51 @@ impl GigaMuxApp {
         }
     }
 
-    /// Drop stale cache entries and pre-cache thumbs/metadata for input + output files.
+    fn preview_path_for_key(&self, key: &str) -> Option<PathBuf> {
+        if let Some(name) = key.strip_prefix("i:") {
+            Some(self.prefs.input_dir.join(name))
+        } else if let Some(name) = key.strip_prefix("o:") {
+            Some(self.prefs.output_dir.join(name))
+        } else {
+            None
+        }
+    }
+
+    /// True when an encode job is using software libvpx (opaque VP8/9 or any α file).
+    fn cpu_encode_active(&self) -> bool {
+        if !(self.busy && matches!(self.job, Some(JobKind::Encode))) {
+            return false;
+        }
+        if self.prefs.opaque_video.is_libvpx() {
+            return true;
+        }
+        // Alpha delivers always use libvpx — throttle if any known-α input is in the batch.
+        self.input_files.iter().any(|p| {
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                return false;
+            };
+            self.preview_cache
+                .get(&Self::preview_key(FileSide::Input, name))
+                .and_then(|e| e.summary.as_ref())
+                .and_then(|r| r.as_ref().ok())
+                .is_some_and(|s| s.has_alpha)
+        })
+    }
+
+    /// All logical CPUs for preview workers; leave most free while CPU encode runs.
+    fn preview_worker_count(&self) -> usize {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+        if self.cpu_encode_active() {
+            (cores / 4).max(1)
+        } else {
+            cores
+        }
+    }
+
+    /// Drop stale cache entries; fast-probe chips in parallel, then enrich peeks + thumbs.
     fn start_preview_cache(&mut self) {
         let mut jobs: Vec<(String, PathBuf)> = Vec::new();
         for (side, files, dir) in [
@@ -715,96 +778,179 @@ impl GigaMuxApp {
         }
         let key_set: HashSet<_> = jobs.iter().map(|(k, _)| k.clone()).collect();
         let parked = self.parked_preview_keys();
-        // Keep on-disk entries and undo-parked ones so Del→Ctrl+Z does not re-probe.
         self.preview_cache
             .retain(|k, _| key_set.contains(k) || parked.contains(k));
 
-        let mut to_fetch = Vec::new();
+        // Full probe vs enrich-only (disk hit with chips but missing peeks/thumb).
+        let mut to_fast = VecDeque::new();
+        let mut to_enrich = VecDeque::new();
         for (key, path) in jobs {
-            if self.preview_cache.get(&key).is_some_and(|e| e.fresh_for(&path)) {
-                continue;
+            if let Some(e) = self.preview_cache.get(&key) {
+                if e.fresh_for(&path) {
+                    let need_rates = !e.bitrates_ready;
+                    let need_thumb = e.thumb.is_none();
+                    if need_rates || need_thumb {
+                        to_enrich.push_back((key, path, need_rates, need_thumb));
+                    }
+                    continue;
+                }
             }
             self.preview_cache
                 .insert(key.clone(), PreviewCacheEntry::pending());
-            to_fetch.push((key, path));
+            to_fast.push_back((key, path));
         }
-        if to_fetch.is_empty() {
+        if to_fast.is_empty() && to_enrich.is_empty() {
             return;
         }
 
-        // Invalidate any prior worker, then start a new one for this folder snapshot.
         let gen = self.cache_gen.fetch_add(1, Ordering::Relaxed) + 1;
         let gen_flag = Arc::clone(&self.cache_gen);
         let (tx, rx) = mpsc::channel();
         self.cache_rx = Some(rx);
-        thread::spawn(move || {
-            for (name, path) in to_fetch {
-                if gen_flag.load(Ordering::Relaxed) != gen {
-                    break;
+
+        let fast_q = Arc::new(Mutex::new(to_fast));
+        let enrich_q = Arc::new(Mutex::new(to_enrich));
+        let workers = self.preview_worker_count();
+        for _ in 0..workers {
+            let fast_q = Arc::clone(&fast_q);
+            let enrich_q = Arc::clone(&enrich_q);
+            let gen_flag = Arc::clone(&gen_flag);
+            let tx = tx.clone();
+            thread::spawn(move || {
+                loop {
+                    if gen_flag.load(Ordering::Relaxed) != gen {
+                        break;
+                    }
+                    // Prefer fast chip probes so the list lights up before peeks/thumbs.
+                    let next_fast = fast_q.lock().ok().and_then(|mut q| q.pop_front());
+                    if let Some((name, path)) = next_fast {
+                        let summary = media_summary_fast(&path);
+                        if tx
+                            .send(PreviewMsg::Fast {
+                                gen,
+                                name: name.clone(),
+                                summary: summary.clone(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if let Ok(mut s) = summary {
+                            enrich_summary_bitrates(&path, &mut s);
+                            let _ = tx.send(PreviewMsg::Bitrates {
+                                gen,
+                                name: name.clone(),
+                                peak_video_kbps: s.peak_video_kbps,
+                                avg_video_kbps: s.avg_video_kbps,
+                                peak_audio_kbps: s.peak_audio_kbps,
+                            });
+                            let thumb = thumbnail_rgba(&path, s.duration_s);
+                            let _ = tx.send(PreviewMsg::Thumb { gen, name, thumb });
+                        }
+                        continue;
+                    }
+                    let next_enrich = enrich_q.lock().ok().and_then(|mut q| q.pop_front());
+                    let Some((name, path, need_rates, need_thumb)) = next_enrich else {
+                        break;
+                    };
+                    // Disk/RAM already has chips — only finish missing peeks / thumb.
+                    let Ok(mut s) = media_summary_fast(&path) else {
+                        continue;
+                    };
+                    if need_rates {
+                        enrich_summary_bitrates(&path, &mut s);
+                        if tx
+                            .send(PreviewMsg::Bitrates {
+                                gen,
+                                name: name.clone(),
+                                peak_video_kbps: s.peak_video_kbps,
+                                avg_video_kbps: s.avg_video_kbps,
+                                peak_audio_kbps: s.peak_audio_kbps,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    if need_thumb {
+                        let thumb = thumbnail_rgba(&path, s.duration_s);
+                        let _ = tx.send(PreviewMsg::Thumb { gen, name, thumb });
+                    }
                 }
-                let summary = media_summary(&path);
-                let dur = summary.as_ref().map(|s| s.duration_s).unwrap_or(0.0);
-                let thumb = thumbnail_rgba(&path, dur);
-                if tx
-                    .send(PreviewReady {
-                        gen,
-                        name,
-                        summary,
-                        thumb,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+            });
+        }
     }
 
-    fn apply_preview_ready(&mut self, ctx: &egui::Context, msg: PreviewReady) {
-        if msg.gen != self.cache_gen.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut texture = None;
-        if let Ok(ref thumb) = msg.thumb {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [thumb.width as usize, thumb.height as usize],
-                &thumb.rgba,
-            );
-            texture = Some(ctx.load_texture(
-                format!("thumb-{}", msg.name),
-                image,
-                egui::TextureOptions::LINEAR,
-            ));
-        }
-        // Resolve path + fingerprint from the current folder lists.
-        let (source_path, file_size, mtime_secs) = {
-            let path = if let Some(name) = msg.name.strip_prefix("i:") {
-                Some(self.prefs.input_dir.join(name))
-            } else if let Some(name) = msg.name.strip_prefix("o:") {
-                Some(self.prefs.output_dir.join(name))
-            } else {
-                None
-            };
-            match path {
-                Some(p) => {
-                    let (sz, mt) = preview_cache::file_fingerprint(&p).unwrap_or((0, 0));
-                    (Some(p), sz, mt)
+    fn apply_preview_msg(&mut self, ctx: &egui::Context, msg: PreviewMsg) {
+        match msg {
+            PreviewMsg::Fast { gen, name, summary } => {
+                if gen != self.cache_gen.load(Ordering::Relaxed) {
+                    return;
                 }
-                None => (None, 0, 0),
+                let (source_path, file_size, mtime_secs) =
+                    match self.preview_path_for_key(&name) {
+                        Some(p) => {
+                            let (sz, mt) = preview_cache::file_fingerprint(&p).unwrap_or((0, 0));
+                            (Some(p), sz, mt)
+                        }
+                        None => (None, 0, 0),
+                    };
+                let entry = self
+                    .preview_cache
+                    .entry(name)
+                    .or_insert_with(PreviewCacheEntry::pending);
+                entry.pending = false;
+                entry.bitrates_ready = false;
+                entry.schema = MediaSummary::SCHEMA;
+                entry.summary = Some(summary);
+                entry.source_path = source_path;
+                entry.file_size = file_size;
+                entry.mtime_secs = mtime_secs;
             }
-        };
-        let entry = self
-            .preview_cache
-            .entry(msg.name)
-            .or_insert_with(PreviewCacheEntry::pending);
-        entry.pending = false;
-        entry.schema = MediaSummary::SCHEMA;
-        entry.summary = Some(msg.summary);
-        entry.thumb = Some(msg.thumb);
-        entry.texture = texture;
-        entry.source_path = source_path;
-        entry.file_size = file_size;
-        entry.mtime_secs = mtime_secs;
+            PreviewMsg::Bitrates {
+                gen,
+                name,
+                peak_video_kbps,
+                avg_video_kbps,
+                peak_audio_kbps,
+            } => {
+                if gen != self.cache_gen.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some(entry) = self.preview_cache.get_mut(&name) else {
+                    return;
+                };
+                if let Some(Ok(s)) = entry.summary.as_mut() {
+                    s.peak_video_kbps = peak_video_kbps;
+                    s.avg_video_kbps = avg_video_kbps;
+                    s.peak_audio_kbps = peak_audio_kbps;
+                }
+                entry.bitrates_ready = true;
+            }
+            PreviewMsg::Thumb { gen, name, thumb } => {
+                if gen != self.cache_gen.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut texture = None;
+                if let Ok(ref t) = thumb {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [t.width as usize, t.height as usize],
+                        &t.rgba,
+                    );
+                    texture = Some(ctx.load_texture(
+                        format!("thumb-{name}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                let entry = self
+                    .preview_cache
+                    .entry(name)
+                    .or_insert_with(PreviewCacheEntry::pending);
+                entry.thumb = Some(thumb);
+                entry.texture = texture;
+            }
+        }
     }
 
     fn poll_preview_cache(&mut self, ctx: &egui::Context) {
@@ -818,7 +964,7 @@ impl GigaMuxApp {
             match rx.try_recv() {
                 Ok(msg) => {
                     got_any = true;
-                    self.apply_preview_ready(ctx, msg);
+                    self.apply_preview_msg(ctx, msg);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -829,9 +975,9 @@ impl GigaMuxApp {
         }
         if keep {
             self.cache_rx = Some(rx);
-            ctx.request_repaint_after(std::time::Duration::from_millis(120));
-        } else if got_any {
-            // Worker finished — persist meta + thumbs for the next session.
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        } else {
+            // All workers done — persist whatever we have (chips + peeks + thumbs).
             self.save_preview_cache_to_disk();
         }
         if got_any {
@@ -2341,10 +2487,11 @@ impl GigaMuxApp {
         if let Some(Err(e)) = &entry.thumb {
             ui.colored_label(egui::Color32::from_rgb(200, 100, 80), format!("thumb: {e}"));
         }
+        let bitrates_ready = entry.bitrates_ready;
         match &entry.summary {
             Some(Ok(s)) => {
                 ui.add_space(8.0);
-                Self::ui_meta_table(ui, s);
+                Self::ui_meta_table(ui, s, bitrates_ready);
             }
             Some(Err(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(200, 100, 80), e);
@@ -2353,7 +2500,7 @@ impl GigaMuxApp {
         }
     }
 
-    fn ui_meta_table(ui: &mut egui::Ui, s: &MediaSummary) {
+    fn ui_meta_table(ui: &mut egui::Ui, s: &MediaSummary, bitrates_ready: bool) {
         let yes_no = |b: bool| if b { "yes" } else { "no" };
         let timing = match s.timing {
             FrameTiming::Cfr => "CFR",
@@ -2416,11 +2563,21 @@ impl GigaMuxApp {
                 row(ui, "Container", &s.container.to_ascii_uppercase());
                 row(ui, "Res", &res);
                 row(ui, "Size", &format_bytes(s.file_size_bytes));
-                row(ui, "Peakrate", &format!("{} kbps", s.peak_video_kbps));
+                row(
+                    ui,
+                    "Peakrate",
+                    &if bitrates_ready {
+                        format!("{} kbps", s.peak_video_kbps)
+                    } else {
+                        "…".into()
+                    },
+                );
                 row(
                     ui,
                     "Avg rate",
-                    &if s.avg_video_kbps > 0 {
+                    &if !bitrates_ready {
+                        "…".into()
+                    } else if s.avg_video_kbps > 0 {
                         format!("{} kbps", s.avg_video_kbps)
                     } else {
                         "—".into()
@@ -2456,7 +2613,15 @@ impl GigaMuxApp {
                     row(ui, "Tracks", &s.audio_track_count.to_string());
                 }
                 row(ui, "Layout", &layout);
-                row(ui, "Peakrate", &format!("{} kbps", s.peak_audio_kbps));
+                row(
+                    ui,
+                    "Peakrate",
+                    &if bitrates_ready {
+                        format!("{} kbps", s.peak_audio_kbps)
+                    } else {
+                        "…".into()
+                    },
+                );
             });
     }
 

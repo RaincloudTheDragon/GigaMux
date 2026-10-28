@@ -16,8 +16,9 @@ pub use encode::{run_batch, EncodeEvent, EncodeOptions};
 pub use gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 pub use prefs::Prefs;
 pub use probe::{
-    codec_heat, codec_tag, container_heat, format_bytes, format_length, media_summary,
-    thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
+    codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
+    media_summary, media_summary_fast, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb,
+    THUMB_W,
 };
 pub use targets::{
     alpha_pair_ok, audio_encode_for, audio_must_recode, cycle_alpha_container,

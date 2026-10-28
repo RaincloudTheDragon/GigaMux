@@ -539,8 +539,17 @@ pub fn format_length(seconds: f64) -> String {
     }
 }
 
-/// Probe codecs, peak bitrates, duration, container, and chapter presence.
-pub fn media_summary(path: &Path) -> Result<MediaSummary, String> {
+/// Bitrate kbps from a stream/format `bit_rate` field already in ffprobe JSON (no extra process).
+fn json_bitrate_kbps(v: Option<&Value>) -> Option<u32> {
+    let raw = v?;
+    let bps = raw
+        .as_u64()
+        .or_else(|| raw.as_str().and_then(|s| s.parse().ok()))?;
+    (bps > 0).then_some(((bps + 500) / 1000).max(1) as u32)
+}
+
+/// Fast list/chip probe: one `ffprobe` JSON — no packet peeks, no peak sampling.
+pub fn media_summary_fast(path: &Path) -> Result<MediaSummary, String> {
     let info = file_info(path)?;
     let fmt = info.get("format").cloned().unwrap_or(Value::Null);
     let duration_s = fmt.get("duration").and_then(json_f64).unwrap_or(0.0);
@@ -620,11 +629,12 @@ pub fn media_summary(path: &Path) -> Result<MediaSummary, String> {
         })
         .unwrap_or(0);
 
-    let (peak_video_kbps, _) = video_bitrate_k(path, &info);
-    let avg_video_kbps = video_avg_bitrate_k(path, duration_s);
-    let peak_audio_kbps = sampled_peak_bitrate_bps(path, "a:0", duration_s)
-        .map(|bps| ((bps + 500) / 1000).max(1) as u32)
-        .unwrap_or_else(|| audio_bitrate_k(path));
+    // Cheap placeholders from tagged bit_rate only — UI shows "…" until enrich fills peeks.
+    let avg_video_kbps = json_bitrate_kbps(video.and_then(|v| v.get("bit_rate")))
+        .or_else(|| json_bitrate_kbps(fmt.get("bit_rate")))
+        .unwrap_or(0);
+    let peak_video_kbps = avg_video_kbps;
+    let peak_audio_kbps = json_bitrate_kbps(audio.and_then(|v| v.get("bit_rate"))).unwrap_or(0);
 
     let chapter_count = info
         .get("chapters")
@@ -658,6 +668,31 @@ pub fn media_summary(path: &Path) -> Result<MediaSummary, String> {
         encoder,
         has_alpha: video_has_alpha(&info),
     })
+}
+
+/// Fill peak/avg bitrates via packet sampling (slow — defer after chips are on screen).
+pub fn enrich_summary_bitrates(path: &Path, summary: &mut MediaSummary) {
+    let info = file_info(path).ok();
+    let (peak_video_kbps, _) = match &info {
+        Some(info) => video_bitrate_k(path, info),
+        None => (summary.peak_video_kbps, String::new()),
+    };
+    let avg_video_kbps = video_avg_bitrate_k(path, summary.duration_s);
+    let peak_audio_kbps = sampled_peak_bitrate_bps(path, "a:0", summary.duration_s)
+        .map(|bps| ((bps + 500) / 1000).max(1) as u32)
+        .unwrap_or_else(|| audio_bitrate_k(path));
+    summary.peak_video_kbps = peak_video_kbps;
+    if avg_video_kbps > 0 {
+        summary.avg_video_kbps = avg_video_kbps;
+    }
+    summary.peak_audio_kbps = peak_audio_kbps;
+}
+
+/// Full probe (fast + bitrate enrich). Prefer [`media_summary_fast`] + [`enrich_summary_bitrates`] for UI.
+pub fn media_summary(path: &Path) -> Result<MediaSummary, String> {
+    let mut s = media_summary_fast(path)?;
+    enrich_summary_bitrates(path, &mut s);
+    Ok(s)
 }
 
 /// Grab one letterboxed RGBA frame near 1s (or 10% of duration) via ffmpeg.

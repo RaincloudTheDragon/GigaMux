@@ -33,6 +33,13 @@ pub struct PersistedPreviewEntry {
     /// When thumb probe failed (no `thumb_file`).
     #[serde(default)]
     pub thumb_err: Option<String>,
+    /// False when only the fast probe ran (peaks still need enrich). Old caches default true.
+    #[serde(default = "default_true")]
+    pub bitrates_ready: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Size + mtime used to invalidate stale cache rows.
