@@ -29,6 +29,16 @@ pub struct Prefs {
     pub alpha_video: AlphaVideo,
     #[serde(default)]
     pub alpha_container: OutContainer,
+    /// Confirm before moving a file to the Recycle Bin. Default on.
+    #[serde(default = "default_true")]
+    pub warn_recycle_delete: bool,
+    /// Confirm before a permanent (non–Recycle Bin) delete. Default on.
+    #[serde(default = "default_true")]
+    pub warn_permanent_delete: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Prefs {
@@ -43,6 +53,8 @@ impl Default for Prefs {
             opaque_container: OutContainer::Mp4,
             alpha_video: AlphaVideo::Vp9,
             alpha_container: OutContainer::Webm,
+            warn_recycle_delete: true,
+            warn_permanent_delete: true,
         }
     }
 }

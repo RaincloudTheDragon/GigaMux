@@ -8,7 +8,8 @@ pub mod probe;
 pub mod targets;
 
 pub use check::{
-    deletable_issues, delete_issue_outputs, list_media, run_check, CheckIssue, CheckReport,
+    deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, run_check,
+    trash_file, CheckIssue, CheckReport,
 };
 pub use encode::{run_batch, EncodeEvent, EncodeOptions};
 pub use gpu::{list_nvenc_devices, GpuChoice, NvencDevice};

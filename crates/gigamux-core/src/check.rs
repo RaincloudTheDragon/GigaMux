@@ -432,7 +432,23 @@ pub fn deletable_issues<'a>(output_dir: &Path, issues: &'a [CheckIssue]) -> Vec<
         .collect()
 }
 
-/// Delete output files listed on issues (skips “Missing from output”).
+/// Move a path to the OS Recycle Bin / Trash. Errors if missing or trash fails.
+pub fn trash_file(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err("not present on disk".into());
+    }
+    trash::delete(path).map_err(|e| format!("{e}"))
+}
+
+/// Permanently remove a file (no Recycle Bin). Errors if missing or remove fails.
+pub fn permanent_delete_file(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err("not present on disk".into());
+    }
+    std::fs::remove_file(path).map_err(|e| format!("{e}"))
+}
+
+/// Recycle output files listed on issues (skips “Missing from output”).
 pub fn delete_issue_outputs(output_dir: &Path, issues: &[CheckIssue]) -> (usize, usize) {
     let mut deleted = 0usize;
     let mut failed = 0usize;
@@ -441,7 +457,7 @@ pub fn delete_issue_outputs(output_dir: &Path, issues: &[CheckIssue]) -> (usize,
             continue;
         }
         let name = issue.output.as_ref().expect("deletable implies output");
-        match std::fs::remove_file(output_dir.join(name)) {
+        match trash_file(&output_dir.join(name)) {
             Ok(()) => deleted += 1,
             Err(_) => failed += 1,
         }

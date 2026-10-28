@@ -11,7 +11,8 @@ use std::time::Instant;
 
 use eframe::egui;
 use gigamux_core::check::{
-    deletable_issues, delete_issue_outputs, list_media, run_check, CheckIssue, CheckReport,
+    deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, run_check,
+    trash_file, CheckIssue, CheckReport,
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
@@ -174,6 +175,10 @@ struct GigaMuxApp {
     event_rx: Option<Receiver<AppEvent>>,
     /// Check result dialog (always shown on issues; delete only if outputs exist).
     pending_check: Option<CheckPrompt>,
+    /// Confirm before Recycle Bin (unless the user opted out).
+    pending_recycle_delete: Option<RecycleDeletePrompt>,
+    /// Recycle Bin failed — confirm permanent delete (or proceed if warnings disabled).
+    pending_permanent_delete: Option<PermanentDeletePrompt>,
     /// Last-frame hit rects for folder drag-and-drop targeting.
     input_rect: Option<egui::Rect>,
     output_rect: Option<egui::Rect>,
@@ -190,6 +195,29 @@ struct GigaMuxApp {
 struct CheckPrompt {
     issue_count: usize,
     deletable: Vec<CheckIssue>,
+}
+
+/// Shared fields for delete confirmation dialogs.
+#[derive(Clone)]
+struct DeletePromptBase {
+    side: FileSide,
+    name: String,
+    path: PathBuf,
+    next_name: Option<String>,
+    dont_ask_again: bool,
+}
+
+/// Confirm moving a file to the Recycle Bin.
+#[derive(Clone)]
+struct RecycleDeletePrompt {
+    base: DeletePromptBase,
+}
+
+/// Confirm a permanent delete after Recycle Bin failed.
+#[derive(Clone)]
+struct PermanentDeletePrompt {
+    base: DeletePromptBase,
+    trash_error: String,
 }
 
 impl GigaMuxApp {
@@ -222,6 +250,8 @@ impl GigaMuxApp {
             cancel: Arc::new(AtomicBool::new(false)),
             event_rx: None,
             pending_check: None,
+            pending_recycle_delete: None,
+            pending_permanent_delete: None,
             input_rect: None,
             output_rect: None,
             cache_gen: Arc::new(AtomicU64::new(0)),
@@ -670,7 +700,8 @@ impl GigaMuxApp {
         }
     }
 
-    /// Delete the active file from disk (Del). Refuses while a job is running.
+    /// Delete the active file (Del). Refuses while a job is running.
+    /// Warns before Recycle Bin / permanent delete unless the user opted out.
     fn delete_active(&mut self) {
         let Some((side, name)) = self.active.clone() else {
             return;
@@ -678,6 +709,9 @@ impl GigaMuxApp {
         if self.busy {
             self.push_session("can't delete while a job is running");
             self.log_open = true;
+            return;
+        }
+        if self.pending_recycle_delete.is_some() || self.pending_permanent_delete.is_some() {
             return;
         }
         let dir = match side {
@@ -694,22 +728,98 @@ impl GigaMuxApp {
                 .or_else(|| (i > 0).then(|| &names[i - 1]))
                 .cloned()
         });
+        let base = DeletePromptBase {
+            side,
+            name,
+            path,
+            next_name,
+            dont_ask_again: false,
+        };
+        if self.prefs.warn_recycle_delete {
+            self.pending_recycle_delete = Some(RecycleDeletePrompt { base });
+        } else {
+            self.execute_recycle_delete(base);
+        }
+    }
 
-        match std::fs::remove_file(&path) {
+    /// Attempt Recycle Bin; on failure, escalate to permanent-delete warn/execute.
+    fn execute_recycle_delete(&mut self, base: DeletePromptBase) {
+        let DeletePromptBase {
+            side,
+            name,
+            path,
+            next_name,
+            ..
+        } = base;
+        match trash_file(&path) {
             Ok(()) => {
-                self.push_session(format!("deleted {name}"));
-                self.refresh_lists();
-                if let Some(n) = next_name.filter(|n| self.names_for(side).iter().any(|x| x == n)) {
-                    self.select_file(side, n);
-                } else {
-                    self.clear_active();
-                }
+                self.push_session(format!("moved to Recycle Bin: {name}"));
+                let key = Self::preview_key(side, &name);
+                self.preview_cache.remove(&key);
+                self.finish_delete_selection(side, &name, next_name);
+            }
+            Err(e) if e == "not present on disk" => {
+                self.push_session(format!("delete failed ({name}): {e}"));
+                self.log_open = true;
+                self.finish_delete_selection(side, &name, next_name);
             }
             Err(e) => {
-                self.push_session(format!("delete failed ({name}): {e}"));
+                if self.prefs.warn_permanent_delete {
+                    self.pending_permanent_delete = Some(PermanentDeletePrompt {
+                        base: DeletePromptBase {
+                            side,
+                            name,
+                            path,
+                            next_name,
+                            dont_ask_again: false,
+                        },
+                        trash_error: e,
+                    });
+                } else {
+                    self.execute_permanent_delete(side, name, path, next_name);
+                }
+            }
+        }
+    }
+
+    /// Re-list from disk and move selection after a successful or aborted delete.
+    fn finish_delete_selection(
+        &mut self,
+        side: FileSide,
+        name: &str,
+        next_name: Option<String>,
+    ) {
+        self.refresh_lists();
+        if let Some(n) = next_name.filter(|n| self.names_for(side).iter().any(|x| x == n)) {
+            self.select_file(side, n);
+        } else if self
+            .active
+            .as_ref()
+            .is_some_and(|(s, n)| *s == side && n == name)
+        {
+            self.clear_active();
+        }
+    }
+
+    fn execute_permanent_delete(
+        &mut self,
+        side: FileSide,
+        name: String,
+        path: PathBuf,
+        next_name: Option<String>,
+    ) {
+        match permanent_delete_file(&path) {
+            Ok(()) => {
+                self.push_session(format!("permanently deleted: {name}"));
+                let key = Self::preview_key(side, &name);
+                self.preview_cache.remove(&key);
+            }
+            Err(e) => {
+                self.push_session(format!("permanent delete failed ({name}): {e}"));
                 self.log_open = true;
             }
         }
+        self.finish_delete_selection(side, &name, next_name);
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -743,7 +853,11 @@ impl GigaMuxApp {
             self.start_encode(None);
         }
         if esc {
-            if self.show_settings {
+            if self.pending_permanent_delete.is_some() {
+                self.pending_permanent_delete = None;
+            } else if self.pending_recycle_delete.is_some() {
+                self.pending_recycle_delete = None;
+            } else if self.show_settings {
                 let _ = prefs::save(&self.prefs);
                 self.show_settings = false;
             } else {
@@ -1578,6 +1692,20 @@ impl GigaMuxApp {
                 .on_hover_text(
                     "Off (default): use average video bitrate. On: use 1s video peak.",
                 );
+                ui.checkbox(
+                    &mut self.prefs.warn_recycle_delete,
+                    "Warn before Recycle Bin",
+                )
+                .on_hover_text(
+                    "Confirm before moving a file to the Recycle Bin. Uncheck via the dialog’s “Don’t ask again.”",
+                );
+                ui.checkbox(
+                    &mut self.prefs.warn_permanent_delete,
+                    "Warn before permanent delete",
+                )
+                .on_hover_text(
+                    "When Recycle Bin fails, confirm before permanently deleting. Uncheck via the dialog’s “Don’t ask again.”",
+                );
                 ui.separator();
                 if ui.button("Close").clicked() {
                     let _ = prefs::save(&self.prefs);
@@ -1662,6 +1790,87 @@ impl GigaMuxApp {
             });
     }
 
+    fn ui_recycle_delete_prompt(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.pending_recycle_delete.clone() else {
+            return;
+        };
+        egui::Window::new("Move to Recycle Bin")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Move this file to the Recycle Bin?");
+                ui.label(egui::RichText::new(&prompt.base.name).strong());
+                ui.add_space(6.0);
+                ui.checkbox(&mut prompt.base.dont_ask_again, "Don't ask again");
+                if let Some(p) = self.pending_recycle_delete.as_mut() {
+                    p.base.dont_ask_again = prompt.base.dont_ask_again;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.pending_recycle_delete = None;
+                    }
+                    if ui.button("Move to Recycle Bin").clicked() {
+                        if prompt.base.dont_ask_again {
+                            self.prefs.warn_recycle_delete = false;
+                            let _ = prefs::save(&self.prefs);
+                        }
+                        self.pending_recycle_delete = None;
+                        self.execute_recycle_delete(prompt.base);
+                    }
+                });
+            });
+    }
+
+    fn ui_permanent_delete_prompt(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.pending_permanent_delete.clone() else {
+            return;
+        };
+        egui::Window::new("Permanent delete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 140, 60),
+                    "Recycle Bin failed — this will permanently delete the file.",
+                );
+                ui.label(egui::RichText::new(&prompt.base.name).strong());
+                ui.label(
+                    egui::RichText::new(format!("({})", prompt.trash_error))
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(6.0);
+                ui.checkbox(&mut prompt.base.dont_ask_again, "Don't ask again");
+                if let Some(p) = self.pending_permanent_delete.as_mut() {
+                    p.base.dont_ask_again = prompt.base.dont_ask_again;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.pending_permanent_delete = None;
+                    }
+                    let del = ui.add(
+                        egui::Button::new("Delete permanently")
+                            .fill(egui::Color32::from_rgb(160, 50, 40)),
+                    );
+                    if del.clicked() {
+                        if prompt.base.dont_ask_again {
+                            self.prefs.warn_permanent_delete = false;
+                            let _ = prefs::save(&self.prefs);
+                        }
+                        self.pending_permanent_delete = None;
+                        self.execute_permanent_delete(
+                            prompt.base.side,
+                            prompt.base.name,
+                            prompt.base.path,
+                            prompt.base.next_name,
+                        );
+                    }
+                });
+            });
+    }
+
     fn ui_check_prompt(&mut self, ctx: &egui::Context) {
         let Some(prompt) = self.pending_check.clone() else {
             return;
@@ -1697,7 +1906,7 @@ impl GigaMuxApp {
                             let (deleted, failed) =
                                 delete_issue_outputs(&self.prefs.output_dir, &prompt.deletable);
                             self.push_session(format!(
-                                "deleted {deleted} output(s); failed {failed}"
+                                "Recycle Bin: {deleted} output(s); failed {failed}"
                             ));
                             self.pending_check = None;
                             self.refresh_lists();
@@ -2030,6 +2239,8 @@ impl eframe::App for GigaMuxApp {
 
         self.ui_settings(&ctx);
         self.ui_check_prompt(&ctx);
+        self.ui_recycle_delete_prompt(&ctx);
+        self.ui_permanent_delete_prompt(&ctx);
     }
 
     fn on_exit(&mut self) {
