@@ -20,8 +20,8 @@ use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
-    media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, thumbnail_rgba, FrameTiming, MediaSummary,
-    RgbaThumb, THUMB_W,
+    media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag, rate_mode_heat,
+    thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
@@ -2376,32 +2376,45 @@ impl GigaMuxApp {
                                 .and_then(|e| e.to_str())
                                 .unwrap_or("")
                                 .to_ascii_lowercase();
-                            // Codec (+ optional α) chips from preview cache; muted … while probing.
+                            // Codec (+ α) + chroma + CBR/VBR from preview cache; muted … while probing.
                             let cache_key = Self::preview_key(side, &name);
-                            // Codec (+ α) + chroma chip from preview cache; muted … while probing.
                             let tags = self.preview_cache.get(&cache_key).and_then(|e| {
                                 if e.pending {
-                                    return Some((None, false, None));
+                                    return Some((None, false, None, None));
                                 }
                                 e.summary.as_ref().and_then(|r| r.as_ref().ok()).map(|s| {
+                                    let rate = if e.bitrates_ready {
+                                        rate_mode_chip_tag(
+                                            s.avg_video_kbps,
+                                            s.peak_video_kbps,
+                                            s.duration_s,
+                                        )
+                                        .map(|t| t.to_string())
+                                    } else {
+                                        None
+                                    };
                                     (
                                         Some(codec_tag(s)),
                                         s.has_alpha,
                                         pix_fmt_chip_tag(&s.pix_fmt),
+                                        rate,
                                     )
                                 })
                             });
                             let row = ui.horizontal(|ui| {
                                 let resp = ui.selectable_label(selected, &name);
                                 match &tags {
-                                    Some((None, _, _)) => codec_chip(ui, "…"),
-                                    Some((Some(tag), has_alpha, chroma)) => {
+                                    Some((None, _, _, _)) => codec_chip(ui, "…"),
+                                    Some((Some(tag), has_alpha, chroma, rate)) => {
                                         codec_chip(ui, tag);
                                         if *has_alpha {
                                             alpha_chip(ui);
                                         }
                                         if let Some(c) = chroma {
                                             pix_fmt_chip(ui, c);
+                                        }
+                                        if let Some(r) = rate {
+                                            rate_mode_chip(ui, r);
                                         }
                                     }
                                     None => {}
@@ -2842,6 +2855,15 @@ impl GigaMuxApp {
                     }
                     if let Some(c) = pix_fmt_chip_tag(&s.pix_fmt) {
                         pix_fmt_chip(ui, &c);
+                    }
+                    if bitrates_ready {
+                        if let Some(r) = rate_mode_chip_tag(
+                            s.avg_video_kbps,
+                            s.peak_video_kbps,
+                            s.duration_s,
+                        ) {
+                            rate_mode_chip(ui, r);
+                        }
                     }
                     if let Some(p) = &s.video_profile {
                         ui.monospace(format!("({p})"));
@@ -3398,6 +3420,12 @@ fn alpha_chip(ui: &mut egui::Ui) {
 /// Chroma / bit-depth chip from ffprobe `pix_fmt` (e.g. `4:2:2`, `4:2:0 10`).
 fn pix_fmt_chip(ui: &mut egui::Ui, tag: &str) {
     let (bg, fg) = heat_chip_colors(pix_fmt_heat(tag), ui.visuals().dark_mode);
+    tag_chip(ui, tag, bg, fg);
+}
+
+/// Detected source rate mode (CBR / VBR) from peak÷avg once peeks are ready.
+fn rate_mode_chip(ui: &mut egui::Ui, tag: &str) {
+    let (bg, fg) = heat_chip_colors(rate_mode_heat(tag), ui.visuals().dark_mode);
     tag_chip(ui, tag, bg, fg);
 }
 

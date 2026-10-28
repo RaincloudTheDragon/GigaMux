@@ -228,6 +228,37 @@ pub fn pix_fmt_chip_tag(pix: &str) -> Option<String> {
     Some(tag.into())
 }
 
+/// Minimum duration for peak÷avg to mean anything (1s peak buckets need several samples).
+const RATE_MODE_MIN_DURATION_S: f64 = 3.0;
+
+/// Peak may sit this far above avg and still count as CBR (OBS/NVENC CBR VBV overshoot).
+const RATE_MODE_CBR_PEAK_RATIO: f32 = 1.35;
+
+/// Detect source CBR vs VBR from enriched peak/avg once both are known.
+/// Near-flat peak≈avg → CBR; peak clearly above average → VBR.
+/// Returns `None` when rates are missing or the clip is too short for the heuristic.
+pub fn rate_mode_chip_tag(avg_kbps: u32, peak_kbps: u32, duration_s: f64) -> Option<&'static str> {
+    if avg_kbps == 0 || peak_kbps == 0 || duration_s < RATE_MODE_MIN_DURATION_S {
+        return None;
+    }
+    let ratio = peak_kbps as f32 / avg_kbps as f32;
+    // 1.20 was too tight: OBS CBR 20M often shows ~1.22–1.30 on 1s peak samples.
+    if ratio <= RATE_MODE_CBR_PEAK_RATIO {
+        Some("CBR")
+    } else {
+        Some("VBR")
+    }
+}
+
+/// Cool→warm heat for rate-mode chips: CBR cooler (locked), VBR warmer (variable).
+pub fn rate_mode_heat(tag: &str) -> f32 {
+    match tag.trim().to_ascii_uppercase().as_str() {
+        "CBR" => 0.28,
+        "VBR" => 0.82,
+        _ => 0.45,
+    }
+}
+
 /// Cool→warm heat for chroma chips: narrower sampling cooler, wider warmer (4:2:0 → 4:4:4).
 pub fn pix_fmt_heat(chip_or_pix: &str) -> f32 {
     let t = chip_or_pix.trim().to_ascii_lowercase();

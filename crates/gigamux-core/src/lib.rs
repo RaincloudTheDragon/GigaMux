@@ -17,9 +17,8 @@ pub use gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 pub use prefs::Prefs;
 pub use probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
-    pix_fmt_chip_tag, pix_fmt_heat,
-    media_summary, media_summary_fast, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb,
-    THUMB_W,
+    media_summary, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,
+    rate_mode_heat, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
 };
 pub use targets::{
     alpha_pair_ok, audio_encode_for, audio_must_recode, cycle_alpha_container,
