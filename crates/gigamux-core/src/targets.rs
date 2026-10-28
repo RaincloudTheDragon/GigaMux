@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OpaqueVideo {
-    #[default]
     Hevc,
     H264,
+    #[default]
     Av1,
     Vp9,
     Vp8,
@@ -429,7 +429,7 @@ pub struct OutputTargets {
 impl Default for OutputTargets {
     fn default() -> Self {
         Self {
-            opaque_video: OpaqueVideo::Hevc,
+            opaque_video: OpaqueVideo::Av1,
             opaque_container: OutContainer::Mp4,
             alpha_video: AlphaVideo::Vp9,
             alpha_container: OutContainer::Webm,
