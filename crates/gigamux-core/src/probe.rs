@@ -51,7 +51,7 @@ pub fn file_info(path: &Path) -> Result<Value, String> {
 }
 
 /// Constant vs variable frame timing (r_frame_rate vs avg_frame_rate).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FrameTiming {
     Cfr,
     Vfr,
@@ -59,7 +59,7 @@ pub enum FrameTiming {
 }
 
 /// Source media summary for the preview pane.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MediaSummary {
     pub container: String,
     pub duration_s: f64,

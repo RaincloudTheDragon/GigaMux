@@ -4,6 +4,7 @@ pub mod check;
 pub mod encode;
 pub mod gpu;
 pub mod prefs;
+pub mod preview_cache;
 pub mod probe;
 pub mod targets;
 

@@ -18,6 +18,7 @@ use gigamux_core::check::{
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 use gigamux_core::prefs::{self, Prefs};
+use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
     codec_heat, codec_tag, container_heat, format_bytes, format_length, media_summary,
     thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
@@ -116,7 +117,7 @@ struct PreviewReady {
     thumb: Result<RgbaThumb, String>,
 }
 
-/// Cached thumb + metadata for one input file (filled by background pre-cache).
+/// Cached thumb + metadata for one file (RAM + optional AppData persistence).
 struct PreviewCacheEntry {
     summary: Option<Result<MediaSummary, String>>,
     thumb: Option<Result<RgbaThumb, String>>,
@@ -125,6 +126,10 @@ struct PreviewCacheEntry {
     pending: bool,
     /// Matches [`MediaSummary::SCHEMA`] when filled so stale shapes re-fetch.
     schema: u32,
+    /// Absolute path + fingerprint for freshness checks across sessions.
+    source_path: Option<PathBuf>,
+    file_size: u64,
+    mtime_secs: i64,
 }
 
 impl PreviewCacheEntry {
@@ -135,11 +140,35 @@ impl PreviewCacheEntry {
             texture: None,
             pending: true,
             schema: 0,
+            source_path: None,
+            file_size: 0,
+            mtime_secs: 0,
         }
     }
 
     fn ready(&self) -> bool {
         !self.pending && self.summary.is_some() && self.schema == MediaSummary::SCHEMA
+    }
+
+    /// Ready and still matches the file on disk at `path`.
+    fn fresh_for(&self, path: &Path) -> bool {
+        if !self.ready() {
+            return false;
+        }
+        let Some((size, mtime)) = preview_cache::file_fingerprint(path) else {
+            return false;
+        };
+        if self.file_size != size || self.mtime_secs != mtime {
+            return false;
+        }
+        match &self.source_path {
+            Some(src) if src == path => true,
+            Some(src) => match (std::fs::canonicalize(src), std::fs::canonicalize(path)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            },
+            None => false,
+        }
     }
 }
 
@@ -362,6 +391,7 @@ impl GigaMuxApp {
             cache_rx: None,
             encode_progress: None,
         };
+        app.load_preview_cache_from_disk();
         app.refresh_lists();
         let started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         app.push_session(format!("—— session start {started} ——"));
@@ -572,6 +602,102 @@ impl GigaMuxApp {
         keys
     }
 
+    /// Hydrate RAM cache from AppData (textures filled later via [`Self::hydrate_preview_textures`]).
+    fn load_preview_cache_from_disk(&mut self) {
+        let disk = preview_cache::load(MediaSummary::SCHEMA);
+        for (key, pe) in disk.entries {
+            let thumb = if pe.thumb_err.is_some() || pe.thumb_file.is_some() {
+                Some(preview_cache::load_thumb(&pe))
+            } else {
+                None
+            };
+            self.preview_cache.insert(
+                key,
+                PreviewCacheEntry {
+                    summary: Some(pe.summary),
+                    thumb,
+                    texture: None,
+                    pending: false,
+                    schema: MediaSummary::SCHEMA,
+                    source_path: Some(pe.path),
+                    file_size: pe.size,
+                    mtime_secs: pe.mtime_secs,
+                },
+            );
+        }
+    }
+
+    /// Write RAM cache to AppData (meta JSON + thumb files).
+    fn save_preview_cache_to_disk(&self) {
+        let mut entries = HashMap::new();
+        for (key, e) in &self.preview_cache {
+            if !e.ready() {
+                continue;
+            }
+            let Some(path) = e.source_path.clone() else {
+                continue;
+            };
+            let Some(summary) = e.summary.clone() else {
+                continue;
+            };
+            let (thumb_file, thumb_width, thumb_height, thumb_err) = match &e.thumb {
+                Some(Ok(thumb)) => match preview_cache::write_thumb(key, thumb) {
+                    Ok(name) => (Some(name), thumb.width, thumb.height, None),
+                    Err(err) => (None, 0, 0, Some(err)),
+                },
+                Some(Err(err)) => (None, 0, 0, Some(err.clone())),
+                None => (None, 0, 0, None),
+            };
+            entries.insert(
+                key.clone(),
+                PersistedPreviewEntry {
+                    path,
+                    size: e.file_size,
+                    mtime_secs: e.mtime_secs,
+                    summary,
+                    thumb_file,
+                    thumb_width,
+                    thumb_height,
+                    thumb_err,
+                },
+            );
+        }
+        let disk = PersistedPreviewCache {
+            schema: MediaSummary::SCHEMA,
+            entries,
+        };
+        let _ = preview_cache::save(&disk);
+    }
+
+    /// Wipe RAM + AppData preview cache (Ctrl+F5).
+    fn clear_preview_cache(&mut self) {
+        self.cache_gen.fetch_add(1, Ordering::Relaxed);
+        self.cache_rx = None;
+        self.preview_cache.clear();
+        let _ = preview_cache::clear();
+    }
+
+    /// Build egui textures for disk-loaded thumbs that have none yet.
+    fn hydrate_preview_textures(&mut self, ctx: &egui::Context) {
+        for (key, entry) in self.preview_cache.iter_mut() {
+            if entry.texture.is_some() {
+                continue;
+            }
+            let Some(Ok(thumb)) = entry.thumb.as_ref() else {
+                continue;
+            };
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [thumb.width as usize, thumb.height as usize],
+                &thumb.rgba,
+            );
+            entry.texture = Some(ctx.load_texture(
+                format!("thumb-{key}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+    }
+
     /// Drop stale cache entries and pre-cache thumbs/metadata for input + output files.
     fn start_preview_cache(&mut self) {
         let mut jobs: Vec<(String, PathBuf)> = Vec::new();
@@ -595,7 +721,7 @@ impl GigaMuxApp {
 
         let mut to_fetch = Vec::new();
         for (key, path) in jobs {
-            if self.preview_cache.get(&key).is_some_and(|e| e.ready()) {
+            if self.preview_cache.get(&key).is_some_and(|e| e.fresh_for(&path)) {
                 continue;
             }
             self.preview_cache
@@ -650,6 +776,23 @@ impl GigaMuxApp {
                 egui::TextureOptions::LINEAR,
             ));
         }
+        // Resolve path + fingerprint from the current folder lists.
+        let (source_path, file_size, mtime_secs) = {
+            let path = if let Some(name) = msg.name.strip_prefix("i:") {
+                Some(self.prefs.input_dir.join(name))
+            } else if let Some(name) = msg.name.strip_prefix("o:") {
+                Some(self.prefs.output_dir.join(name))
+            } else {
+                None
+            };
+            match path {
+                Some(p) => {
+                    let (sz, mt) = preview_cache::file_fingerprint(&p).unwrap_or((0, 0));
+                    (Some(p), sz, mt)
+                }
+                None => (None, 0, 0),
+            }
+        };
         let entry = self
             .preview_cache
             .entry(msg.name)
@@ -659,9 +802,13 @@ impl GigaMuxApp {
         entry.summary = Some(msg.summary);
         entry.thumb = Some(msg.thumb);
         entry.texture = texture;
+        entry.source_path = source_path;
+        entry.file_size = file_size;
+        entry.mtime_secs = mtime_secs;
     }
 
     fn poll_preview_cache(&mut self, ctx: &egui::Context) {
+        self.hydrate_preview_textures(ctx);
         let Some(rx) = self.cache_rx.take() else {
             return;
         };
@@ -683,6 +830,9 @@ impl GigaMuxApp {
         if keep {
             self.cache_rx = Some(rx);
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        } else if got_any {
+            // Worker finished — persist meta + thumbs for the next session.
+            self.save_preview_cache_to_disk();
         }
         if got_any {
             ctx.request_repaint();
@@ -1416,14 +1566,16 @@ impl GigaMuxApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (ctrl_j, ctrl_z, ctrl_shift_z, f5, f12, esc, arrow_up, arrow_down, arrow_left, arrow_right, delete) =
+        let (ctrl_j, ctrl_z, ctrl_shift_z, f5, ctrl_f5, f12, esc, arrow_up, arrow_down, arrow_left, arrow_right, delete) =
             ctx.input(|i| {
                 let z = i.key_pressed(egui::Key::Z);
+                let f5_pressed = i.key_pressed(egui::Key::F5);
                 (
                     i.modifiers.command && i.key_pressed(egui::Key::J),
                     i.modifiers.command && !i.modifiers.shift && z,
                     i.modifiers.command && i.modifiers.shift && z,
-                    i.key_pressed(egui::Key::F5),
+                    f5_pressed && !i.modifiers.command,
+                    f5_pressed && i.modifiers.command,
                     i.key_pressed(egui::Key::F12),
                     i.key_pressed(egui::Key::Escape),
                     i.key_pressed(egui::Key::ArrowUp),
@@ -1446,7 +1598,12 @@ impl GigaMuxApp {
         } else if ctrl_z {
             self.undo_last_delete();
         }
-        if f5 {
+        // F5 = re-index files (keep meta/thumb cache); Ctrl+F5 = wipe cache then re-index.
+        if ctrl_f5 {
+            self.clear_preview_cache();
+            self.refresh_lists();
+            self.push_session("cleared preview cache; reloaded file lists");
+        } else if f5 {
             self.refresh_lists();
             self.push_session("reloaded file lists");
         }
@@ -2968,5 +3125,6 @@ impl eframe::App for GigaMuxApp {
 
     fn on_exit(&mut self) {
         let _ = prefs::save(&self.prefs);
+        self.save_preview_cache_to_disk();
     }
 }
