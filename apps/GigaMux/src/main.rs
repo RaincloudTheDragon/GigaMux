@@ -3192,6 +3192,35 @@ impl GigaMuxApp {
             });
     }
 
+    /// Lines for the log view currently shown (session vs active file).
+    fn visible_log_lines(&self) -> Vec<String> {
+        let log_name = self.log_file_name();
+        let showing_session = self.log_show_session || log_name.is_none();
+        if showing_session {
+            self.session_log.clone()
+        } else if let Some(name) = log_name {
+            self.file_logs.get(&name).cloned().unwrap_or_default()
+        } else {
+            self.session_log.clone()
+        }
+    }
+
+    /// Clipboard text for the copy control: file log as-is; session log from latest `—— session start`.
+    fn visible_log_text(&self) -> String {
+        let log_name = self.log_file_name();
+        let showing_session = self.log_show_session || log_name.is_none();
+        if showing_session {
+            let lines = &self.session_log;
+            let start = lines
+                .iter()
+                .rposition(|l| l.starts_with("—— session start"))
+                .unwrap_or(0);
+            lines[start..].join("\n")
+        } else {
+            self.visible_log_lines().join("\n")
+        }
+    }
+
     fn ui_log_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("log_bar")
             .exact_size(if self.log_open { 220.0 } else { 28.0 })
@@ -3237,21 +3266,22 @@ impl GigaMuxApp {
                         {
                             self.log_open = !self.log_open;
                         }
+                        // Two-squares copy control (painted — no emoji font required).
+                        if copy_icon_button(ui)
+                            .on_hover_text("Copy log to clipboard")
+                            .clicked()
+                        {
+                            let text = self.visible_log_text();
+                            ui.ctx().copy_text(text);
+                        }
                     });
                 });
                 if !self.log_open {
                     return;
                 }
                 ui.separator();
-                let log_name = self.log_file_name();
-                let showing_session = self.log_show_session || log_name.is_none();
-                let lines: Vec<String> = if showing_session {
-                    self.session_log.clone()
-                } else if let Some(name) = log_name {
-                    self.file_logs.get(&name).cloned().unwrap_or_default()
-                } else {
-                    self.session_log.clone()
-                };
+                let lines = self.visible_log_lines();
+                let showing_session = self.log_show_session || self.log_file_name().is_none();
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
@@ -3491,6 +3521,31 @@ fn select_tag_chip(
             )
         });
     enabled && inner.inner.clicked()
+}
+
+/// Standard “two overlapping squares” copy control (stroke only — no emoji glyph).
+fn copy_icon_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::vec2(18.0, 18.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    let stroke = egui::Stroke::new(1.2, visuals.fg_stroke.color);
+    let painter = ui.painter();
+    // Back square (offset up-right) then front square (down-left) — classic copy glyph.
+    let back = egui::Rect::from_min_size(
+        rect.min + egui::vec2(5.0, 2.5),
+        egui::vec2(9.0, 9.0),
+    );
+    let front = egui::Rect::from_min_size(
+        rect.min + egui::vec2(2.5, 5.5),
+        egui::vec2(9.0, 9.0),
+    );
+    if response.hovered() || response.highlighted() {
+        painter.rect_filled(rect, 3.0, visuals.weak_bg_fill);
+    }
+    painter.rect_stroke(back, 1.0, stroke, egui::StrokeKind::Outside);
+    painter.rect_filled(front, 1.0, visuals.weak_bg_fill);
+    painter.rect_stroke(front, 1.0, stroke, egui::StrokeKind::Outside);
+    response
 }
 
 /// Codec chip: warm→cool spectrum tint from [`codec_heat`].
