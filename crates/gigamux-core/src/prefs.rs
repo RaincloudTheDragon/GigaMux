@@ -24,6 +24,9 @@ pub struct Prefs {
     /// NVENC for HEVC/H.264/AV1 when true; CPU encoders when false. Default on.
     #[serde(default = "default_true")]
     pub use_hardware: bool,
+    /// When set, replaces the automatic video ceiling (maxrate / bufsize) in kbps.
+    #[serde(default)]
+    pub maxrate_override_k: Option<u32>,
     #[serde(default)]
     pub opaque_video: OpaqueVideo,
     #[serde(default)]
@@ -53,6 +56,7 @@ impl Default for Prefs {
             preserve_obs_metadata: false,
             use_peak_bitrate: false,
             use_hardware: true,
+            maxrate_override_k: None,
             opaque_video: OpaqueVideo::Hevc,
             opaque_container: OutContainer::Mp4,
             alpha_video: AlphaVideo::Vp9,

@@ -206,6 +206,8 @@ enum FileSide {
 
 struct GigaMuxApp {
     prefs: Prefs,
+    /// Draft text for the maxrate override field (keeps typing stable across frames).
+    maxrate_override_edit: String,
     devices: Vec<NvencDevice>,
     gpu_warn: Option<String>,
     input_files: Vec<PathBuf>,
@@ -402,8 +404,13 @@ impl GigaMuxApp {
         };
         let (gpu, warn) = prefs.gpu.sanitize(&devices);
         prefs.gpu = gpu;
+        let maxrate_override_edit = prefs
+            .maxrate_override_k
+            .map(|k| k.to_string())
+            .unwrap_or_default();
         let mut app = Self {
             prefs,
+            maxrate_override_edit,
             devices,
             gpu_warn: warn,
             input_files: Vec::new(),
@@ -1208,6 +1215,11 @@ impl GigaMuxApp {
                     p.sanitize_targets();
                     let (gpu, warn) = p.gpu.sanitize(&self.devices);
                     self.prefs = Prefs { gpu, ..p };
+                    self.maxrate_override_edit = self
+                        .prefs
+                        .maxrate_override_k
+                        .map(|k| k.to_string())
+                        .unwrap_or_default();
                     self.gpu_warn = warn;
                     let _ = prefs::save(&self.prefs);
                     self.refresh_lists();
@@ -1229,6 +1241,7 @@ impl GigaMuxApp {
             self.log_open = true;
             return;
         }
+        self.commit_maxrate_override_edit();
         let _ = prefs::save(&self.prefs);
         self.cancel.store(false, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
@@ -1239,6 +1252,7 @@ impl GigaMuxApp {
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
             use_hardware: self.prefs.use_hardware,
+            maxrate_override_k: self.prefs.maxrate_override_k,
             opaque_video: self.prefs.opaque_video,
             opaque_container: self.prefs.opaque_container,
             alpha_video: self.prefs.alpha_video,
@@ -2322,6 +2336,50 @@ impl GigaMuxApp {
         None
     }
 
+    /// Apply the maxrate draft into prefs (empty → auto; invalid → keep previous).
+    fn commit_maxrate_override_edit(&mut self) {
+        let trimmed = self.maxrate_override_edit.trim();
+        let next = if trimmed.is_empty() {
+            None
+        } else {
+            trimmed.parse::<u32>().ok().filter(|&k| k > 0)
+        };
+        if next.is_none() && !trimmed.is_empty() {
+            self.maxrate_override_edit = self
+                .prefs
+                .maxrate_override_k
+                .map(|k| k.to_string())
+                .unwrap_or_default();
+            return;
+        }
+        if next != self.prefs.maxrate_override_k {
+            self.prefs.maxrate_override_k = next;
+            self.maxrate_override_edit = next.map(|k| k.to_string()).unwrap_or_default();
+            self.save_targets();
+        }
+    }
+
+    /// Optional maxrate kbps next to Use hardware; empty = automatic ceiling.
+    fn ui_maxrate_override(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Maxrate").weak().small());
+        let edit = ui
+            .add(
+                egui::TextEdit::singleline(&mut self.maxrate_override_edit)
+                    .desired_width(64.0)
+                    .hint_text("auto")
+                    .font(egui::TextStyle::Monospace),
+            )
+            .on_hover_text(
+                "Override automatic encode maxrate (kbps). Leave empty for auto from source avg/peak.",
+            );
+        // Commit on Enter or focus loss so partial typing (e.g. "12" of "12000") isn't saved early.
+        if edit.lost_focus() || (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+        {
+            self.commit_maxrate_override_edit();
+        }
+        ui.label(egui::RichText::new("kbps").weak().small());
+    }
+
     fn ui_output_targets(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Targets").strong().small());
         // One cycling codec chip + one cycling container chip per path.
@@ -2359,15 +2417,18 @@ impl GigaMuxApp {
             }
         });
         ui.add_space(4.0);
-        if ui
-            .checkbox(&mut self.prefs.use_hardware, "Use hardware")
-            .on_hover_text(
-                "On: NVIDIA NVENC — matches source chroma when supported (no 4:2:2; warns on fallback). Off: CPU and keep source chroma. VP8/VP9 and α stay 4:2:0.",
-            )
-            .changed()
-        {
-            self.save_targets();
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.prefs.use_hardware, "Use hardware")
+                .on_hover_text(
+                    "On: NVIDIA NVENC — matches source chroma when supported (no 4:2:2; warns on fallback). Off: CPU and keep source chroma. VP8/VP9 and α stay 4:2:0.",
+                )
+                .changed()
+            {
+                self.save_targets();
+            }
+            self.ui_maxrate_override(ui);
+        });
         if let Some(warn) = self.chroma_convert_warning() {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
         }
@@ -3100,15 +3161,18 @@ impl GigaMuxApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                if ui
-                    .checkbox(&mut self.prefs.use_hardware, "Use hardware")
-                    .on_hover_text(
-                        "On: NVIDIA NVENC — match source chroma when supported; warn on fallback. Off: CPU keep source.",
-                    )
-                    .changed()
-                {
-                    let _ = prefs::save(&self.prefs);
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut self.prefs.use_hardware, "Use hardware")
+                        .on_hover_text(
+                            "On: NVIDIA NVENC — match source chroma when supported; warn on fallback. Off: CPU keep source.",
+                        )
+                        .changed()
+                    {
+                        let _ = prefs::save(&self.prefs);
+                    }
+                    self.ui_maxrate_override(ui);
+                });
                 ui.add_enabled_ui(self.prefs.use_hardware, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("GPU");

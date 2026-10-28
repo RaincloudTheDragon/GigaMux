@@ -60,6 +60,8 @@ pub struct EncodeOptions {
     pub use_peak_bitrate: bool,
     /// NVENC for HEVC/H.264/AV1 when true; CPU (libx265/x264/aom) when false. VP8/VP9 always CPU.
     pub use_hardware: bool,
+    /// When set, replaces automatic video ceiling (maxrate) in kbps.
+    pub maxrate_override_k: Option<u32>,
     pub opaque_video: OpaqueVideo,
     pub opaque_container: OutContainer,
     pub alpha_video: AlphaVideo,
@@ -673,8 +675,13 @@ pub fn run_batch(
             total: total_files,
             duration_s,
         });
-        let (bitrate_k, src_label) =
+        let (auto_k, auto_label) =
             video_ceiling_k(&input, &info, opts.use_peak_bitrate);
+        // Manual override replaces auto ceiling so users can raise (or lower) maxrate.
+        let (bitrate_k, src_label) = match opts.maxrate_override_k.filter(|&k| k > 0) {
+            Some(k) => (k, format!("override {k}k (auto {auto_k}k / {auto_label})")),
+            None => (auto_k, auto_label),
+        };
         let use_nvenc = opts.use_hardware && opts.opaque_video.is_nvenc() && !has_alpha;
         let path_label = if has_alpha {
             format!("α {} {}", opts.alpha_video.label(), opts.alpha_container.label())

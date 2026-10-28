@@ -20,6 +20,7 @@ fn main() {
         preserve_obs_metadata: false,
         use_peak_bitrate: false,
         use_hardware: true,
+        maxrate_override_k: None,
         opaque_video: OpaqueVideo::Hevc,
         opaque_container: OutContainer::Mp4,
         alpha_video: AlphaVideo::Vp9,
@@ -29,7 +30,9 @@ fn main() {
     run_batch(opts, Arc::new(AtomicBool::new(false)), |ev| match ev {
         EncodeEvent::Log(m) => println!("log: {m}"),
         EncodeEvent::FileStarted { name, .. } => println!("start: {name}"),
-        EncodeEvent::BatchStarted { .. } | EncodeEvent::FileProgress { .. } => {}
+        EncodeEvent::BatchStarted { .. }
+        | EncodeEvent::FileProgress { .. }
+        | EncodeEvent::LiveThumb { .. } => {}
         EncodeEvent::FileSkipped { name } => println!("skip: {name}"),
         EncodeEvent::FileDone { name } => println!("done: {name}"),
         EncodeEvent::FileFailed { name, error } => println!("fail: {name}: {error}"),
