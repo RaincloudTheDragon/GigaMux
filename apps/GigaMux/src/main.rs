@@ -1291,6 +1291,23 @@ impl GigaMuxApp {
         }
     }
 
+    /// Shift+↑/↓/PgUp/PgDn: inclusive range from selection anchor to the landed row.
+    fn navigate_list_extend(&mut self, delta: isize) {
+        let Some((side, cur)) = self.active.clone() else {
+            return;
+        };
+        let names = self.names_for(side);
+        if names.is_empty() {
+            return;
+        }
+        let Some(idx) = names.iter().position(|n| n == &cur) else {
+            return;
+        };
+        let next = (idx as isize + delta).clamp(0, names.len() as isize - 1) as usize;
+        self.select_range(side, names[next].clone());
+        self.scroll_sel_into_view = true;
+    }
+
     /// Jump selection to the first (`to_start`) or last file on the active side.
     fn navigate_list_edge(&mut self, to_start: bool) {
         let Some((side, _)) = self.active else {
@@ -1310,6 +1327,24 @@ impl GigaMuxApp {
             return;
         }
         self.select_file(side, name);
+        self.scroll_sel_into_view = true;
+    }
+
+    /// Shift+Home/End: inclusive range from selection anchor to list edge; primary lands on the edge.
+    fn navigate_list_edge_extend(&mut self, to_start: bool) {
+        let Some((side, _)) = self.active.clone() else {
+            return;
+        };
+        let names = self.names_for(side);
+        let Some(name) = (if to_start {
+            names.first()
+        } else {
+            names.last()
+        })
+        .cloned() else {
+            return;
+        };
+        self.select_range(side, name);
         self.scroll_sel_into_view = true;
     }
 
@@ -1805,6 +1840,7 @@ impl GigaMuxApp {
             page_down,
             delete,
             ctrl,
+            shift,
         ) = ctx.input(|i| {
             let z = i.key_pressed(egui::Key::Z);
             let f5_pressed = i.key_pressed(egui::Key::F5);
@@ -1826,6 +1862,7 @@ impl GigaMuxApp {
                 i.key_pressed(egui::Key::PageDown),
                 i.key_pressed(egui::Key::Delete),
                 i.modifiers.command,
+                i.modifiers.shift,
             )
         });
         // Ctrl+J toggles log even while typing in a field.
@@ -1873,17 +1910,37 @@ impl GigaMuxApp {
                 self.cancel_encode();
             }
         }
-        // List nav: ↑/↓ step; Ctrl+↑/↓ + Home/End jump edges; PgUp/PgDn by visible page.
-        if home || (ctrl && arrow_up) {
+        // List nav: ↑/↓ step; Ctrl+↑/↓ + Home/End jump edges; Shift+Home/End/PgUp/PgDn range-select.
+        if home {
+            if shift {
+                self.navigate_list_edge_extend(true);
+            } else {
+                self.navigate_list_edge(true);
+            }
+        } else if end {
+            if shift {
+                self.navigate_list_edge_extend(false);
+            } else {
+                self.navigate_list_edge(false);
+            }
+        } else if ctrl && arrow_up {
             self.navigate_list_edge(true);
-        } else if end || (ctrl && arrow_down) {
+        } else if ctrl && arrow_down {
             self.navigate_list_edge(false);
         } else if page_up {
             let page = self.folder_page_rows.max(1) as isize;
-            self.navigate_list(-page);
+            if shift {
+                self.navigate_list_extend(-page);
+            } else {
+                self.navigate_list(-page);
+            }
         } else if page_down {
             let page = self.folder_page_rows.max(1) as isize;
-            self.navigate_list(page);
+            if shift {
+                self.navigate_list_extend(page);
+            } else {
+                self.navigate_list(page);
+            }
         } else if arrow_up {
             self.navigate_list(-1);
         } else if arrow_down {
