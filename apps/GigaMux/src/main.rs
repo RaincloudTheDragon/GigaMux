@@ -241,6 +241,10 @@ struct GigaMuxApp {
     /// Last-frame hit rects for folder drag-and-drop targeting.
     input_rect: Option<egui::Rect>,
     output_rect: Option<egui::Rect>,
+    /// Visible row count for PgUp/PgDn (updated while painting the active folder list).
+    folder_page_rows: usize,
+    /// After keyboard nav, scroll the primary row into view once.
+    scroll_sel_into_view: bool,
     /// Invalidates in-flight pre-cache workers when the input folder changes.
     cache_gen: Arc<AtomicU64>,
     preview_cache: HashMap<String, PreviewCacheEntry>,
@@ -422,6 +426,8 @@ impl GigaMuxApp {
             history_nav: None,
             input_rect: None,
             output_rect: None,
+            folder_page_rows: 10,
+            scroll_sel_into_view: false,
             cache_gen: Arc::new(AtomicU64::new(0)),
             preview_cache: HashMap::new(),
             cache_rx: None,
@@ -1261,7 +1267,7 @@ impl GigaMuxApp {
         }
     }
 
-    /// Move selection by `delta` (±1) within the active side's list.
+    /// Move selection by `delta` within the active side's list (clamped).
     fn navigate_list(&mut self, delta: isize) {
         let Some((side, cur)) = self.active.clone() else {
             return;
@@ -1276,7 +1282,30 @@ impl GigaMuxApp {
         let next = (idx as isize + delta).clamp(0, names.len() as isize - 1) as usize;
         if next != idx {
             self.select_file(side, names[next].clone());
+            self.scroll_sel_into_view = true;
         }
+    }
+
+    /// Jump selection to the first (`to_start`) or last file on the active side.
+    fn navigate_list_edge(&mut self, to_start: bool) {
+        let Some((side, _)) = self.active else {
+            return;
+        };
+        let names = self.names_for(side);
+        let Some(name) = (if to_start {
+            names.first()
+        } else {
+            names.last()
+        })
+        .cloned() else {
+            return;
+        };
+        if self.active.as_ref().is_some_and(|(_, n)| *n == name) {
+            self.scroll_sel_into_view = true;
+            return;
+        }
+        self.select_file(side, name);
+        self.scroll_sel_into_view = true;
     }
 
     /// ← input / → output: jump to the same-stem file on that side.
@@ -1753,25 +1782,47 @@ impl GigaMuxApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (ctrl_j, ctrl_z, ctrl_shift_z, f5, ctrl_f5, f12, esc, arrow_up, arrow_down, arrow_left, arrow_right, delete) =
-            ctx.input(|i| {
-                let z = i.key_pressed(egui::Key::Z);
-                let f5_pressed = i.key_pressed(egui::Key::F5);
-                (
-                    i.modifiers.command && i.key_pressed(egui::Key::J),
-                    i.modifiers.command && !i.modifiers.shift && z,
-                    i.modifiers.command && i.modifiers.shift && z,
-                    f5_pressed && !i.modifiers.command,
-                    f5_pressed && i.modifiers.command,
-                    i.key_pressed(egui::Key::F12),
-                    i.key_pressed(egui::Key::Escape),
-                    i.key_pressed(egui::Key::ArrowUp),
-                    i.key_pressed(egui::Key::ArrowDown),
-                    i.key_pressed(egui::Key::ArrowLeft),
-                    i.key_pressed(egui::Key::ArrowRight),
-                    i.key_pressed(egui::Key::Delete),
-                )
-            });
+        let (
+            ctrl_j,
+            ctrl_z,
+            ctrl_shift_z,
+            f5,
+            ctrl_f5,
+            f12,
+            esc,
+            arrow_up,
+            arrow_down,
+            arrow_left,
+            arrow_right,
+            home,
+            end,
+            page_up,
+            page_down,
+            delete,
+            ctrl,
+        ) = ctx.input(|i| {
+            let z = i.key_pressed(egui::Key::Z);
+            let f5_pressed = i.key_pressed(egui::Key::F5);
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::J),
+                i.modifiers.command && !i.modifiers.shift && z,
+                i.modifiers.command && i.modifiers.shift && z,
+                f5_pressed && !i.modifiers.command,
+                f5_pressed && i.modifiers.command,
+                i.key_pressed(egui::Key::F12),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Home),
+                i.key_pressed(egui::Key::End),
+                i.key_pressed(egui::Key::PageUp),
+                i.key_pressed(egui::Key::PageDown),
+                i.key_pressed(egui::Key::Delete),
+                i.modifiers.command,
+            )
+        });
         // Ctrl+J toggles log even while typing in a field.
         if ctrl_j {
             self.log_open = !self.log_open;
@@ -1817,10 +1868,20 @@ impl GigaMuxApp {
                 self.cancel_encode();
             }
         }
-        if arrow_up {
+        // List nav: ↑/↓ step; Ctrl+↑/↓ + Home/End jump edges; PgUp/PgDn by visible page.
+        if home || (ctrl && arrow_up) {
+            self.navigate_list_edge(true);
+        } else if end || (ctrl && arrow_down) {
+            self.navigate_list_edge(false);
+        } else if page_up {
+            let page = self.folder_page_rows.max(1) as isize;
+            self.navigate_list(-page);
+        } else if page_down {
+            let page = self.folder_page_rows.max(1) as isize;
+            self.navigate_list(page);
+        } else if arrow_up {
             self.navigate_list(-1);
-        }
-        if arrow_down {
+        } else if arrow_down {
             self.navigate_list(1);
         }
         if arrow_left {
@@ -2304,6 +2365,15 @@ impl GigaMuxApp {
                             let resp = row.inner;
                             // Full row (name + chips) for marquee hit-testing.
                             row_rects.push((name.clone(), row.response.rect));
+                            // Keyboard nav asks once; keep the primary row on-screen.
+                            if self.scroll_sel_into_view
+                                && self.active.as_ref().is_some_and(|(s, n)| {
+                                    *s == side && n == &name
+                                })
+                            {
+                                resp.scroll_to_me(Some(egui::Align::Center));
+                                self.scroll_sel_into_view = false;
+                            }
                             if resp.clicked() {
                                 let (shift, ctrl) = ui.ctx().input(|i| {
                                     (i.modifiers.shift, i.modifiers.command)
@@ -2473,6 +2543,18 @@ impl GigaMuxApp {
                                 self.select_file(side, name);
                             }
                         }
+                    }
+
+                    // PgUp/PgDn step ≈ one viewport of rows (overlap by one).
+                    if self.active.as_ref().is_some_and(|(s, _)| *s == side) {
+                        let clip_h = ui.clip_rect().height();
+                        let row_h = row_rects
+                            .first()
+                            .map(|(_, r)| r.height())
+                            .unwrap_or(22.0)
+                            .max(1.0);
+                        let visible = (clip_h / row_h).floor() as usize;
+                        self.folder_page_rows = visible.saturating_sub(1).max(1);
                     }
                 });
         });
