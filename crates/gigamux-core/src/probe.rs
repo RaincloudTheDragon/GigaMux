@@ -833,6 +833,12 @@ pub fn thumbnail_rgba(path: &Path, duration_s: f64) -> Result<RgbaThumb, String>
     } else {
         0.0
     };
+    thumbnail_rgba_at(path, seek)
+}
+
+/// Grab one letterboxed RGBA frame at `seek_s` (input seek before decode).
+pub fn thumbnail_rgba_at(path: &Path, seek_s: f64) -> Result<RgbaThumb, String> {
+    let seek = seek_s.max(0.0);
     let vf = format!(
         "scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:black"
     );

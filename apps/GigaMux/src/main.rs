@@ -42,6 +42,8 @@ struct EncodeProgress {
     completed_duration_s: f64,
     batch_started: Instant,
     file_started: Instant,
+    /// Live source frame at current out-time (center preview during encode).
+    live_texture: Option<egui::TextureHandle>,
 }
 
 impl EncodeProgress {
@@ -1957,6 +1959,7 @@ impl GigaMuxApp {
                         completed_duration_s: 0.0,
                         batch_started: now,
                         file_started: now,
+                        live_texture: None,
                     });
                 }
                 AppEvent::Encode(EncodeEvent::FileStarted {
@@ -1974,11 +1977,33 @@ impl GigaMuxApp {
                         p.file_duration_s = duration_s;
                         p.file_out_time_s = 0.0;
                         p.file_started = Instant::now();
+                        p.live_texture = None;
                     }
                 }
                 AppEvent::Encode(EncodeEvent::FileProgress { out_time_s }) => {
                     if let Some(p) = &mut self.encode_progress {
                         p.file_out_time_s = out_time_s.max(p.file_out_time_s);
+                    }
+                }
+                AppEvent::Encode(EncodeEvent::LiveThumb { name, thumb }) => {
+                    // Ignore stale frames from a previous file's side-thread grab.
+                    let matches = self
+                        .encode_progress
+                        .as_ref()
+                        .is_some_and(|p| p.file_name == name);
+                    if matches {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [thumb.width as usize, thumb.height as usize],
+                            &thumb.rgba,
+                        );
+                        let tex = ctx.load_texture(
+                            format!("live-encode-{name}"),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        if let Some(p) = &mut self.encode_progress {
+                            p.live_texture = Some(tex);
+                        }
                     }
                 }
                 AppEvent::Encode(EncodeEvent::FileSkipped { name }) => {
@@ -2774,7 +2799,16 @@ impl GigaMuxApp {
         if entry.pending {
             ui.label("Loading preview…");
         }
-        if let Some(tex) = &entry.texture {
+        // During encode, prefer the live out-time frame over the static mid-clip thumb.
+        let live_tex = self.encode_progress.as_ref().and_then(|p| {
+            if p.file_name == name {
+                p.live_texture.as_ref()
+            } else {
+                None
+            }
+        });
+        let tex = live_tex.or(entry.texture.as_ref());
+        if let Some(tex) = tex {
             // Fit inside the center column; never spill into side panes.
             let max_w = ui.available_width().max(1.0);
             let tex_size = tex.size_vec2();

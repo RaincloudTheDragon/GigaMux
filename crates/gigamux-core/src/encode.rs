@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use crate::gpu::GpuChoice;
 use crate::probe::{
-    audio_bitrate_k, audio_codec_name, file_info, require_tools, video_ceiling_k, video_codec_name,
-    video_has_alpha, video_pix_fmt,
+    audio_bitrate_k, audio_codec_name, file_info, require_tools, thumbnail_rgba_at,
+    video_ceiling_k, video_codec_name, video_has_alpha, video_pix_fmt, RgbaThumb,
 };
 use crate::targets::{
     audio_encode_for, delivery_pix_fmt, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
@@ -41,6 +41,8 @@ pub enum EncodeEvent {
     },
     /// Live ffmpeg out-time for the current file (seconds).
     FileProgress { out_time_s: f64 },
+    /// Source frame at current out-time (throttled; for UI live preview).
+    LiveThumb { name: String, thumb: RgbaThumb },
     FileSkipped { name: String },
     FileDone { name: String },
     FileFailed { name: String, error: String },
@@ -717,17 +719,53 @@ pub fn run_batch(
             opts.alpha_video,
             opts.alpha_container,
         );
+        // Live preview: grab source frames at out-time on a side thread (throttled).
+        let (thumb_tx, thumb_rx) = mpsc::channel::<(String, RgbaThumb)>();
+        let thumb_busy = Arc::new(AtomicBool::new(false));
+        let mut last_thumb = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now);
+        let flush_thumbs = |on_event: &mut dyn FnMut(EncodeEvent)| {
+            while let Ok((n, thumb)) = thumb_rx.try_recv() {
+                on_event(EncodeEvent::LiveThumb { name: n, thumb });
+            }
+        };
         match run_ffmpeg(&argv, &cancel, |line, out_time| {
+            flush_thumbs(&mut on_event);
             if let Some(t) = out_time {
                 on_event(EncodeEvent::FileProgress { out_time_s: t });
+                // ~1 Hz max; skip if a grab is already running (encode stays primary).
+                if last_thumb.elapsed() >= Duration::from_millis(900)
+                    && !thumb_busy.swap(true, Ordering::Relaxed)
+                {
+                    last_thumb = Instant::now();
+                    let path = input.clone();
+                    let n = name.clone();
+                    let busy = Arc::clone(&thumb_busy);
+                    let tx = thumb_tx.clone();
+                    // Cap seek slightly before EOF so ffmpeg always has a frame.
+                    let seek = if duration_s > 0.2 {
+                        t.min(duration_s - 0.05).max(0.0)
+                    } else {
+                        t.max(0.0)
+                    };
+                    thread::spawn(move || {
+                        if let Ok(thumb) = thumbnail_rgba_at(&path, seek) {
+                            let _ = tx.send((n, thumb));
+                        }
+                        busy.store(false, Ordering::Relaxed);
+                    });
+                }
             }
             on_event(EncodeEvent::Log(line));
         }) {
             Ok(()) => {
+                flush_thumbs(&mut on_event);
                 ok += 1;
                 on_event(EncodeEvent::FileDone { name });
             }
             Err(e) => {
+                flush_thumbs(&mut on_event);
                 failed += 1;
                 let _ = std::fs::remove_file(&output);
                 on_event(EncodeEvent::FileFailed { name, error: e });
