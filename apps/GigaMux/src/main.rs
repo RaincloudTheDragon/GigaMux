@@ -2008,7 +2008,13 @@ impl GigaMuxApp {
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 AppEvent::Encode(EncodeEvent::Log(msg)) => {
-                    if let Some(name) = self.log_file_name() {
+                    // Always pin to the in-flight encode file — not UI selection (deselect must not leak into session / other files).
+                    let encode_name = self
+                        .encode_progress
+                        .as_ref()
+                        .map(|p| p.file_name.clone())
+                        .filter(|n| !n.is_empty());
+                    if let Some(name) = encode_name {
                         self.push_file_log(&name, msg);
                     } else {
                         self.push_session(msg);
