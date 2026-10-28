@@ -165,7 +165,8 @@ fn build_cmd(
     cmd.push(input.to_string_lossy().into_owned());
 
     if has_alpha {
-        // CRF0 visually lossless; -maxrate kept intentionally (libvpx ignores it at CRF0).
+        // CRF0 CQ capped at source ceiling. libvpx ≥1.17 rejects -maxrate without -b:v
+        // (and rejects -b:v 0 with -maxrate), so use constrained CQ: -b:v = -maxrate.
         cmd.extend([
             "-c:v".into(),
             alpha_video.ffmpeg_encoder().into(),
@@ -189,12 +190,16 @@ fn build_cmd(
             "1".into(),
             "-crf".into(),
             "0".into(),
+            "-b:v".into(),
+            ceiling.clone(),
             "-maxrate".into(),
             ceiling,
+            "-bufsize".into(),
+            bufsize,
         ]);
         append_audio_args(&mut cmd, input, info, out_container);
     } else if opaque_video.is_libvpx() {
-        // Opaque VP8/VP9 — same CRF0 libvpx knobs, no alpha plane.
+        // Opaque VP8/VP9 — same constrained CRF0 libvpx knobs, no alpha plane.
         cmd.extend([
             "-c:v".into(),
             opaque_video.ffmpeg_encoder().into(),
@@ -218,8 +223,12 @@ fn build_cmd(
             "1".into(),
             "-crf".into(),
             "0".into(),
+            "-b:v".into(),
+            ceiling.clone(),
             "-maxrate".into(),
             ceiling,
+            "-bufsize".into(),
+            bufsize,
         ]);
         append_audio_args(&mut cmd, input, info, out_container);
     } else {
