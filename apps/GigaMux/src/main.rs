@@ -17,8 +17,8 @@ use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
 use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::probe::{
-    codec_tag, format_bytes, format_length, media_summary, thumbnail_rgba, FrameTiming,
-    MediaSummary, RgbaThumb, THUMB_W,
+    codec_heat, codec_tag, format_bytes, format_length, media_summary, thumbnail_rgba,
+    FrameTiming, MediaSummary, RgbaThumb, THUMB_W,
 };
 
 /// Live dual-bar encode progress (current file + whole batch).
@@ -1028,7 +1028,7 @@ impl GigaMuxApp {
                                 .horizontal(|ui| {
                                     let resp = ui.selectable_label(selected, &name);
                                     if let Some(tag) = &tag_label {
-                                        ui.label(egui::RichText::new(tag).weak().small());
+                                        codec_chip(ui, tag);
                                     }
                                     resp
                                 })
@@ -1260,11 +1260,6 @@ impl GigaMuxApp {
 
     fn ui_meta_table(ui: &mut egui::Ui, s: &MediaSummary) {
         let yes_no = |b: bool| if b { "yes" } else { "no" };
-        // Same tag form as side lists (`VP9 α`), then optional profile.
-        let codec_v = match &s.video_profile {
-            Some(p) => format!("{} ({p})", codec_tag(s)),
-            None => codec_tag(s),
-        };
         let timing = match s.timing {
             FrameTiming::Cfr => "CFR",
             FrameTiming::Vfr => "VFR",
@@ -1312,7 +1307,14 @@ impl GigaMuxApp {
                 ui.label(egui::RichText::new("Video").strong());
                 ui.label("");
                 ui.end_row();
-                row(ui, "Codec", &codec_v);
+                ui.label(egui::RichText::new("Codec").weak().small());
+                ui.horizontal(|ui| {
+                    codec_chip(ui, &codec_tag(s));
+                    if let Some(p) = &s.video_profile {
+                        ui.monospace(format!("({p})"));
+                    }
+                });
+                ui.end_row();
                 row(ui, "Container", &s.container.to_ascii_uppercase());
                 row(ui, "Res", &res);
                 row(ui, "Size", &format_bytes(s.file_size_bytes));
@@ -1578,6 +1580,77 @@ impl GigaMuxApp {
                     });
                 }
             });
+    }
+}
+
+/// Markdown-backtick-style codec chip: monospace on a warm→cool spectrum tint.
+fn codec_chip(ui: &mut egui::Ui, tag: &str) {
+    let pending = tag == "…";
+    let (bg, fg) = if pending {
+        codec_chip_neutral(ui.visuals().dark_mode)
+    } else {
+        codec_chip_colors(codec_heat(tag), ui.visuals().dark_mode)
+    };
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(tag)
+                    .monospace()
+                    .size(12.0)
+                    .color(fg),
+            );
+        });
+}
+
+fn codec_chip_neutral(dark: bool) -> (egui::Color32, egui::Color32) {
+    if dark {
+        (
+            egui::Color32::from_rgb(48, 50, 56),
+            egui::Color32::from_rgb(170, 174, 184),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(228, 230, 236),
+            egui::Color32::from_rgb(90, 94, 104),
+        )
+    }
+}
+
+/// HSV → sRGB (`h` in degrees, `s`/`v` in 0..=1).
+fn hsv_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
+    let h = h.rem_euclid(360.0) / 60.0;
+    let c = v * s;
+    let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    egui::Color32::from_rgb(
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
+}
+
+/// Warm→cool spectrum: efficient (heat 1) = red/orange … primitive (heat 0) = violet, via yellow/green/cyan/blue.
+fn codec_chip_colors(heat: f32, dark: bool) -> (egui::Color32, egui::Color32) {
+    let t = heat.clamp(0.0, 1.0);
+    // Slight ease so AV1/HEVC/VP9 sit clearly on the warm third of the wheel.
+    let t = t.powf(0.9);
+    // Hue sweep: 12° (warm red-orange) → 275° (cool violet), covering the full spectrum.
+    let hue = 12.0 + (1.0 - t) * 263.0;
+    if dark {
+        (hsv_rgb(hue, 0.62, 0.42), hsv_rgb(hue, 0.40, 0.96))
+    } else {
+        (hsv_rgb(hue, 0.38, 0.93), hsv_rgb(hue, 0.82, 0.42))
     }
 }
 

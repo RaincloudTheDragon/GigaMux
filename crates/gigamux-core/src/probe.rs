@@ -169,6 +169,31 @@ pub fn codec_tag(summary: &MediaSummary) -> String {
     }
 }
 
+/// Cool→warm heat for UI chips: `0.0` = primitive/inefficient, `1.0` = mature/efficient.
+/// Accepts a display name or full [`codec_tag`] (`"VP9 α"`).
+pub fn codec_heat(display_or_tag: &str) -> f32 {
+    let name = display_or_tag
+        .strip_suffix(" α")
+        .unwrap_or(display_or_tag)
+        .trim();
+    match name {
+        "AV1" => 1.0,
+        "HEVC" => 0.88,
+        "VP9" => 0.76,
+        "H.264" => 0.58,
+        "VP8" => 0.46,
+        // Mature mezzanine / archive — capable, but bitrate-heavy → mid-cool.
+        "ProRes" | "DNxHR" | "FFV1" | "CineForm" => 0.38,
+        "DNxHD" | "Ut Video" | "HAP" => 0.32,
+        "MPEG-4" | "Theora" => 0.28,
+        "MPEG-2" => 0.22,
+        "MJPEG" => 0.16,
+        "PNG" | "Animation" => 0.10,
+        "Raw" | "—" | "" => 0.05,
+        _ => 0.34,
+    }
+}
+
 pub fn video_codec_name(info: &Value) -> String {
     first_video_stream(info)
         .and_then(|s| s.get("codec_name"))
