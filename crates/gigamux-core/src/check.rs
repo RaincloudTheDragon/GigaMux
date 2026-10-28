@@ -10,7 +10,11 @@ use serde_json::Value;
 use crate::probe::{file_info, video_has_alpha};
 use crate::targets::OutputTargets;
 
-const INPUT_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm"];
+/// Containers accepted as encode *inputs* (probe + list). Keep broad — disk wins over allowlist nostalgia.
+const INPUT_EXTS: &[&str] = &[
+    "mp4", "mkv", "mov", "webm", "m4v", "avi", "mpg", "mpeg", "m2v", "m2ts", "mts", "ts", "mxf",
+    "ogv", "ogg", "wmv", "flv", "3gp", "3g2",
+];
 const OUTPUT_EXTS: &[&str] = &["mp4", "webm", "mkv"];
 const STREAM_END_SLACK_S: f64 = 1.0;
 const STREAM_END_SLACK_FRAC: f64 = 0.002;

@@ -16,7 +16,11 @@ use crate::targets::{
     audio_encode_for, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
 };
 
-const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm"];
+/// Same family as check `INPUT_EXTS` — what the batch encoder will pick up.
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "mov", "webm", "m4v", "avi", "mpg", "mpeg", "m2v", "m2ts", "mts", "ts", "mxf",
+    "ogv", "ogg", "wmv", "flv", "3gp", "3g2",
+];
 
 /// Progress / log events from a batch encode.
 #[derive(Debug, Clone)]
@@ -429,7 +433,7 @@ pub fn run_batch(
             if opts.only_names.is_some() {
                 "no matching input file to encode".into()
             } else {
-                "no .mp4/.mkv/.mov/.webm files in input folder".into()
+                "no supported video files in input folder".into()
             },
         ));
         on_event(EncodeEvent::Finished {
