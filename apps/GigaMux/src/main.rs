@@ -212,6 +212,8 @@ struct GigaMuxApp {
     selected: HashSet<String>,
     /// Shift-click range anchor (basename on the active side).
     selection_anchor: Option<String>,
+    /// Click-drag marquee over Input/Output rows (None when idle).
+    box_select: Option<BoxSelect>,
     /// Per-input-file log lines (encode progress keyed by input basename).
     file_logs: HashMap<String, Vec<String>>,
     /// Session / batch log when no file is active.
@@ -251,6 +253,22 @@ struct GigaMuxApp {
 const DELETE_STEP_MS: u64 = 90;
 /// Cap Ctrl+Z undo gestures (not individual files) so the stack cannot grow without bound.
 const DELETE_UNDO_CAP: usize = 50;
+/// Pointer travel before a press becomes a marquee instead of a click.
+const BOX_SELECT_SLOP: f32 = 5.0;
+
+/// In-progress drag rectangle for multi-select in a folder list.
+struct BoxSelect {
+    side: FileSide,
+    origin: egui::Pos2,
+    current: egui::Pos2,
+    /// Ctrl/Cmd held at press — union with selection at press time.
+    additive: bool,
+    baseline: HashSet<String>,
+    /// True once drag exceeded [`BOX_SELECT_SLOP`].
+    active: bool,
+    /// Press started on a file row (vs blank padding).
+    started_on_row: bool,
+}
 
 /// Sequential Recycle Bin job — pops one basename per step so rows vanish one-by-one.
 struct DeleteQueue {
@@ -385,6 +403,7 @@ impl GigaMuxApp {
             active: None,
             selected: HashSet::new(),
             selection_anchor: None,
+            box_select: None,
             file_logs: HashMap::new(),
             // Restore prior session lines from AppData (same cap as the live buffer).
             session_log: prefs::load_session_log(500),
@@ -556,6 +575,28 @@ impl GigaMuxApp {
         self.preview_cache
             .entry(key)
             .or_insert_with(PreviewCacheEntry::pending);
+    }
+
+    /// Replace selection with `names` (list order); primary = last selected row.
+    fn select_set(&mut self, side: FileSide, names: HashSet<String>, anchor: Option<String>) {
+        if names.is_empty() {
+            self.clear_active();
+            return;
+        }
+        let ordered: Vec<String> = self
+            .names_for(side)
+            .into_iter()
+            .filter(|n| names.contains(n))
+            .collect();
+        if ordered.is_empty() {
+            self.clear_active();
+            return;
+        }
+        self.selected = ordered.iter().cloned().collect();
+        self.selection_anchor = anchor.or_else(|| ordered.first().cloned());
+        if let Some(primary) = ordered.last().cloned() {
+            self.set_primary(side, primary);
+        }
     }
 
     /// Basename after a multi-delete (first survivor below the block, else above).
@@ -2209,10 +2250,16 @@ impl GigaMuxApp {
             } else {
                 FileSide::Output
             };
+            // Wheel scrolls; primary-drag is marquee (ScrollSource drag defaults to touch-only).
             egui::ScrollArea::vertical()
                 .id_salt(if is_input { "in_list" } else { "out_list" })
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    let mut row_rects: Vec<(String, egui::Rect)> = Vec::new();
+                    // Defer row clicks until after marquee handling (drag wins over click).
+                    let mut pending_click: Option<(String, bool, bool)> = None;
+                    let mut pending_dbl: Option<(String, PathBuf)> = None;
+
                     if files.is_empty() {
                         ui.label(egui::RichText::new("(empty)").weak());
                     } else {
@@ -2237,42 +2284,34 @@ impl GigaMuxApp {
                                     (Some(codec_tag(s)), s.has_alpha)
                                 })
                             });
-                            let resp = ui
-                                .horizontal(|ui| {
-                                    let resp = ui.selectable_label(selected, &name);
-                                    match &tags {
-                                        Some((None, _)) => codec_chip(ui, "…"),
-                                        Some((Some(tag), has_alpha)) => {
-                                            codec_chip(ui, tag);
-                                            if *has_alpha {
-                                                alpha_chip(ui);
-                                            }
+                            let row = ui.horizontal(|ui| {
+                                let resp = ui.selectable_label(selected, &name);
+                                match &tags {
+                                    Some((None, _)) => codec_chip(ui, "…"),
+                                    Some((Some(tag), has_alpha)) => {
+                                        codec_chip(ui, tag);
+                                        if *has_alpha {
+                                            alpha_chip(ui);
                                         }
-                                        None => {}
                                     }
-                                    if !ext.is_empty() {
-                                        ext_chip(ui, &format!(".{ext}"), true);
-                                    }
-                                    resp
-                                })
-                                .inner;
+                                    None => {}
+                                }
+                                if !ext.is_empty() {
+                                    ext_chip(ui, &format!(".{ext}"), true);
+                                }
+                                resp
+                            });
+                            let resp = row.inner;
+                            // Full row (name + chips) for marquee hit-testing.
+                            row_rects.push((name.clone(), row.response.rect));
                             if resp.clicked() {
                                 let (shift, ctrl) = ui.ctx().input(|i| {
                                     (i.modifiers.shift, i.modifiers.command)
                                 });
-                                if shift {
-                                    self.select_range(side, name.clone());
-                                } else if ctrl {
-                                    self.select_toggle(side, name.clone());
-                                } else {
-                                    self.select_file(side, name.clone());
-                                }
+                                pending_click = Some((name.clone(), shift, ctrl));
                             }
                             if resp.double_clicked() {
-                                self.select_file(side, name.clone());
-                                if let Err(e) = open_path_in_os(path) {
-                                    self.push_session(format!("open failed: {e}"));
-                                }
+                                pending_dbl = Some((name.clone(), path.clone()));
                             }
                             resp.context_menu(|ui| {
                                 if is_input
@@ -2314,11 +2353,126 @@ impl GigaMuxApp {
                             });
                         }
                     }
-                    // Click or click-drag blank space below the list to clear selection.
+                    // Trailing blank absorbs presses for marquee / clear.
                     let fill = ui.available_size().max(egui::vec2(1.0, 24.0));
                     let blank = ui.allocate_response(fill, egui::Sense::click_and_drag());
-                    if blank.clicked() || blank.drag_started() {
-                        self.clear_active();
+
+                    let list_rect = ui.min_rect().union(blank.rect);
+                    let (pressed, down, released, additive, pointer) = ui.ctx().input(|i| {
+                        (
+                            i.pointer.primary_pressed(),
+                            i.pointer.primary_down(),
+                            i.pointer.primary_released(),
+                            i.modifiers.command,
+                            i.pointer.interact_pos(),
+                        )
+                    });
+
+                    // Begin marquee on primary press inside this list.
+                    if pressed {
+                        if let Some(pos) = pointer.filter(|p| list_rect.contains(*p)) {
+                            let on_row = row_rects.iter().any(|(_, r)| r.contains(pos));
+                            let baseline = if additive {
+                                self.selected.clone()
+                            } else {
+                                HashSet::new()
+                            };
+                            self.box_select = Some(BoxSelect {
+                                side,
+                                origin: pos,
+                                current: pos,
+                                additive,
+                                baseline,
+                                active: false,
+                                started_on_row: on_row,
+                            });
+                        }
+                    }
+
+                    let mut marquee_consumed = false;
+                    if self.box_select.as_ref().is_some_and(|b| b.side == side) {
+                        if down {
+                            if let Some(pos) = pointer {
+                                if let Some(box_sel) = self.box_select.as_mut() {
+                                    box_sel.current = pos;
+                                    if !box_sel.active
+                                        && (box_sel.current - box_sel.origin).length()
+                                            >= BOX_SELECT_SLOP
+                                    {
+                                        box_sel.active = true;
+                                    }
+                                }
+                            }
+                        }
+                        let active = self.box_select.as_ref().is_some_and(|b| b.active);
+                        if active {
+                            marquee_consumed = true;
+                            let (origin, current, additive, baseline) = {
+                                let b = self.box_select.as_ref().unwrap();
+                                (b.origin, b.current, b.additive, b.baseline.clone())
+                            };
+                            let rect =
+                                egui::Rect::from_two_pos(origin, current).intersect(list_rect);
+                            let fill_c = egui::Color32::from_rgba_unmultiplied(90, 160, 230, 45);
+                            let stroke =
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 160, 230));
+                            ui.painter().rect_filled(rect, 0.0, fill_c);
+                            ui.painter().rect_stroke(
+                                rect,
+                                0.0,
+                                stroke,
+                                egui::StrokeKind::Outside,
+                            );
+
+                            let mut hits: HashSet<String> = if additive {
+                                baseline.clone()
+                            } else {
+                                HashSet::new()
+                            };
+                            for (name, row) in &row_rects {
+                                if rect.intersects(*row) {
+                                    hits.insert(name.clone());
+                                }
+                            }
+                            let anchor = baseline.iter().next().cloned().or_else(|| {
+                                row_rects
+                                    .iter()
+                                    .find(|(_, r)| rect.intersects(*r))
+                                    .map(|(n, _)| n.clone())
+                            });
+                            self.select_set(side, hits, anchor);
+                        }
+
+                        if released {
+                            if let Some(box_sel) = self.box_select.take() {
+                                if box_sel.active {
+                                    marquee_consumed = true;
+                                } else if !box_sel.started_on_row {
+                                    // Click empty space without dragging — clear (unless Ctrl).
+                                    if !box_sel.additive {
+                                        self.clear_active();
+                                    }
+                                    marquee_consumed = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !marquee_consumed {
+                        if let Some((name, path)) = pending_dbl {
+                            self.select_file(side, name);
+                            if let Err(e) = open_path_in_os(&path) {
+                                self.push_session(format!("open failed: {e}"));
+                            }
+                        } else if let Some((name, shift, ctrl)) = pending_click {
+                            if shift {
+                                self.select_range(side, name);
+                            } else if ctrl {
+                                self.select_toggle(side, name);
+                            } else {
+                                self.select_file(side, name);
+                            }
+                        }
                     }
                 });
         });
