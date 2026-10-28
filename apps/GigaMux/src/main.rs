@@ -1015,20 +1015,28 @@ impl GigaMuxApp {
                                 .active
                                 .as_ref()
                                 .is_some_and(|(s, n)| *s == side && n == &name);
-                            // Codec/α tag from preview cache; muted … while the worker is still probing.
+                            // Codec (+ optional α) chips from preview cache; muted … while probing.
                             let cache_key = Self::preview_key(side, &name);
-                            let tag_label: Option<String> =
-                                self.preview_cache.get(&cache_key).and_then(|e| {
-                                    if e.pending {
-                                        return Some("…".into());
-                                    }
-                                    e.summary.as_ref().and_then(|r| r.as_ref().ok()).map(codec_tag)
-                                });
+                            let tags = self.preview_cache.get(&cache_key).and_then(|e| {
+                                if e.pending {
+                                    return Some((None, false));
+                                }
+                                e.summary.as_ref().and_then(|r| r.as_ref().ok()).map(|s| {
+                                    (Some(codec_tag(s)), s.has_alpha)
+                                })
+                            });
                             let resp = ui
                                 .horizontal(|ui| {
                                     let resp = ui.selectable_label(selected, &name);
-                                    if let Some(tag) = &tag_label {
-                                        codec_chip(ui, tag);
+                                    match &tags {
+                                        Some((None, _)) => codec_chip(ui, "…"),
+                                        Some((Some(tag), has_alpha)) => {
+                                            codec_chip(ui, tag);
+                                            if *has_alpha {
+                                                alpha_chip(ui);
+                                            }
+                                        }
+                                        None => {}
                                     }
                                     resp
                                 })
@@ -1310,6 +1318,9 @@ impl GigaMuxApp {
                 ui.label(egui::RichText::new("Codec").weak().small());
                 ui.horizontal(|ui| {
                     codec_chip(ui, &codec_tag(s));
+                    if s.has_alpha {
+                        alpha_chip(ui);
+                    }
                     if let Some(p) = &s.video_profile {
                         ui.monospace(format!("({p})"));
                     }
@@ -1344,7 +1355,6 @@ impl GigaMuxApp {
                         "no".into()
                     },
                 );
-                row(ui, "α", yes_no(s.has_alpha));
 
                 // Blank row between sections (no add_space — illegal inside Grid).
                 ui.label("");
@@ -1583,7 +1593,23 @@ impl GigaMuxApp {
     }
 }
 
-/// Markdown-backtick-style codec chip: monospace on a warm→cool spectrum tint.
+/// Markdown-backtick-style chip: monospace label on a filled rounded rect.
+fn tag_chip(ui: &mut egui::Ui, label: &str, bg: egui::Color32, fg: egui::Color32) {
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(label)
+                    .monospace()
+                    .size(12.0)
+                    .color(fg),
+            );
+        });
+}
+
+/// Codec chip: warm→cool spectrum tint from [`codec_heat`].
 fn codec_chip(ui: &mut egui::Ui, tag: &str) {
     let pending = tag == "…";
     let (bg, fg) = if pending {
@@ -1591,18 +1617,23 @@ fn codec_chip(ui: &mut egui::Ui, tag: &str) {
     } else {
         codec_chip_colors(codec_heat(tag), ui.visuals().dark_mode)
     };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(3.0)
-        .inner_margin(egui::Margin::symmetric(5, 1))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(tag)
-                    .monospace()
-                    .size(12.0)
-                    .color(fg),
-            );
-        });
+    tag_chip(ui, tag, bg, fg);
+}
+
+/// Separate α chip (only drawn when the stream has alpha).
+fn alpha_chip(ui: &mut egui::Ui) {
+    let (bg, fg) = if ui.visuals().dark_mode {
+        (
+            egui::Color32::from_rgb(72, 48, 96),
+            egui::Color32::from_rgb(220, 190, 255),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(232, 220, 248),
+            egui::Color32::from_rgb(88, 48, 140),
+        )
+    };
+    tag_chip(ui, "α", bg, fg);
 }
 
 fn codec_chip_neutral(dark: bool) -> (egui::Color32, egui::Color32) {

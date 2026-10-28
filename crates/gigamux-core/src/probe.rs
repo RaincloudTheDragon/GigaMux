@@ -160,22 +160,14 @@ pub fn video_has_alpha(info: &Value) -> bool {
     false
 }
 
-/// Compact list/meta tag from a summary: e.g. `VP9 α`, `HEVC`, `ProRes α`.
+/// Display codec name for list/meta chips (α is a separate chip in the UI).
 pub fn codec_tag(summary: &MediaSummary) -> String {
-    if summary.has_alpha && summary.video_codec != "—" {
-        format!("{} α", summary.video_codec)
-    } else {
-        summary.video_codec.clone()
-    }
+    summary.video_codec.clone()
 }
 
 /// Cool→warm heat for UI chips: `0.0` = primitive/inefficient, `1.0` = mature/efficient.
-/// Accepts a display name or full [`codec_tag`] (`"VP9 α"`).
-pub fn codec_heat(display_or_tag: &str) -> f32 {
-    let name = display_or_tag
-        .strip_suffix(" α")
-        .unwrap_or(display_or_tag)
-        .trim();
+pub fn codec_heat(display_codec: &str) -> f32 {
+    let name = display_codec.trim();
     match name {
         "AV1" => 1.0,
         "HEVC" => 0.88,
