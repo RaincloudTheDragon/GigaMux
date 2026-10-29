@@ -84,7 +84,7 @@ impl Prefs {
     }
 }
 
-/// `%APPDATA%\GigaMux` (Windows) or platform equivalent.
+/// App config root — Windows: `%APPDATA%\GigaMux\config` (`directories` ProjectDirs).
 pub fn prefs_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "", "GigaMux").map(|d| d.config_dir().to_path_buf())
 }
@@ -139,7 +139,7 @@ pub fn import_profile(path: &Path) -> Result<Prefs, String> {
     Ok(prefs)
 }
 
-/// `%APPDATA%\GigaMux\session.log` — durable UI session log.
+/// `%APPDATA%\GigaMux\config\session.log` — durable UI session log.
 pub fn session_log_path() -> Option<PathBuf> {
     prefs_dir().map(|d| d.join("session.log"))
 }
