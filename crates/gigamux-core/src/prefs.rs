@@ -89,6 +89,57 @@ pub fn prefs_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "", "GigaMux").map(|d| d.config_dir().to_path_buf())
 }
 
+/// App root — Windows: `%APPDATA%\GigaMux` (parent of `config`).
+pub fn app_root() -> Option<PathBuf> {
+    prefs_dir().and_then(|d| d.parent().map(|p| p.to_path_buf()))
+}
+
+/// Durable logs — Windows: `%APPDATA%\GigaMux\logs` (session + encode/VMAF job gz).
+pub fn logs_dir() -> Option<PathBuf> {
+    app_root().map(|d| d.join("logs"))
+}
+
+/// Create `logs/`, migrating leftovers from `config/session.log` and `config/logs/`.
+pub fn ensure_logs_dir() -> Result<PathBuf, String> {
+    let dir = logs_dir().ok_or_else(|| "could not resolve AppData logs dir".to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| format!("create logs dir: {e}"))?;
+    migrate_legacy_logs(&dir);
+    Ok(dir)
+}
+
+/// One-shot: move old config-scoped logs into `%APPDATA%\GigaMux\logs`.
+fn migrate_legacy_logs(new_dir: &Path) {
+    let Some(config) = prefs_dir() else {
+        return;
+    };
+    let old_session = config.join("session.log");
+    let new_session = new_dir.join("session.log");
+    if old_session.is_file() && !new_session.exists() {
+        let _ = fs::rename(&old_session, &new_session);
+    }
+    let old_jobs = config.join("logs");
+    if old_jobs.is_dir() {
+        if let Ok(entries) = fs::read_dir(&old_jobs) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if !src.is_file() {
+                    continue;
+                }
+                let Some(name) = src.file_name() else {
+                    continue;
+                };
+                let dst = new_dir.join(name);
+                if dst.exists() {
+                    let _ = fs::remove_file(&src);
+                } else {
+                    let _ = fs::rename(&src, &dst);
+                }
+            }
+        }
+        let _ = fs::remove_dir(&old_jobs);
+    }
+}
+
 fn prefs_path() -> Option<PathBuf> {
     prefs_dir().map(|d| d.join("prefs.json"))
 }
@@ -139,13 +190,14 @@ pub fn import_profile(path: &Path) -> Result<Prefs, String> {
     Ok(prefs)
 }
 
-/// `%APPDATA%\GigaMux\config\session.log` — durable UI session log.
+/// `%APPDATA%\GigaMux\logs\session.log` — full durable transcript (UI + encode + VMAF).
 pub fn session_log_path() -> Option<PathBuf> {
-    prefs_dir().map(|d| d.join("session.log"))
+    logs_dir().map(|d| d.join("session.log"))
 }
 
 /// Load the tail of the on-disk session log (newest `max_lines` lines).
 pub fn load_session_log(max_lines: usize) -> Vec<String> {
+    let _ = ensure_logs_dir();
     let Some(path) = session_log_path() else {
         return Vec::new();
     };
@@ -159,10 +211,9 @@ pub fn load_session_log(max_lines: usize) -> Vec<String> {
     lines
 }
 
-/// Append one session-log line (creates AppData dir / file as needed).
+/// Append one session-log line (creates logs dir / file as needed).
 pub fn append_session_log(line: &str) -> Result<(), String> {
-    let dir = prefs_dir().ok_or_else(|| "could not resolve AppData config dir".to_string())?;
-    fs::create_dir_all(&dir).map_err(|e| format!("create prefs dir: {e}"))?;
+    let dir = ensure_logs_dir()?;
     let path = dir.join("session.log");
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
@@ -175,8 +226,7 @@ pub fn append_session_log(line: &str) -> Result<(), String> {
 
 /// Replace on-disk session log with the in-memory tail (after trim).
 pub fn rewrite_session_log(lines: &[String]) -> Result<(), String> {
-    let dir = prefs_dir().ok_or_else(|| "could not resolve AppData config dir".to_string())?;
-    fs::create_dir_all(&dir).map_err(|e| format!("create prefs dir: {e}"))?;
+    let dir = ensure_logs_dir()?;
     let path = dir.join("session.log");
     let mut text = lines.join("\n");
     if !lines.is_empty() {
@@ -185,14 +235,18 @@ pub fn rewrite_session_log(lines: &[String]) -> Result<(), String> {
     fs::write(&path, text).map_err(|e| format!("rewrite session.log: {e}"))
 }
 
-/// Delete `session.log` if present.
+/// Delete `session.log` if present (also clears a leftover `config/session.log`).
 pub fn clear_session_log() -> Result<(), String> {
-    let Some(path) = session_log_path() else {
-        return Ok(());
-    };
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("remove session.log: {e}")),
+    let _ = ensure_logs_dir();
+    for path in [session_log_path(), prefs_dir().map(|d| d.join("session.log"))]
+        .into_iter()
+        .flatten()
+    {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", path.display())),
+        }
     }
+    Ok(())
 }

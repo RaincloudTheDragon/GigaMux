@@ -1362,16 +1362,19 @@ impl GigaMuxApp {
         }
     }
 
+    /// UI session pane + durable `session.log` (UI-only actions; not job-mirrored lines).
     fn push_session(&mut self, line: impl Into<String>) {
         let line = line.into();
         let _ = prefs::append_session_log(&line);
         self.session_log.push(line);
-        let before = self.session_log.len();
         trim_log(&mut self.session_log);
-        // Keep the on-disk file capped to the same tail as the UI buffer.
-        if self.session_log.len() < before {
-            let _ = prefs::rewrite_session_log(&self.session_log);
-        }
+        // Do not rewrite disk from the UI tail — job lines live on disk beyond the pane.
+    }
+
+    /// Session pane only — durable line already written by [`job_log::JobLog`].
+    fn note_session_ui(&mut self, line: impl Into<String>) {
+        self.session_log.push(line.into());
+        trim_log(&mut self.session_log);
     }
 
     fn push_file_log(&mut self, file: &str, line: impl Into<String>) {
@@ -2356,6 +2359,7 @@ impl GigaMuxApp {
             match ev {
                 AppEvent::Encode(EncodeEvent::Log(msg)) => {
                     // Always pin to the in-flight encode file — not UI selection (deselect must not leak into session / other files).
+                    // Durable session.log already got this via JobLog; pane/file logs only here.
                     let encode_name = self
                         .encode_progress
                         .as_ref()
@@ -2364,7 +2368,7 @@ impl GigaMuxApp {
                     if let Some(name) = encode_name {
                         self.push_file_log(&name, msg);
                     } else {
-                        self.push_session(msg);
+                        self.note_session_ui(msg);
                     }
                 }
                 AppEvent::Encode(EncodeEvent::BatchStarted {
@@ -2432,11 +2436,11 @@ impl GigaMuxApp {
                 }
                 AppEvent::Encode(EncodeEvent::FileSkipped { name }) => {
                     self.push_file_log(&name, format!("skip (exists): {name}"));
-                    self.push_session(format!("skip (exists): {name}"));
+                    self.note_session_ui(format!("skip (exists): {name}"));
                 }
                 AppEvent::Encode(EncodeEvent::FileDone { name }) => {
                     self.push_file_log(&name, format!("done: {name}"));
-                    self.push_session(format!("done: {name}"));
+                    self.note_session_ui(format!("done: {name}"));
                     if let Some(p) = &mut self.encode_progress {
                         p.completed_duration_s += p.file_duration_s;
                         p.file_out_time_s = p.file_duration_s;
@@ -2444,7 +2448,7 @@ impl GigaMuxApp {
                 }
                 AppEvent::Encode(EncodeEvent::FileFailed { name, error }) => {
                     self.push_file_log(&name, format!("error: {error}"));
-                    self.push_session(format!("error {name}: {error}"));
+                    self.note_session_ui(format!("error {name}: {error}"));
                     if let Some(p) = &mut self.encode_progress {
                         p.completed_duration_s += p.file_duration_s;
                         p.file_out_time_s = 0.0;
@@ -2455,7 +2459,7 @@ impl GigaMuxApp {
                     skipped,
                     failed,
                 }) => {
-                    self.push_session(format!(
+                    self.note_session_ui(format!(
                         "finished — ok={ok} skipped={skipped} failed={failed}"
                     ));
                     finished = true;
@@ -2471,7 +2475,8 @@ impl GigaMuxApp {
                 }
                 AppEvent::Vmaf(ev) => match ev {
                     VmafEvent::Log(msg) => {
-                        self.push_session(msg);
+                        // JobLog already mirrored to session.log.
+                        self.note_session_ui(msg);
                     }
                     VmafEvent::BatchStarted {
                         total_files,
@@ -2527,7 +2532,9 @@ impl GigaMuxApp {
                         }
                     }
                     VmafEvent::Finished { ok, failed } => {
-                        self.push_session(format!("VMAF finished — scored={ok} failed={failed}"));
+                        self.note_session_ui(format!(
+                            "VMAF finished — scored={ok} failed={failed}"
+                        ));
                     }
                 },
                 AppEvent::VmafDone(result) => {
@@ -3808,7 +3815,7 @@ impl GigaMuxApp {
                 ui.label(egui::RichText::new("Logs").strong().small());
                 ui.checkbox(&mut prompt.session_log, "Session log");
                 ui.checkbox(&mut prompt.file_logs, "Per-file logs (this session)");
-                ui.checkbox(&mut prompt.job_logs, "Job logs (encode + VMAF, AppData)");
+                ui.checkbox(&mut prompt.job_logs, "Job logs (encode + VMAF .log.gz)");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let can = prompt.any_selected();

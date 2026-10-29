@@ -15,12 +15,15 @@ pub use check::{
     run_check, trash_file, CheckIssue, CheckReport,
 };
 pub use encode::{run_batch, EncodeEvent, EncodeOptions};
-pub use job_log::{encode_logs_dir, job_logs_dir, EncodeJobLog, JobLog, JobLogKind};
+pub use job_log::{
+    encode_event_line, encode_logs_dir, job_logs_dir, vmaf_event_line, EncodeJobLog, JobLog,
+    JobLogKind,
+};
 pub use gpu::{
     av1_nvenc_available, list_av1_nvenc_devices, list_nvenc_devices, list_nvenc_devices_for,
     nvenc_encoder_works, GpuChoice, NvencDevice,
 };
-pub use prefs::Prefs;
+pub use prefs::{logs_dir, Prefs};
 pub use probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
     media_summary, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,

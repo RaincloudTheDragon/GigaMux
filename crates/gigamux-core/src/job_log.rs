@@ -1,4 +1,5 @@
-//! Per-job gzipped logs under `%APPDATA%\GigaMux\config\logs\` (encode + VMAF).
+//! Per-job gzipped logs under `%APPDATA%\GigaMux\logs\` (encode + VMAF).
+//! Each durable line is also mirrored into `session.log` for a single parseable transcript.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -9,7 +10,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use crate::encode::EncodeEvent;
-use crate::prefs::prefs_dir;
+use crate::prefs::{self, ensure_logs_dir, logs_dir, prefs_dir};
 use crate::vmaf::VmafEvent;
 
 /// Which pipeline owns this durable log file.
@@ -47,9 +48,7 @@ pub type EncodeJobLog = JobLog;
 impl JobLog {
     /// Create `logs/{encode|vmaf}_YYYYMMDD_HHMMSS.log.gz` (suffix if the stamp collides).
     pub fn start(kind: JobLogKind) -> Result<Self, String> {
-        let root = prefs_dir().ok_or_else(|| "could not resolve AppData config dir".to_string())?;
-        let dir = root.join("logs");
-        fs::create_dir_all(&dir).map_err(|e| format!("create logs dir: {e}"))?;
+        let dir = ensure_logs_dir()?;
         let stamp = Local::now().format("%Y%m%d_%H%M%S");
         let prefix = kind.prefix();
         let mut path = dir.join(format!("{prefix}_{stamp}.log.gz"));
@@ -60,13 +59,13 @@ impl JobLog {
         }
         let file = File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
         let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
-        writeln!(
-            encoder,
+        let header = format!(
             "# GigaMux {} job log — {}",
             kind.title(),
             Local::now().to_rfc3339()
-        )
-        .map_err(|e| format!("write log header: {e}"))?;
+        );
+        writeln!(encoder, "{header}").map_err(|e| format!("write log header: {e}"))?;
+        let _ = prefs::append_session_log(&header);
         Ok(Self {
             path,
             encoder: Some(encoder),
@@ -99,6 +98,8 @@ impl JobLog {
         };
         let _ = writeln!(enc, "{line}");
         let _ = enc.flush();
+        // Mirror into the rolling session transcript (UI pane may also show a subset).
+        let _ = prefs::append_session_log(line);
     }
 }
 
@@ -110,7 +111,8 @@ impl Drop for JobLog {
     }
 }
 
-fn encode_event_line(ev: &EncodeEvent) -> Option<String> {
+/// Durable line for an encode event (`None` = progress-only, skip logging).
+pub fn encode_event_line(ev: &EncodeEvent) -> Option<String> {
     match ev {
         EncodeEvent::Log(msg) => Some(msg.clone()),
         EncodeEvent::BatchStarted {
@@ -141,7 +143,8 @@ fn encode_event_line(ev: &EncodeEvent) -> Option<String> {
     }
 }
 
-fn vmaf_event_line(ev: &VmafEvent) -> Option<String> {
+/// Durable line for a VMAF event (`None` = progress-only, skip logging).
+pub fn vmaf_event_line(ev: &VmafEvent) -> Option<String> {
     match ev {
         VmafEvent::Log(msg) => Some(msg.clone()),
         VmafEvent::BatchStarted {
@@ -167,32 +170,46 @@ fn vmaf_event_line(ev: &VmafEvent) -> Option<String> {
     }
 }
 
-/// `%APPDATA%\GigaMux\config\logs` (or platform equivalent).
+/// `%APPDATA%\GigaMux\logs` (or platform equivalent).
 pub fn encode_logs_dir() -> Option<PathBuf> {
-    prefs_dir().map(|d| d.join("logs"))
+    logs_dir()
 }
 
-/// Alias — same directory holds encode + VMAF job logs.
+/// Alias — same directory holds encode + VMAF job logs (+ session.log).
 pub fn job_logs_dir() -> Option<PathBuf> {
     encode_logs_dir()
 }
 
-/// Delete every file under `config/logs` (encode/VMAF `.log.gz` etc.). Returns how many removed.
-pub fn clear_encode_logs() -> Result<usize, String> {
-    let Some(dir) = encode_logs_dir() else {
-        return Ok(0);
-    };
+fn clear_job_files_in(dir: &Path) -> Result<usize, String> {
     if !dir.is_dir() {
         return Ok(0);
     }
     let mut n = 0usize;
-    for entry in fs::read_dir(&dir).map_err(|e| format!("read logs dir: {e}"))? {
+    for entry in fs::read_dir(dir).map_err(|e| format!("read logs dir: {e}"))? {
         let entry = entry.map_err(|e| format!("logs entry: {e}"))?;
         let path = entry.path();
+        // Keep rolling session.log when purging job archives only.
+        if path.file_name().and_then(|s| s.to_str()) == Some("session.log") {
+            continue;
+        }
         if path.is_file() {
             fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
             n += 1;
         }
+    }
+    Ok(n)
+}
+
+/// Delete encode/VMAF `.log.gz` under `logs/` (and leftover `config/logs`). Keeps `session.log`.
+pub fn clear_encode_logs() -> Result<usize, String> {
+    let _ = ensure_logs_dir();
+    let mut n = 0usize;
+    if let Some(dir) = encode_logs_dir() {
+        n += clear_job_files_in(&dir)?;
+    }
+    if let Some(legacy) = prefs_dir().map(|d| d.join("logs")) {
+        n += clear_job_files_in(&legacy)?;
+        let _ = fs::remove_dir(&legacy);
     }
     Ok(n)
 }
