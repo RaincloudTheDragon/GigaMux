@@ -163,6 +163,24 @@ fn append_libvpx_opaque_args(cmd: &mut Vec<String>, encoder: &str, ceiling: &str
     ]);
 }
 
+/// Opaque `vp9_qsv` — VBR capped at source ceiling (no CRF0/CQ0 equivalent on QSV).
+fn append_vp9_qsv_args(cmd: &mut Vec<String>, pix: &str, ceiling: &str, bufsize: &str) {
+    cmd.extend([
+        "-c:v".into(),
+        "vp9_qsv".into(),
+        "-pix_fmt".into(),
+        pix.into(),
+        "-preset".into(),
+        "slow".into(),
+        "-b:v".into(),
+        ceiling.into(),
+        "-maxrate".into(),
+        ceiling.into(),
+        "-bufsize".into(),
+        bufsize.into(),
+    ]);
+}
+
 /// libx264 needs an explicit profile for 4:2:2 / 4:4:4 / 10-bit.
 fn append_x264_profile(cmd: &mut Vec<String>, pix: &str) {
     let profile = match pix {
@@ -210,6 +228,9 @@ fn build_cmd(
     } else {
         opaque_container
     };
+    let use_nvenc = use_hardware && opaque_video.is_nvenc() && !has_alpha;
+    let use_qsv = use_hardware && opaque_video.is_qsv() && !has_alpha;
+
     let mut cmd = vec![
         "ffmpeg".into(),
         "-v".into(),
@@ -219,6 +240,10 @@ fn build_cmd(
         "1.0".into(),
         "-y".into(),
     ];
+    // QSV needs an explicit device on Windows; software decode → iGPU encode is fine.
+    if use_qsv {
+        cmd.extend(["-init_hw_device".into(), "qsv=hw".into()]);
+    }
 
     let vcodec = video_codec_name(info);
     if has_alpha && (vcodec == "vp9" || vcodec == "vp8") {
@@ -233,12 +258,11 @@ fn build_cmd(
     cmd.push("-i".into());
     cmd.push(input.to_string_lossy().into_owned());
 
-    let use_nvenc = use_hardware && opaque_video.is_nvenc() && !has_alpha;
     let src_pix = video_pix_fmt(info);
     let out_pix = delivery_pix_fmt(&src_pix, has_alpha, use_hardware, opaque_video);
 
     if has_alpha {
-        // Alpha is VP8/VP9 via libvpx — NVENC has no VP8/VP9 encoder (α or otherwise).
+        // Alpha is VP8/VP9 via libvpx — HW has no VP8/VP9 alpha encoder.
         cmd.extend([
             "-c:v".into(),
             alpha_video.ffmpeg_encoder().into(),
@@ -269,6 +293,9 @@ fn build_cmd(
             "-bufsize".into(),
             bufsize,
         ]);
+        append_audio_args(&mut cmd, input, info, out_container);
+    } else if use_qsv {
+        append_vp9_qsv_args(&mut cmd, out_pix, &ceiling, &bufsize);
         append_audio_args(&mut cmd, input, info, out_container);
     } else if opaque_video.is_libvpx() {
         append_libvpx_opaque_args(
@@ -683,6 +710,7 @@ pub fn run_batch(
             None => (auto_k, auto_label),
         };
         let use_nvenc = opts.use_hardware && opts.opaque_video.is_nvenc() && !has_alpha;
+        let use_qsv = opts.use_hardware && opts.opaque_video.is_qsv() && !has_alpha;
         let path_label = if has_alpha {
             format!("α {} {}", opts.alpha_video.label(), opts.alpha_container.label())
         } else {
@@ -694,6 +722,8 @@ pub fn run_batch(
         };
         let device = if use_nvenc {
             format!("gpu={}", opts.gpu.ffmpeg_arg())
+        } else if use_qsv {
+            format!("qsv={}", opts.opaque_video.ffmpeg_encoder(true))
         } else {
             format!(
                 "cpu={}",

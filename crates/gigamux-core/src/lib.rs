@@ -26,7 +26,7 @@ pub use probe::{
 };
 pub use targets::{
     alpha_pair_ok, audio_encode_for, audio_must_recode, cycle_alpha_container,
-    cycle_opaque_container, delivery_pix_fmt, nvenc_pix_fmt, opaque_pair_ok,
+    cycle_opaque_container, delivery_pix_fmt, nvenc_pix_fmt, opaque_pair_ok, qsv_vp9_pix_fmt,
     pix_fmt_convert_warning, pix_fmt_label, pix_fmt_will_convert, software_pix_fmt, AlphaVideo,
     AudioEncode, OpaqueVideo, OutContainer,
     OutputTargets,

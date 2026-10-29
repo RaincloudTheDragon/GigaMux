@@ -792,12 +792,15 @@ impl GigaMuxApp {
         }
     }
 
-    /// True when an encode job is using software libvpx (opaque VP8/9 or any α file).
+    /// True when an encode job is using software libvpx (opaque VP8/9 CPU or any α file).
     fn cpu_encode_active(&self) -> bool {
         if !(self.busy && matches!(self.job, Some(JobKind::Encode))) {
             return false;
         }
-        if self.prefs.opaque_video.is_libvpx() {
+        // Opaque VP9 + hardware uses QSV — don't throttle previews as a CPU encode.
+        if self.prefs.opaque_video.is_libvpx()
+            && !(self.prefs.use_hardware && self.prefs.opaque_video.is_qsv())
+        {
             return true;
         }
         // Alpha delivers always use libvpx — throttle if any known-α input is in the batch.
@@ -2474,7 +2477,7 @@ impl GigaMuxApp {
             if ui
                 .checkbox(&mut self.prefs.use_hardware, "Use hardware")
                 .on_hover_text(
-                    "On: NVIDIA NVENC — matches source chroma when supported (no 4:2:2; warns on fallback). Off: CPU and keep source chroma. VP8/VP9 and α stay 4:2:0.",
+                    "On: NVENC for HEVC/H.264/AV1; Intel QSV (vp9_qsv) for opaque VP9. Matches source chroma when supported (no 4:2:2; warns on fallback). Off: CPU. VP8 and α stay libvpx 4:2:0.",
                 )
                 .changed()
             {
@@ -3221,7 +3224,7 @@ impl GigaMuxApp {
                     if ui
                         .checkbox(&mut self.prefs.use_hardware, "Use hardware")
                         .on_hover_text(
-                            "On: NVIDIA NVENC — match source chroma when supported; warn on fallback. Off: CPU keep source.",
+                            "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9. Off: CPU. VP8/α stay libvpx.",
                         )
                         .changed()
                     {

@@ -33,7 +33,7 @@ impl OpaqueVideo {
         Self::ALL[(i + 1) % Self::ALL.len()]
     }
 
-    /// True for software libvpx opaque encodes (CRF0 path).
+    /// True for VP8/VP9 family (opaque libvpx when hardware is off; α always libvpx).
     pub fn is_libvpx(self) -> bool {
         matches!(self, Self::Vp9 | Self::Vp8)
     }
@@ -43,7 +43,12 @@ impl OpaqueVideo {
         matches!(self, Self::Hevc | Self::H264 | Self::Av1)
     }
 
-    /// ffmpeg `-c:v` — NVENC when `hardware` and codec supports it, else CPU.
+    /// True when opaque VP9 can use Intel Quick Sync (`vp9_qsv`) with `use_hardware`.
+    pub fn is_qsv(self) -> bool {
+        matches!(self, Self::Vp9)
+    }
+
+    /// ffmpeg `-c:v` — NVENC / QSV when `hardware` and codec supports it, else CPU.
     pub fn ffmpeg_encoder(self, hardware: bool) -> &'static str {
         match self {
             Self::Hevc if hardware => "hevc_nvenc",
@@ -52,6 +57,8 @@ impl OpaqueVideo {
             Self::H264 => "libx264",
             Self::Av1 if hardware => "av1_nvenc",
             Self::Av1 => "libaom-av1",
+            // Opaque VP9 only — α stays libvpx (QSV has no alpha).
+            Self::Vp9 if hardware => "vp9_qsv",
             Self::Vp9 => "libvpx-vp9",
             Self::Vp8 => "libvpx",
         }
@@ -280,7 +287,13 @@ pub fn software_pix_fmt(src_pix: &str) -> &'static str {
 /// Chroma (420/422/444) + bit depth (8/10) for convert detection.
 fn pix_chroma_depth(pix: &str) -> (u16, u8) {
     let p = pix.trim().to_ascii_lowercase();
-    let depth = if p.contains("10")
+    // nv12/nv16/etc. are 8-bit; naive "12"/"16" substring matches would mis-tag them as 10-bit.
+    let depth = if matches!(
+        p.as_str(),
+        "nv12" | "nv21" | "nv16" | "nv24" | "nv42"
+    ) {
+        8
+    } else if p.contains("10")
         || p.contains("12")
         || p.contains("16")
         || p.starts_with("p010")
@@ -341,8 +354,16 @@ pub fn nvenc_pix_fmt(src_pix: &str, opaque: OpaqueVideo) -> &'static str {
     }
 }
 
+/// Closest QSV-friendly format for opaque `vp9_qsv` (nv12 / p010 only).
+pub fn qsv_vp9_pix_fmt(src_pix: &str) -> &'static str {
+    match software_pix_fmt(src_pix) {
+        "yuv420p10le" | "yuv422p10le" | "yuv444p10le" => "p010le",
+        _ => "nv12",
+    }
+}
+
 /// Pixel format we will feed the encoder for this target.
-/// CPU keeps source chroma; NVENC matches when the codec/GPU allows, else nearest fallback.
+/// CPU keeps source chroma; NVENC/QSV match when the codec/GPU allows, else nearest fallback.
 pub fn delivery_pix_fmt(
     src_pix: &str,
     has_alpha: bool,
@@ -351,6 +372,9 @@ pub fn delivery_pix_fmt(
 ) -> &'static str {
     if has_alpha {
         return "yuva420p";
+    }
+    if use_hardware && opaque.is_qsv() {
+        return qsv_vp9_pix_fmt(src_pix);
     }
     if opaque.is_libvpx() {
         return "yuv420p";
