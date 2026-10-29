@@ -15,3 +15,19 @@ Thus, GigaMux will re-encode your input file with `CQ=0`/`CRF=0` (same target, d
 This is a **LOSSY** encode target. For most applications (Downloaded Twitch VODs & local OBS recordings with CBR) there will be no perceptible difference in quality, but the output is still removing data that was included in the input. The question for the user is whether that input matters to them more than storage. For most Twitch streamers or archivists, storage is a constraint that matters more, due to the astronomical size that VODs can reach.
 
 Audio is copied directly from the source to the destination, unless the destination container is incompatible, in which case the audio will be recoded to a compatible codec. The UI will warn if this will occur on render.
+
+### Codec, Encoder, & Container
+
+Codec choice depends entirely on your hardware, time budget, and end goal. Generally, you should be encoding to the most quality-efficient codec. Software (CPU) encoding is always better in this regard. It is also universally slower. To assist with this, [Flamenco](https://flamenco.blender.org/) support is planned. But in the meantime, encoding with hardware, especially Nvidia's Nvenc, is much faster, and already used to power the encoding needs of most people. For information regarding what your GPU is capable of, consult [this page](https://en.wikipedia.org/wiki/NVENC#Versions).
+
+It's best to test a short encode in whatever your workflow is, before committing to any given combination of Codec, Encoder, and container. Not all software and hardware has support for every codec or container natively, and may require plugins or manual configuration in order to function properly. (e.g. Adobe Premiere Pro does not support `.webm`/`vp9` or `AV1` in any codec natively; I use [Autokroma's Influx](https://www.autokroma.com/Influx) importer for both; Windows may not support playback universally and might need a 'video extensions' Microsoft Store installation on a per-codec basis) In any case, use the codec/encoder/container that is best supported by your hardware, software, and preference.
+
+Your codec choices in GigaMux, in order of efficiency:
+- `AV1`: Currently the most efficient codec available that has a CQ0 target. This is the default and is recommended. The Nvenc generation required is Ada (40 series) or higher GPU. Software encoding is also an option, provided by ffmpeg's `libaom-av1`.
+  - Supports containers `.mp4`, `.mkv`
+- `HEVC`: Second-most efficient, recommended for users on Ampere (30 series) or lower GPU, or any user who wishes not to use `AV1`. Software via `libx265`. Allegedly supports alpha, but not with vanilla ffmpeg, and most softwares don't support it anyway.
+  - Supports containers `.mp4`, `.mkv`
+- `VP9`: Somewhat efficient, but not necessarily worth the time. This is the only option for alpha support, because it's the only lossy codec with a crf0 target that supports alpha. No real hardware encoder support (yet). Intel Quick Sync on Intel Arc GPUs or post-Ice Lake CPUs have hardware encoders supported via ffmpeg `vp9_qsv` or `vp9_vaapi`, but I haven't been able to test on any yet. So it's software only for now, via `libvpx-vp9`.
+  - Supports containers `.mp4`, `.mkv`, `.webm`
+- `AVC`/`H.264`: Denoted as `H.264` in GigaMux due to it being the more common name for `AVC`. Not strongly recommended if your nvenc generation is less than 5th gen (Maxwell 2.0; 900 series) but still a strong option for maximum deliverability; it's one of the longest-living codecs and has wide support on just about everything that can play video. Software encoding via ol' reliable `libx264`.
+  - Supports containers `.mp4`, `.mkv`
