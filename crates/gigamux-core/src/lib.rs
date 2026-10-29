@@ -13,7 +13,10 @@ pub use check::{
     run_check, trash_file, CheckIssue, CheckReport,
 };
 pub use encode::{run_batch, EncodeEvent, EncodeOptions};
-pub use gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
+pub use gpu::{
+    av1_nvenc_available, list_av1_nvenc_devices, list_nvenc_devices, list_nvenc_devices_for,
+    nvenc_encoder_works, GpuChoice, NvencDevice,
+};
 pub use prefs::Prefs;
 pub use probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,

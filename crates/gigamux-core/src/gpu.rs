@@ -55,8 +55,14 @@ pub struct NvencDevice {
     pub name: String,
 }
 
-/// Probe NVENC devices via a short hevc_nvenc encode with `-gpu list`.
+/// Probe NVENC devices via a short `hevc_nvenc` encode with `-gpu list`.
 pub fn list_nvenc_devices() -> Result<Vec<NvencDevice>, String> {
+    list_nvenc_devices_for("hevc_nvenc")
+}
+
+/// Devices reported by ffmpeg `-gpu list` for an NVENC encoder (inventory only).
+/// Note: `av1_nvenc -gpu list` still lists pre-Ada cards — use [`list_av1_nvenc_devices`] for capability.
+pub fn list_nvenc_devices_for(encoder: &str) -> Result<Vec<NvencDevice>, String> {
     let output = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -65,7 +71,7 @@ pub fn list_nvenc_devices() -> Result<Vec<NvencDevice>, String> {
             "-i",
             "nullsrc=s=64x64:d=0.1",
             "-c:v",
-            "hevc_nvenc",
+            encoder,
             "-gpu",
             "list",
             "-f",
@@ -75,9 +81,53 @@ pub fn list_nvenc_devices() -> Result<Vec<NvencDevice>, String> {
         .output()
         .map_err(|e| format!("ffmpeg not found or failed to start: {e}"))?;
 
-    // Device lines are printed to stderr.
+    // Device lines land on stderr (list mode often exits non-zero; parse anyway).
     let text = String::from_utf8_lossy(&output.stderr);
     parse_gpu_list(&text)
+}
+
+/// One-frame encode smoke test. Needed for AV1: `-gpu list` prints GPUs that cannot encode.
+pub fn nvenc_encoder_works(encoder: &str, gpu: Option<u32>) -> bool {
+    let gpu_arg = match gpu {
+        Some(i) => i.to_string(),
+        None => "any".to_string(),
+    };
+    Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=256x256:d=0.1",
+            "-frames:v",
+            "1",
+            "-c:v",
+            encoder,
+            "-gpu",
+            &gpu_arg,
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// GPUs from `hevc_devices` that actually open `av1_nvenc` (Ada / 40-series+).
+pub fn list_av1_nvenc_devices(hevc_devices: &[NvencDevice]) -> Vec<NvencDevice> {
+    hevc_devices
+        .iter()
+        .filter(|d| nvenc_encoder_works("av1_nvenc", Some(d.index)))
+        .cloned()
+        .collect()
+}
+
+/// True when `av1_nvenc` can encode on any GPU.
+pub fn av1_nvenc_available() -> bool {
+    nvenc_encoder_works("av1_nvenc", None)
 }
 
 fn parse_gpu_list(stderr: &str) -> Result<Vec<NvencDevice>, String> {

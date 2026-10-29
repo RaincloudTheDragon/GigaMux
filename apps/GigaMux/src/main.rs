@@ -15,7 +15,7 @@ use gigamux_core::check::{
     run_check, trash_file, CheckIssue, CheckReport,
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
-use gigamux_core::gpu::{list_nvenc_devices, GpuChoice, NvencDevice};
+use gigamux_core::gpu::{list_av1_nvenc_devices, list_nvenc_devices, GpuChoice, NvencDevice};
 use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
@@ -25,8 +25,7 @@ use gigamux_core::probe::{
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
-    pix_fmt_convert_warning,
-    AudioEncode, OutContainer, OutputTargets,
+    pix_fmt_convert_warning, AudioEncode, OpaqueVideo, OutContainer, OutputTargets,
 };
 
 /// Live dual-bar encode progress (current file + whole batch).
@@ -209,6 +208,8 @@ struct GigaMuxApp {
     /// Draft text for the maxrate override field (keeps typing stable across frames).
     maxrate_override_edit: String,
     devices: Vec<NvencDevice>,
+    /// GPUs that can open `av1_nvenc` (empty on pre-Ada / no AV1 NVENC).
+    av1_devices: Vec<NvencDevice>,
     gpu_warn: Option<String>,
     input_files: Vec<PathBuf>,
     output_files: Vec<PathBuf>,
@@ -238,6 +239,8 @@ struct GigaMuxApp {
     pending_recycle_delete: Option<RecycleDeletePrompt>,
     /// Recycle Bin failed — confirm permanent delete (or proceed if warnings disabled).
     pending_permanent_delete: Option<PermanentDeletePrompt>,
+    /// AV1 + hardware but no `av1_nvenc` — holds queued encode selection until dismissed/fixed.
+    pending_av1_nvenc: Option<Option<String>>,
     /// One-by-one delete cascade (list shrinks between each file).
     delete_queue: Option<DeleteQueue>,
     /// Blender-style waypoint history (delete steps + cursor); jump undoes/redoes across Recycle Bin.
@@ -402,6 +405,8 @@ impl GigaMuxApp {
                 Vec::new()
             }
         };
+        // Real one-frame smoke — `-gpu list` falsely reports AV1 on pre-Ada cards.
+        let av1_devices = list_av1_nvenc_devices(&devices);
         let (gpu, warn) = prefs.gpu.sanitize(&devices);
         prefs.gpu = gpu;
         let maxrate_override_edit = prefs
@@ -412,6 +417,7 @@ impl GigaMuxApp {
             prefs,
             maxrate_override_edit,
             devices,
+            av1_devices,
             gpu_warn: warn,
             input_files: Vec::new(),
             output_files: Vec::new(),
@@ -432,6 +438,7 @@ impl GigaMuxApp {
             pending_check: None,
             pending_recycle_delete: None,
             pending_permanent_delete: None,
+            pending_av1_nvenc: None,
             delete_queue: None,
             undo_history: UndoHistory::new(),
             history_nav: None,
@@ -1236,12 +1243,25 @@ impl GigaMuxApp {
         if self.busy || self.delete_queue.is_some() || self.history_nav.is_some() {
             return;
         }
+        if self.pending_av1_nvenc.is_some() {
+            return;
+        }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
             self.push_session("set both input and output folders before Encode");
             self.log_open = true;
             return;
         }
         self.commit_maxrate_override_edit();
+        // Block encode until the user fixes AV1-without-nvAV1 (popup).
+        if self.av1_nvenc_warning().is_some() {
+            self.pending_av1_nvenc = Some(only_name);
+            return;
+        }
+        self.start_encode_now(only_name);
+    }
+
+    /// Spawn the encode worker (caller already cleared AV1 NVENC / folder guards).
+    fn start_encode_now(&mut self, only_name: Option<String>) {
         let _ = prefs::save(&self.prefs);
         self.cancel.store(false, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
@@ -1905,7 +1925,9 @@ impl GigaMuxApp {
             self.start_encode(None);
         }
         if esc {
-            if self.pending_permanent_delete.is_some() {
+            if self.pending_av1_nvenc.is_some() {
+                self.pending_av1_nvenc = None;
+            } else if self.pending_permanent_delete.is_some() {
                 self.pending_permanent_delete = None;
                 if let Some(q) = self.delete_queue.as_mut() {
                     q.next_at = Instant::now() + Duration::from_millis(DELETE_STEP_MS);
@@ -2317,6 +2339,31 @@ impl GigaMuxApp {
         None
     }
 
+    /// Amber when opaque AV1 + hardware but no GPU can run `av1_nvenc` (pre-Ada, etc.).
+    fn av1_nvenc_warning(&self) -> Option<String> {
+        if !self.prefs.use_hardware || self.prefs.opaque_video != OpaqueVideo::Av1 {
+            return None;
+        }
+        let ok = match self.prefs.gpu {
+            GpuChoice::Any => !self.av1_devices.is_empty(),
+            GpuChoice::Index(i) => self.av1_devices.iter().any(|d| d.index == i),
+        };
+        if ok {
+            return None;
+        }
+        if self.av1_devices.is_empty() {
+            Some(
+                "AV1 NVENC not available on this GPU — turn off Use hardware (libaom) or pick HEVC/H.264"
+                    .into(),
+            )
+        } else {
+            Some(
+                "Selected GPU has no AV1 NVENC — pick Any/another GPU, HEVC/H.264, or turn off Use hardware"
+                    .into(),
+            )
+        }
+    }
+
     /// Amber line when any input’s chroma/bit-depth can’t be matched for the current target.
     fn chroma_convert_warning(&self) -> Option<String> {
         for path in &self.input_files {
@@ -2435,6 +2482,9 @@ impl GigaMuxApp {
             }
             self.ui_maxrate_override(ui);
         });
+        if let Some(warn) = self.av1_nvenc_warning() {
+            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+        }
         if let Some(warn) = self.chroma_convert_warning() {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
         }
@@ -3179,6 +3229,9 @@ impl GigaMuxApp {
                     }
                     self.ui_maxrate_override(ui);
                 });
+                if let Some(warn) = self.av1_nvenc_warning() {
+                    ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+                }
                 ui.add_enabled_ui(self.prefs.use_hardware, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("GPU");
@@ -3220,6 +3273,7 @@ impl GigaMuxApp {
                                 }
                                 Err(e) => self.push_session(format!("GPU probe failed: {e}")),
                             }
+                            self.av1_devices = list_av1_nvenc_devices(&self.devices);
                         }
                     });
                 });
@@ -3379,6 +3433,56 @@ impl GigaMuxApp {
                             );
                         }
                     });
+            });
+    }
+
+    /// Block encode when AV1 + hardware but `av1_nvenc` is missing; offer fix-and-continue.
+    fn ui_av1_nvenc_prompt(&mut self, ctx: &egui::Context) {
+        let Some(only_name) = self.pending_av1_nvenc.clone() else {
+            return;
+        };
+        let msg = self.av1_nvenc_warning().unwrap_or_else(|| {
+            "AV1 NVENC is not available for the current GPU / hardware setting.".into()
+        });
+        egui::Window::new("AV1 NVENC unavailable")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), &msg);
+                ui.add_space(4.0);
+                ui.label("Encode would fail with the current targets. Fix the setting, then continue:");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.pending_av1_nvenc = None;
+                    }
+                    if ui
+                        .button("Turn off hardware")
+                        .on_hover_text("Use libaom-av1 (CPU) for this encode")
+                        .clicked()
+                    {
+                        self.prefs.use_hardware = false;
+                        self.save_targets();
+                        self.pending_av1_nvenc = None;
+                        self.start_encode_now(only_name.clone());
+                    }
+                    if ui
+                        .button("Use HEVC")
+                        .on_hover_text("Switch opaque target to HEVC (NVENC on this GPU)")
+                        .clicked()
+                    {
+                        self.prefs.opaque_video = OpaqueVideo::Hevc;
+                        self.prefs.opaque_container =
+                            gigamux_core::targets::clamp_opaque_container(
+                                OpaqueVideo::Hevc,
+                                self.prefs.opaque_container,
+                            );
+                        self.save_targets();
+                        self.pending_av1_nvenc = None;
+                        self.start_encode_now(only_name);
+                    }
+                });
             });
     }
 
@@ -3932,6 +4036,7 @@ impl eframe::App for GigaMuxApp {
         });
 
         self.ui_settings(&ctx);
+        self.ui_av1_nvenc_prompt(&ctx);
         self.ui_check_prompt(&ctx);
         self.ui_recycle_delete_prompt(&ctx);
         self.ui_permanent_delete_prompt(&ctx);
