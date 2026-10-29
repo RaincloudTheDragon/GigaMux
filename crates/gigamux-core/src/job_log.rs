@@ -108,3 +108,23 @@ fn event_line(ev: &EncodeEvent) -> Option<String> {
 pub fn encode_logs_dir() -> Option<PathBuf> {
     prefs_dir().map(|d| d.join("logs"))
 }
+
+/// Delete every file under `config/logs` (encode job `.log.gz` etc.). Returns how many removed.
+pub fn clear_encode_logs() -> Result<usize, String> {
+    let Some(dir) = encode_logs_dir() else {
+        return Ok(0);
+    };
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let mut n = 0usize;
+    for entry in fs::read_dir(&dir).map_err(|e| format!("read logs dir: {e}"))? {
+        let entry = entry.map_err(|e| format!("logs entry: {e}"))?;
+        let path = entry.path();
+        if path.is_file() {
+            fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}

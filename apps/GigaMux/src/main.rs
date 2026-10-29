@@ -16,6 +16,7 @@ use gigamux_core::check::{
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::gpu::{list_av1_nvenc_devices, list_nvenc_devices, GpuChoice, NvencDevice};
+use gigamux_core::job_log;
 use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
@@ -87,6 +88,8 @@ impl EncodeProgress {
 }
 
 fn main() -> eframe::Result<()> {
+    // Adobe-style: Alt held while launching → ask to purge prefs (before the window eats focus).
+    let ask_purge_prefs = alt_held_at_launch();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 700.0])
@@ -98,8 +101,22 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "GigaMux",
         options,
-        Box::new(|_cc| Ok(Box::new(GigaMuxApp::new()))),
+        Box::new(move |_cc| Ok(Box::new(GigaMuxApp::new(ask_purge_prefs)))),
     )
+}
+
+/// True when Alt/Option is down at process start (prefs-purge offer).
+fn alt_held_at_launch() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
+        // High bit set ⇒ key currently down.
+        unsafe { GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000 != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 enum JobKind {
@@ -241,6 +258,8 @@ struct GigaMuxApp {
     pending_permanent_delete: Option<PermanentDeletePrompt>,
     /// AV1 + hardware but no `av1_nvenc` — holds queued encode selection until dismissed/fixed.
     pending_av1_nvenc: Option<Option<String>>,
+    /// Alt held at launch — choose which prefs / logs to purge.
+    pending_purge: Option<PurgePrompt>,
     /// One-by-one delete cascade (list shrinks between each file).
     delete_queue: Option<DeleteQueue>,
     /// Blender-style waypoint history (delete steps + cursor); jump undoes/redoes across Recycle Bin.
@@ -397,8 +416,51 @@ struct PermanentDeletePrompt {
     trash_error: String,
 }
 
+/// Alt-at-launch purge chooser (which prefs slices + optional logs).
+#[derive(Clone)]
+struct PurgePrompt {
+    folders: bool,
+    targets: bool,
+    hardware: bool,
+    bitrate: bool,
+    /// OBS metadata + delete-confirm toggles.
+    misc: bool,
+    session_log: bool,
+    file_logs: bool,
+    job_logs: bool,
+}
+
+impl Default for PurgePrompt {
+    fn default() -> Self {
+        // Prefs on, logs off — matches “reset settings, keep history” default.
+        Self {
+            folders: true,
+            targets: true,
+            hardware: true,
+            bitrate: true,
+            misc: true,
+            session_log: false,
+            file_logs: false,
+            job_logs: false,
+        }
+    }
+}
+
+impl PurgePrompt {
+    fn any_selected(&self) -> bool {
+        self.folders
+            || self.targets
+            || self.hardware
+            || self.bitrate
+            || self.misc
+            || self.session_log
+            || self.file_logs
+            || self.job_logs
+    }
+}
+
 impl GigaMuxApp {
-    fn new() -> Self {
+    fn new(ask_purge_prefs: bool) -> Self {
         let mut prefs = prefs::load();
         let devices = match list_nvenc_devices() {
             Ok(d) => d,
@@ -441,6 +503,7 @@ impl GigaMuxApp {
             pending_recycle_delete: None,
             pending_permanent_delete: None,
             pending_av1_nvenc: None,
+            pending_purge: ask_purge_prefs.then(PurgePrompt::default),
             delete_queue: None,
             undo_history: UndoHistory::new(),
             history_nav: None,
@@ -1265,6 +1328,83 @@ impl GigaMuxApp {
         }
     }
 
+    /// Apply selected purge slices from the Alt-at-launch dialog.
+    fn apply_purge(&mut self, p: &PurgePrompt) {
+        let d = Prefs::default();
+        let mut parts: Vec<String> = Vec::new();
+        let mut touched_prefs = false;
+
+        if p.folders {
+            self.prefs.input_dir = d.input_dir.clone();
+            self.prefs.output_dir = d.output_dir.clone();
+            touched_prefs = true;
+            parts.push("folders".into());
+        }
+        if p.targets {
+            self.prefs.opaque_video = d.opaque_video;
+            self.prefs.opaque_container = d.opaque_container;
+            self.prefs.alpha_video = d.alpha_video;
+            self.prefs.alpha_container = d.alpha_container;
+            touched_prefs = true;
+            parts.push("targets".into());
+        }
+        if p.hardware {
+            self.prefs.use_hardware = d.use_hardware;
+            self.prefs.gpu = d.gpu;
+            touched_prefs = true;
+            parts.push("hardware".into());
+        }
+        if p.bitrate {
+            self.prefs.use_peak_bitrate = d.use_peak_bitrate;
+            self.prefs.maxrate_override_k = d.maxrate_override_k;
+            self.maxrate_override_edit.clear();
+            touched_prefs = true;
+            parts.push("bitrate".into());
+        }
+        if p.misc {
+            self.prefs.preserve_obs_metadata = d.preserve_obs_metadata;
+            self.prefs.warn_recycle_delete = d.warn_recycle_delete;
+            self.prefs.warn_permanent_delete = d.warn_permanent_delete;
+            touched_prefs = true;
+            parts.push("misc".into());
+        }
+        if touched_prefs {
+            self.prefs.sanitize_targets();
+            let (gpu, warn) = self.prefs.gpu.sanitize(&self.devices);
+            self.prefs.gpu = gpu;
+            self.gpu_warn = warn;
+            let _ = prefs::save(&self.prefs);
+            if p.folders {
+                self.clear_active();
+                self.refresh_lists();
+            }
+        }
+
+        if p.session_log {
+            self.session_log.clear();
+            let _ = prefs::clear_session_log();
+            parts.push("session log".into());
+            let started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            self.push_session(format!("—— session start {started} ——"));
+        }
+        if p.file_logs {
+            self.file_logs.clear();
+            parts.push("file logs".into());
+        }
+        if p.job_logs {
+            match job_log::clear_encode_logs() {
+                Ok(n) => parts.push(format!("job logs ({n})")),
+                Err(e) => self.push_session(format!("job log purge failed: {e}")),
+            }
+        }
+
+        if parts.is_empty() {
+            self.push_session("purge: nothing selected");
+        } else {
+            self.push_session(format!("purged: {}", parts.join(", ")));
+        }
+    }
+
     /// Encode all inputs, or only `only_name` when set (context-menu selection).
     fn start_encode(&mut self, only_name: Option<String>) {
         if self.busy || self.delete_queue.is_some() || self.history_nav.is_some() {
@@ -1952,7 +2092,9 @@ impl GigaMuxApp {
             self.start_encode(None);
         }
         if esc {
-            if self.pending_av1_nvenc.is_some() {
+            if self.pending_purge.is_some() {
+                self.pending_purge = None;
+            } else if self.pending_av1_nvenc.is_some() {
                 self.pending_av1_nvenc = None;
             } else if self.pending_permanent_delete.is_some() {
                 self.pending_permanent_delete = None;
@@ -3343,6 +3485,55 @@ impl GigaMuxApp {
             });
     }
 
+    /// Alt-at-launch: pick which prefs slices / logs to purge.
+    fn ui_purge_prefs_prompt(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.pending_purge.clone() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Purge on launch")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Alt was held at launch. Choose what to reset:");
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Preferences").strong().small());
+                ui.checkbox(&mut prompt.folders, "Folders (input / output)");
+                ui.checkbox(&mut prompt.targets, "Encode targets (codec / container)");
+                ui.checkbox(&mut prompt.hardware, "Hardware / GPU");
+                ui.checkbox(&mut prompt.bitrate, "Bitrate ceiling options");
+                ui.checkbox(&mut prompt.misc, "OBS metadata + delete warnings");
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Logs").strong().small());
+                ui.checkbox(&mut prompt.session_log, "Session log");
+                ui.checkbox(&mut prompt.file_logs, "Per-file logs (this session)");
+                ui.checkbox(&mut prompt.job_logs, "Encode job logs (AppData)");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let can = prompt.any_selected();
+                    if ui
+                        .add_enabled(can, egui::Button::new("Purge selected"))
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            self.apply_purge(&prompt);
+            self.pending_purge = None;
+        } else if cancel {
+            self.pending_purge = None;
+        } else {
+            self.pending_purge = Some(prompt);
+        }
+    }
+
     /// Lines for the log view currently shown (session vs active file).
     fn visible_log_lines(&self) -> Vec<String> {
         let log_name = self.log_file_name();
@@ -4088,6 +4279,7 @@ impl eframe::App for GigaMuxApp {
         self.handle_folder_dnd(&ctx);
 
         self.ui_settings(&ctx);
+        self.ui_purge_prefs_prompt(&ctx);
         self.ui_av1_nvenc_prompt(&ctx);
         self.ui_check_prompt(&ctx);
         self.ui_recycle_delete_prompt(&ctx);

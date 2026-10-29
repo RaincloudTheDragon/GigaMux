@@ -184,3 +184,15 @@ pub fn rewrite_session_log(lines: &[String]) -> Result<(), String> {
     }
     fs::write(&path, text).map_err(|e| format!("rewrite session.log: {e}"))
 }
+
+/// Delete `session.log` if present.
+pub fn clear_session_log() -> Result<(), String> {
+    let Some(path) = session_log_path() else {
+        return Ok(());
+    };
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove session.log: {e}")),
+    }
+}
