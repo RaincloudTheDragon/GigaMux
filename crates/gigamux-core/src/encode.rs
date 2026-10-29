@@ -1,4 +1,4 @@
-//! Local sequential encode (opaque HEVC NVENC / alpha VP9). No chunking.
+//! Local sequential encode (opaque NVENC / VP9 QSV / CPU; alpha libvpx or QSV+libvpx hybrid). No chunking.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use crate::probe::{
 use crate::targets::{
     audio_encode_for, delivery_pix_fmt, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
 };
+use crate::webm_alpha::{mux_vp9_alpha_webm, wants_qsv_alpha_hybrid};
 
 /// Same family as check `INPUT_EXTS` — what the batch encoder will pick up.
 const VIDEO_EXTS: &[&str] = &[
@@ -59,7 +60,7 @@ pub struct EncodeOptions {
     pub preserve_obs_metadata: bool,
     /// Ceiling from 1s video peak when true; otherwise average rate.
     pub use_peak_bitrate: bool,
-    /// NVENC for HEVC/H.264/AV1 when true; CPU (libx265/x264/aom) when false. VP8/VP9 always CPU.
+    /// NVENC for HEVC/H.264/AV1; `vp9_qsv` for opaque VP9; hybrid QSV+libvpx for α VP9/.webm.
     pub use_hardware: bool,
     /// When set, replaces automatic video ceiling (maxrate) in kbps.
     pub maxrate_override_k: Option<u32>,
@@ -180,6 +181,192 @@ fn append_vp9_qsv_args(cmd: &mut Vec<String>, pix: &str, ceiling: &str, bufsize:
         "-bufsize".into(),
         bufsize.into(),
     ]);
+}
+
+/// Dual-output ffmpeg: color → `vp9_qsv` IVF, alpha plane → `libvpx-vp9` IVF.
+fn build_qsv_alpha_dual_argv(
+    input: &Path,
+    info: &serde_json::Value,
+    color_ivf: &Path,
+    alpha_ivf: &Path,
+    bitrate_k: u32,
+) -> Vec<String> {
+    let ceiling = format!("{bitrate_k}k");
+    let bufsize = format!("{}k", bitrate_k * 2);
+    let mut cmd = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-stats".into(),
+        "-stats_period".into(),
+        "1.0".into(),
+        "-y".into(),
+        "-init_hw_device".into(),
+        "qsv=hw".into(),
+    ];
+    let vcodec = video_codec_name(info);
+    if vcodec == "vp9" || vcodec == "vp8" {
+        cmd.push("-c:v".into());
+        cmd.push(if vcodec == "vp9" {
+            "libvpx-vp9".into()
+        } else {
+            "libvpx".into()
+        });
+    }
+    cmd.push("-i".into());
+    cmd.push(input.to_string_lossy().into_owned());
+    // Split YUVA → nv12 color for QSV + gray-as-yuv420p alpha for libvpx.
+    cmd.extend([
+        "-filter_complex".into(),
+        "[0:v]format=yuva420p,split=2[c0][a0];[c0]format=nv12[c];[a0]alphaextract,format=yuv420p[a]"
+            .into(),
+        "-map".into(),
+        "[c]".into(),
+        "-an".into(),
+    ]);
+    append_vp9_qsv_args(&mut cmd, "nv12", &ceiling, &bufsize);
+    cmd.push(color_ivf.to_string_lossy().into_owned());
+    cmd.extend([
+        "-map".into(),
+        "[a]".into(),
+        "-an".into(),
+        "-c:v".into(),
+        "libvpx-vp9".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-auto-alt-ref".into(),
+        "0".into(),
+        "-deadline".into(),
+        "good".into(),
+        "-cpu-used".into(),
+        "0".into(),
+        "-threads".into(),
+        "0".into(),
+        "-tile-columns".into(),
+        "2".into(),
+        "-tile-rows".into(),
+        "1".into(),
+        "-lag-in-frames".into(),
+        "25".into(),
+        "-row-mt".into(),
+        "1".into(),
+        "-crf".into(),
+        "0".into(),
+        "-b:v".into(),
+        ceiling.clone(),
+        "-maxrate".into(),
+        ceiling,
+        "-bufsize".into(),
+        bufsize,
+    ]);
+    cmd.push(alpha_ivf.to_string_lossy().into_owned());
+    cmd
+}
+
+/// Mux hybrid video-only WebM with audio from the source (WebM-safe codecs).
+fn build_hybrid_audio_argv(
+    video_webm: &Path,
+    source: &Path,
+    info: &serde_json::Value,
+    output: &Path,
+    preserve_obs: bool,
+) -> Vec<String> {
+    let mut cmd = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-y".into(),
+        "-i".into(),
+        video_webm.to_string_lossy().into_owned(),
+        "-i".into(),
+        source.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v".into(),
+        "-map".into(),
+        "1:a?".into(),
+        "-c:v".into(),
+        "copy".into(),
+    ];
+    let raw = audio_codec_name(info);
+    if raw.is_empty() {
+        cmd.extend(["-an".into()]);
+    } else {
+        match audio_encode_for(&raw, OutContainer::Webm) {
+            AudioEncode::Copy => cmd.extend(["-c:a".into(), "copy".into()]),
+            AudioEncode::Opus | AudioEncode::Aac => {
+                // WebM wants Opus; AAC path shouldn't run for .webm but re-encode to Opus anyway.
+                let a_k = audio_bitrate_k(source);
+                cmd.extend([
+                    "-c:a".into(),
+                    "libopus".into(),
+                    "-b:a".into(),
+                    format!("{a_k}k"),
+                ]);
+            }
+        }
+    }
+    if preserve_obs {
+        cmd.extend([
+            "-map_metadata".into(),
+            "1".into(),
+            "-map_chapters".into(),
+            "1".into(),
+        ]);
+    }
+    cmd.push("-avoid_negative_ts".into());
+    cmd.push("make_zero".into());
+    cmd.push(output.to_string_lossy().into_owned());
+    cmd
+}
+
+/// QSV color + libvpx alpha → WebM BlockAdditional; caller falls back to full libvpx on `Err`.
+fn run_qsv_alpha_hybrid(
+    input: &Path,
+    output: &Path,
+    info: &serde_json::Value,
+    bitrate_k: u32,
+    preserve_obs: bool,
+    cancel: &AtomicBool,
+    mut on_line: impl FnMut(String, Option<f64>),
+) -> Result<(), String> {
+    let tmp = output.with_extension("hybrid_tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("hybrid temp dir: {e}"))?;
+    let color_ivf = tmp.join("color.ivf");
+    let alpha_ivf = tmp.join("alpha.ivf");
+    let video_webm = tmp.join("video.webm");
+
+    let cleanup = |tmp: &Path| {
+        let _ = std::fs::remove_dir_all(tmp);
+    };
+
+    let dual = build_qsv_alpha_dual_argv(input, info, &color_ivf, &alpha_ivf, bitrate_k);
+    on_line("hybrid: dual encode (vp9_qsv color + libvpx alpha)".into(), None);
+    if let Err(e) = run_ffmpeg(&dual, cancel, &mut on_line) {
+        cleanup(&tmp);
+        return Err(format!("hybrid dual encode: {e}"));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        cleanup(&tmp);
+        return Err("cancelled".into());
+    }
+
+    on_line("hybrid: remux WebM AlphaMode + BlockAdditional".into(), None);
+    if let Err(e) = mux_vp9_alpha_webm(&color_ivf, &alpha_ivf, &video_webm) {
+        cleanup(&tmp);
+        return Err(format!("hybrid remux: {e}"));
+    }
+
+    let audio_argv = build_hybrid_audio_argv(&video_webm, input, info, output, preserve_obs);
+    on_line("hybrid: mux audio".into(), None);
+    if let Err(e) = run_ffmpeg(&audio_argv, cancel, &mut on_line) {
+        cleanup(&tmp);
+        let _ = std::fs::remove_file(output);
+        return Err(format!("hybrid audio mux: {e}"));
+    }
+
+    cleanup(&tmp);
+    Ok(())
 }
 
 /// libx264 needs an explicit profile for 4:2:2 / 4:4:4 / 10-bit.
@@ -729,6 +916,12 @@ pub fn run_batch(
         };
         let use_nvenc = opts.use_hardware && opts.opaque_video.is_nvenc() && !has_alpha;
         let use_qsv = opts.use_hardware && opts.opaque_video.is_qsv() && !has_alpha;
+        let use_hybrid = wants_qsv_alpha_hybrid(
+            opts.use_hardware,
+            has_alpha,
+            opts.alpha_video == AlphaVideo::Vp9,
+            opts.alpha_container == OutContainer::Webm,
+        );
         let path_label = if has_alpha {
             format!("α {} {}", opts.alpha_video.label(), opts.alpha_container.label())
         } else {
@@ -738,7 +931,9 @@ pub fn run_batch(
                 opts.opaque_container.label()
             )
         };
-        let device = if use_nvenc {
+        let device = if use_hybrid {
+            "qsv+libvpx hybrid".into()
+        } else if use_nvenc {
             format!("gpu={}", opts.gpu.ffmpeg_arg())
         } else if use_qsv {
             format!("qsv={}", opts.opaque_video.ffmpeg_encoder(true))
@@ -760,20 +955,6 @@ pub fn run_batch(
                 .unwrap_or_default(),
         )));
 
-        let argv = build_cmd(
-            &input,
-            &output,
-            &info,
-            has_alpha,
-            opts.gpu,
-            bitrate_k,
-            opts.preserve_obs_metadata,
-            opts.use_hardware,
-            opts.opaque_video,
-            opts.opaque_container,
-            opts.alpha_video,
-            opts.alpha_container,
-        );
         // Live preview: grab source frames at out-time on a side thread (throttled).
         let (thumb_tx, thumb_rx) = mpsc::channel::<(String, RgbaThumb)>();
         let thumb_busy = Arc::new(AtomicBool::new(false));
@@ -785,7 +966,7 @@ pub fn run_batch(
                 on_event(EncodeEvent::LiveThumb { name: n, thumb });
             }
         };
-        match run_ffmpeg(&argv, &cancel, |line, out_time| {
+        let mut on_ffmpeg_line = |line: String, out_time: Option<f64>| {
             flush_thumbs(&mut on_event);
             if let Some(t) = out_time {
                 on_event(EncodeEvent::FileProgress { out_time_s: t });
@@ -813,7 +994,61 @@ pub fn run_batch(
                 }
             }
             on_event(EncodeEvent::Log(line));
-        }) {
+        };
+
+        let encode_result = if use_hybrid {
+            match run_qsv_alpha_hybrid(
+                &input,
+                &output,
+                &info,
+                bitrate_k,
+                opts.preserve_obs_metadata,
+                &cancel,
+                &mut on_ffmpeg_line,
+            ) {
+                Ok(()) => Ok(()),
+                Err(e) if e == "cancelled" => Err(e),
+                Err(e) => {
+                    on_ffmpeg_line(
+                        format!("{name}: hybrid failed ({e}); falling back to libvpx-vp9"),
+                        None,
+                    );
+                    let argv = build_cmd(
+                        &input,
+                        &output,
+                        &info,
+                        has_alpha,
+                        opts.gpu,
+                        bitrate_k,
+                        opts.preserve_obs_metadata,
+                        false, // force CPU α path
+                        opts.opaque_video,
+                        opts.opaque_container,
+                        opts.alpha_video,
+                        opts.alpha_container,
+                    );
+                    run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
+                }
+            }
+        } else {
+            let argv = build_cmd(
+                &input,
+                &output,
+                &info,
+                has_alpha,
+                opts.gpu,
+                bitrate_k,
+                opts.preserve_obs_metadata,
+                opts.use_hardware,
+                opts.opaque_video,
+                opts.opaque_container,
+                opts.alpha_video,
+                opts.alpha_container,
+            );
+            run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
+        };
+
+        match encode_result {
             Ok(()) => {
                 flush_thumbs(&mut on_event);
                 ok += 1;

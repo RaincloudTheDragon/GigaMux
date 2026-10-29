@@ -8,6 +8,7 @@ pub mod prefs;
 pub mod preview_cache;
 pub mod probe;
 pub mod targets;
+pub mod webm_alpha;
 
 pub use check::{
     deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, restore_trashed_file,
