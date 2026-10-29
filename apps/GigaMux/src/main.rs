@@ -10,6 +10,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+
+#[cfg(windows)]
+mod taskbar_progress;
+
 use gigamux_core::check::{
     deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, restore_trashed_file,
     run_check, trash_file, CheckIssue, CheckReport,
@@ -288,6 +292,9 @@ struct GigaMuxApp {
     cache_rx: Option<Receiver<PreviewMsg>>,
     /// Dual progress bars while an encode batch is running.
     encode_progress: Option<EncodeProgress>,
+    /// Taskbar overlay is currently showing (Windows); used to clear once when the job ends.
+    #[cfg(windows)]
+    taskbar_showing: bool,
 }
 
 /// Pace between one-by-one delete / restore steps so the list visibly moves.
@@ -523,6 +530,8 @@ impl GigaMuxApp {
             preview_cache: HashMap::new(),
             cache_rx: None,
             encode_progress: None,
+            #[cfg(windows)]
+            taskbar_showing: false,
         };
         app.load_preview_cache_from_disk();
         app.refresh_lists();
@@ -4510,12 +4519,25 @@ fn open_path_in_os(path: &Path) -> Result<(), String> {
 }
 
 impl eframe::App for GigaMuxApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.poll_events(ctx);
         // Keep elapsed / ETA labels ticking while encode bars are visible.
         if self.encode_progress.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+        #[cfg(windows)]
+        {
+            // Green Win10 taskbar fill tracks the same overall batch fraction as the UI bar.
+            let frac = self.encode_progress.as_ref().map(|p| p.batch_frac());
+            if frac.is_some() {
+                taskbar_progress::sync(frame, frac);
+                self.taskbar_showing = true;
+            } else if self.taskbar_showing {
+                taskbar_progress::sync(frame, None);
+                self.taskbar_showing = false;
+            }
+        }
+        let _ = frame;
         self.tick_delete_queue(ctx);
         self.tick_history_nav(ctx);
         self.poll_preview_cache(ctx);
