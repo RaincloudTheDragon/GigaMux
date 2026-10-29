@@ -1306,7 +1306,9 @@ dependencies = [
 name = "gigamux-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "directories",
+ "flate2",
  "regex",
  "serde",
  "serde_json",

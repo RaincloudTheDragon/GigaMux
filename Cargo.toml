@@ -22,4 +22,5 @@ directories = "6"
 rfd = "0.17"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+flate2 = "1"
 trash = "5"

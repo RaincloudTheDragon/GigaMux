@@ -12,3 +12,5 @@ serde_json = { workspace = true }
 directories = { workspace = true }
 regex = { workspace = true }
 trash = { workspace = true }
+chrono = { workspace = true }
+flate2 = { workspace = true }

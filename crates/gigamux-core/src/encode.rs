@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::gpu::GpuChoice;
+use crate::job_log::EncodeJobLog;
 use crate::probe::{
     audio_bitrate_k, audio_codec_name, file_info, require_tools, thumbnail_rgba_at,
     video_ceiling_k, video_codec_name, video_has_alpha, video_pix_fmt, RgbaThumb,
@@ -518,11 +519,28 @@ fn format_duration_s(info: &serde_json::Value) -> f64 {
 
 /// Encode all matching files in `opts.input_dir` into `opts.output_dir` sequentially.
 /// Calls `on_event` for UI logging. Honors `cancel` between files.
+/// Also writes a gzipped per-job log under `%APPDATA%\GigaMux\config\logs\`.
 pub fn run_batch(
     opts: EncodeOptions,
     cancel: Arc<AtomicBool>,
     mut on_event: impl FnMut(EncodeEvent),
 ) {
+    // Durable job log (best-effort); UI still gets every event via the wrapped callback.
+    let (mut job_log, start_msg) = match EncodeJobLog::start() {
+        Ok(log) => {
+            let msg = format!("job log: {}", log.path().display());
+            (Some(log), msg)
+        }
+        Err(e) => (None, format!("job log unavailable: {e}")),
+    };
+    let mut on_event = |ev: EncodeEvent| {
+        if let Some(log) = job_log.as_mut() {
+            log.record(&ev);
+        }
+        on_event(ev);
+    };
+    on_event(EncodeEvent::Log(start_msg));
+
     if let Err(e) = require_tools() {
         on_event(EncodeEvent::Log(e));
         on_event(EncodeEvent::Finished {

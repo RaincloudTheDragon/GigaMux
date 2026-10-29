@@ -3,6 +3,7 @@
 pub mod check;
 pub mod encode;
 pub mod gpu;
+pub mod job_log;
 pub mod prefs;
 pub mod preview_cache;
 pub mod probe;
@@ -13,6 +14,7 @@ pub use check::{
     run_check, trash_file, CheckIssue, CheckReport,
 };
 pub use encode::{run_batch, EncodeEvent, EncodeOptions};
+pub use job_log::{encode_logs_dir, EncodeJobLog};
 pub use gpu::{
     av1_nvenc_available, list_av1_nvenc_devices, list_nvenc_devices, list_nvenc_devices_for,
     nvenc_encoder_works, GpuChoice, NvencDevice,
