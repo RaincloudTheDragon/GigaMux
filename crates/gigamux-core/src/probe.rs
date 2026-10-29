@@ -310,6 +310,52 @@ pub fn video_codec_name(info: &Value) -> String {
         .to_lowercase()
 }
 
+/// Source video colour tags from ffprobe (range / matrix / primaries / transfer).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoColorMeta {
+    /// `tv` / `mpeg` = limited; `pc` / `jpeg` = full.
+    pub range: Option<String>,
+    pub space: Option<String>,
+    pub primaries: Option<String>,
+    pub transfer: Option<String>,
+}
+
+impl VideoColorMeta {
+    pub fn is_empty(&self) -> bool {
+        self.range.is_none()
+            && self.space.is_none()
+            && self.primaries.is_none()
+            && self.transfer.is_none()
+    }
+
+    /// True when source is tagged full range (`pc` / `jpeg`).
+    pub fn is_full_range(&self) -> bool {
+        matches!(
+            self.range.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("pc" | "jpeg")
+        )
+    }
+}
+
+/// First video stream colour metadata (empty fields when ffprobe omitted them).
+pub fn video_color_meta(info: &Value) -> VideoColorMeta {
+    let Some(s) = first_video_stream(info) else {
+        return VideoColorMeta::default();
+    };
+    let get = |k: &str| {
+        s.get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty() && v != "unknown")
+    };
+    VideoColorMeta {
+        range: get("color_range"),
+        space: get("color_space"),
+        primaries: get("color_primaries"),
+        transfer: get("color_transfer"),
+    }
+}
+
 /// Raw first-audio `codec_name` (lowercase), empty if none.
 pub fn audio_codec_name(info: &Value) -> String {
     first_audio_stream(info)

@@ -13,7 +13,8 @@ use crate::gpu::GpuChoice;
 use crate::job_log::EncodeJobLog;
 use crate::probe::{
     audio_bitrate_k, audio_codec_name, file_info, require_tools, thumbnail_rgba_at,
-    video_ceiling_k, video_codec_name, video_has_alpha, video_pix_fmt, RgbaThumb,
+    video_ceiling_k, video_codec_name, video_color_meta, video_has_alpha, video_pix_fmt,
+    RgbaThumb, VideoColorMeta,
 };
 use crate::targets::{
     audio_encode_for, delivery_pix_fmt, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
@@ -174,6 +175,9 @@ fn append_vp9_qsv_args(cmd: &mut Vec<String>, pix: &str, ceiling: &str, bufsize:
         pix.into(),
         "-preset".into(),
         "slow".into(),
+        // Regular keyframes so Premiere/Influx can seek (hybrid remux writes Cues on these).
+        "-g".into(),
+        "60".into(),
         "-b:v".into(),
         ceiling.into(),
         "-maxrate".into(),
@@ -183,6 +187,50 @@ fn append_vp9_qsv_args(cmd: &mut Vec<String>, pix: &str, ceiling: &str, bufsize:
     ]);
 }
 
+/// ffmpeg `-color_*` flags from probed source tags (keeps pc/bt709 from becoming unmarked).
+fn append_color_meta_args(cmd: &mut Vec<String>, meta: &VideoColorMeta) {
+    if let Some(r) = meta.range.as_deref() {
+        cmd.extend(["-color_range".into(), r.into()]);
+    }
+    if let Some(s) = meta.space.as_deref() {
+        cmd.extend(["-colorspace".into(), s.into()]);
+    }
+    if let Some(p) = meta.primaries.as_deref() {
+        cmd.extend(["-color_primaries".into(), p.into()]);
+    }
+    if let Some(t) = meta.transfer.as_deref() {
+        cmd.extend(["-color_trc".into(), t.into()]);
+    }
+}
+
+/// `setparams=` fragment to re-assert colour after `format=` (avoids silent tv default).
+fn setparams_color_filter(meta: &VideoColorMeta) -> String {
+    let mut parts = Vec::new();
+    if let Some(r) = meta.range.as_deref() {
+        // ffmpeg setparams wants jpeg/mpeg; map pc→jpeg, tv→mpeg.
+        let range = match r {
+            "pc" | "jpeg" => "jpeg",
+            "tv" | "mpeg" => "mpeg",
+            other => other,
+        };
+        parts.push(format!("range={range}"));
+    }
+    if let Some(s) = meta.space.as_deref() {
+        parts.push(format!("colorspace={s}"));
+    }
+    if let Some(p) = meta.primaries.as_deref() {
+        parts.push(format!("color_primaries={p}"));
+    }
+    if let Some(t) = meta.transfer.as_deref() {
+        parts.push(format!("color_trc={t}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(",setparams={}", parts.join(":"))
+    }
+}
+
 /// Dual-output ffmpeg: color → `vp9_qsv` IVF, alpha plane → `libvpx-vp9` IVF.
 fn build_qsv_alpha_dual_argv(
     input: &Path,
@@ -190,6 +238,7 @@ fn build_qsv_alpha_dual_argv(
     color_ivf: &Path,
     alpha_ivf: &Path,
     bitrate_k: u32,
+    color_meta: &VideoColorMeta,
 ) -> Vec<String> {
     let ceiling = format!("{bitrate_k}k");
     let bufsize = format!("{}k", bitrate_k * 2);
@@ -215,16 +264,20 @@ fn build_qsv_alpha_dual_argv(
     }
     cmd.push("-i".into());
     cmd.push(input.to_string_lossy().into_owned());
-    // Split YUVA → nv12 color for QSV + gray-as-yuv420p alpha for libvpx.
+    // Split YUVA → nv12 color for QSV + gray-as-yuv420p alpha for libvpx; re-assert colour tags.
+    let sp = setparams_color_filter(color_meta);
+    let filter = format!(
+        "[0:v]format=yuva420p,split=2[c0][a0];[c0]format=nv12{sp}[c];[a0]alphaextract,format=yuv420p{sp}[a]"
+    );
     cmd.extend([
         "-filter_complex".into(),
-        "[0:v]format=yuva420p,split=2[c0][a0];[c0]format=nv12[c];[a0]alphaextract,format=yuv420p[a]"
-            .into(),
+        filter,
         "-map".into(),
         "[c]".into(),
         "-an".into(),
     ]);
     append_vp9_qsv_args(&mut cmd, "nv12", &ceiling, &bufsize);
+    append_color_meta_args(&mut cmd, color_meta);
     cmd.push(color_ivf.to_string_lossy().into_owned());
     cmd.extend([
         "-map".into(),
@@ -250,6 +303,11 @@ fn build_qsv_alpha_dual_argv(
         "25".into(),
         "-row-mt".into(),
         "1".into(),
+        // Match color GOP so α BlockAdditional stays aligned on keyframes.
+        "-g".into(),
+        "60".into(),
+        "-keyint_min".into(),
+        "60".into(),
         "-crf".into(),
         "0".into(),
         "-b:v".into(),
@@ -259,6 +317,7 @@ fn build_qsv_alpha_dual_argv(
         "-bufsize".into(),
         bufsize,
     ]);
+    append_color_meta_args(&mut cmd, color_meta);
     cmd.push(alpha_ivf.to_string_lossy().into_owned());
     cmd
 }
@@ -340,7 +399,15 @@ fn run_qsv_alpha_hybrid(
         let _ = std::fs::remove_dir_all(tmp);
     };
 
-    let dual = build_qsv_alpha_dual_argv(input, info, &color_ivf, &alpha_ivf, bitrate_k);
+    let color_meta = video_color_meta(info);
+    let dual = build_qsv_alpha_dual_argv(
+        input,
+        info,
+        &color_ivf,
+        &alpha_ivf,
+        bitrate_k,
+        &color_meta,
+    );
     on_line("hybrid: dual encode (vp9_qsv color + libvpx alpha)".into(), None);
     if let Err(e) = run_ffmpeg(&dual, cancel, &mut on_line) {
         cleanup(&tmp);
@@ -352,7 +419,7 @@ fn run_qsv_alpha_hybrid(
     }
 
     on_line("hybrid: remux WebM AlphaMode + BlockAdditional".into(), None);
-    if let Err(e) = mux_vp9_alpha_webm(&color_ivf, &alpha_ivf, &video_webm) {
+    if let Err(e) = mux_vp9_alpha_webm(&color_ivf, &alpha_ivf, &video_webm, &color_meta) {
         cleanup(&tmp);
         return Err(format!("hybrid remux: {e}"));
     }
@@ -484,6 +551,7 @@ fn build_cmd(
         append_audio_args(&mut cmd, input, info, out_container);
     } else if use_qsv {
         append_vp9_qsv_args(&mut cmd, out_pix, &ceiling, &bufsize);
+        append_color_meta_args(&mut cmd, &video_color_meta(info));
         append_audio_args(&mut cmd, input, info, out_container);
     } else if opaque_video.is_libvpx() {
         append_libvpx_opaque_args(
