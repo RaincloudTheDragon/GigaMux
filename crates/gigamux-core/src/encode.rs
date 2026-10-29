@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::gpu::GpuChoice;
-use crate::job_log::EncodeJobLog;
+use crate::job_log::{JobLog, JobLogKind};
 use crate::probe::{
     audio_bitrate_k, audio_codec_name, file_info, require_tools, thumbnail_rgba_at,
     video_ceiling_k, video_codec_name, video_has_alpha, video_pix_fmt, RgbaThumb,
@@ -526,7 +526,7 @@ pub fn run_batch(
     mut on_event: impl FnMut(EncodeEvent),
 ) {
     // Durable job log (best-effort); UI still gets every event via the wrapped callback.
-    let (mut job_log, start_msg) = match EncodeJobLog::start() {
+    let (mut job_log, start_msg) = match JobLog::start(JobLogKind::Encode) {
         Ok(log) => {
             let msg = format!("job log: {}", log.path().display());
             (Some(log), msg)
@@ -535,7 +535,7 @@ pub fn run_batch(
     };
     let mut on_event = |ev: EncodeEvent| {
         if let Some(log) = job_log.as_mut() {
-            log.record(&ev);
+            log.record_encode(&ev);
         }
         on_event(ev);
     };

@@ -36,6 +36,9 @@ pub struct PersistedPreviewEntry {
     /// False when only the fast probe ran (peaks still need enrich). Old caches default true.
     #[serde(default = "default_true")]
     pub bitrates_ready: bool,
+    /// Last libvmaf score for this file vs its encode pair (`None` = not scored / cleared).
+    #[serde(default)]
+    pub vmaf_score: Option<f64>,
 }
 
 fn default_true() -> bool {

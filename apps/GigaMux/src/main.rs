@@ -15,6 +15,7 @@ use gigamux_core::check::{
     run_check, trash_file, CheckIssue, CheckReport,
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
+use gigamux_core::vmaf::{run_vmaf, VmafEvent, VmafReport};
 use gigamux_core::gpu::{list_av1_nvenc_devices, list_nvenc_devices, GpuChoice, NvencDevice};
 use gigamux_core::job_log;
 use gigamux_core::prefs::{self, Prefs};
@@ -122,11 +123,14 @@ fn alt_held_at_launch() -> bool {
 enum JobKind {
     Encode,
     Check,
+    Vmaf,
 }
 
 enum AppEvent {
     Encode(EncodeEvent),
     CheckDone(Result<CheckReport, String>),
+    Vmaf(VmafEvent),
+    VmafDone(Result<VmafReport, String>),
 }
 
 /// Incremental preview worker messages (fast chips first, then peeks + thumb).
@@ -165,6 +169,8 @@ struct PreviewCacheEntry {
     source_path: Option<PathBuf>,
     file_size: u64,
     mtime_secs: i64,
+    /// libvmaf vs encode pair; kept across re-probes while the file fingerprint matches.
+    vmaf_score: Option<f64>,
 }
 
 impl PreviewCacheEntry {
@@ -179,6 +185,7 @@ impl PreviewCacheEntry {
             source_path: None,
             file_size: 0,
             mtime_secs: 0,
+            vmaf_score: None,
         }
     }
 
@@ -587,6 +594,82 @@ impl GigaMuxApp {
             .find(|n| Self::file_stem_of(n) == stem)
     }
 
+    fn other_side(side: FileSide) -> FileSide {
+        match side {
+            FileSide::Input => FileSide::Output,
+            FileSide::Output => FileSide::Input,
+        }
+    }
+
+    /// Parse `i:name` / `o:name` cache keys.
+    fn split_preview_key(key: &str) -> Option<(FileSide, &str)> {
+        key.strip_prefix("i:")
+            .map(|n| (FileSide::Input, n))
+            .or_else(|| key.strip_prefix("o:").map(|n| (FileSide::Output, n)))
+    }
+
+    /// VMAF only while the paired file is still listed and still carries the same score.
+    fn live_vmaf_score(&self, side: FileSide, name: &str) -> Option<f64> {
+        let score = self.preview_cache.get(&Self::preview_key(side, name))?.vmaf_score?;
+        let other_name = self.counterpart_name(side, name)?;
+        let other = self
+            .preview_cache
+            .get(&Self::preview_key(Self::other_side(side), &other_name))?;
+        match other.vmaf_score {
+            Some(s) if (s - score).abs() < 1e-6 => Some(score),
+            _ => None,
+        }
+    }
+
+    /// Drop cached VMAF when the pair is gone or only one side still has a score.
+    /// Skips undo-parked cache rows that aren't in the live lists.
+    fn scrub_stale_vmaf(&mut self) -> bool {
+        let live_keys: HashSet<String> = self
+            .names_for(FileSide::Input)
+            .into_iter()
+            .map(|n| Self::preview_key(FileSide::Input, &n))
+            .chain(
+                self.names_for(FileSide::Output)
+                    .into_iter()
+                    .map(|n| Self::preview_key(FileSide::Output, &n)),
+            )
+            .collect();
+        let mut clear = Vec::new();
+        for key in self.preview_cache.keys() {
+            if !live_keys.contains(key) {
+                continue;
+            }
+            let Some((side, name)) = Self::split_preview_key(key) else {
+                continue;
+            };
+            let Some(score) = self.preview_cache.get(key).and_then(|e| e.vmaf_score) else {
+                continue;
+            };
+            let stale = match self.counterpart_name(side, name) {
+                None => true,
+                Some(other_name) => {
+                    let other_key = Self::preview_key(Self::other_side(side), &other_name);
+                    match self.preview_cache.get(&other_key).and_then(|e| e.vmaf_score) {
+                        Some(s) if (s - score).abs() < 1e-6 => false,
+                        _ => true,
+                    }
+                }
+            };
+            if stale {
+                clear.push(key.clone());
+            }
+        }
+        if clear.is_empty() {
+            return false;
+        }
+        for key in clear {
+            if let Some(e) = self.preview_cache.get_mut(&key) {
+                e.vmaf_score = None;
+            }
+        }
+        true
+    }
+
     /// Input basename used for per-file encode logs (maps output → paired input).
     fn log_file_name(&self) -> Option<String> {
         let (side, name) = self.active.as_ref()?;
@@ -771,6 +854,7 @@ impl GigaMuxApp {
                     source_path: Some(pe.path),
                     file_size: pe.size,
                     mtime_secs: pe.mtime_secs,
+                    vmaf_score: pe.vmaf_score,
                 },
             );
         }
@@ -809,6 +893,7 @@ impl GigaMuxApp {
                     thumb_height,
                     thumb_err,
                     bitrates_ready: e.bitrates_ready,
+                    vmaf_score: e.vmaf_score,
                 },
             );
         }
@@ -1028,8 +1113,14 @@ impl GigaMuxApp {
                     };
                 let entry = self
                     .preview_cache
-                    .entry(name)
+                    .entry(name.clone())
                     .or_insert_with(PreviewCacheEntry::pending);
+                // Keep VMAF only while the on-disk file is unchanged.
+                let same_file = entry.file_size == file_size
+                    && entry.mtime_secs == mtime_secs
+                    && entry.source_path == source_path;
+                let keep_vmaf = if same_file { entry.vmaf_score } else { None };
+                let drop_pair = entry.vmaf_score.is_some() && keep_vmaf.is_none();
                 entry.pending = false;
                 entry.bitrates_ready = false;
                 entry.schema = MediaSummary::SCHEMA;
@@ -1037,6 +1128,19 @@ impl GigaMuxApp {
                 entry.source_path = source_path;
                 entry.file_size = file_size;
                 entry.mtime_secs = mtime_secs;
+                entry.vmaf_score = keep_vmaf;
+                // Replaced encode → clear the other side so input meta doesn't keep a dead score.
+                if drop_pair {
+                    if let Some((side, bare)) = Self::split_preview_key(&name) {
+                        if let Some(other_name) = self.counterpart_name(side, bare) {
+                            let other_key =
+                                Self::preview_key(Self::other_side(side), &other_name);
+                            if let Some(e) = self.preview_cache.get_mut(&other_key) {
+                                e.vmaf_score = None;
+                            }
+                        }
+                    }
+                }
             }
             PreviewMsg::Bitrates {
                 gen,
@@ -1252,6 +1356,10 @@ impl GigaMuxApp {
         } else {
             self.start_preview_cache();
         }
+        // Output deleted/renamed → drop orphaned input (and vice versa) VMAF so meta stays live.
+        if self.scrub_stale_vmaf() {
+            self.save_preview_cache_to_disk();
+        }
     }
 
     fn push_session(&mut self, line: impl Into<String>) {
@@ -1466,7 +1574,8 @@ impl GigaMuxApp {
 
     /// Request cancel of the running encode (kills in-flight ffmpeg, then stops the batch).
     fn cancel_encode(&mut self) {
-        if matches!(self.job, Some(JobKind::Encode)) && self.busy {
+        // Shared cancel flag for encode + VMAF (both drive ffmpeg).
+        if matches!(self.job, Some(JobKind::Encode | JobKind::Vmaf)) && self.busy {
             self.cancel.store(true, Ordering::Relaxed);
             self.push_session("cancel requested…");
             self.log_open = true;
@@ -2191,6 +2300,53 @@ impl GigaMuxApp {
         });
     }
 
+    /// VMAF input→output for one basename, or every matched pair when `None`.
+    fn start_vmaf(&mut self, only_name: Option<String>) {
+        if self.busy || self.delete_queue.is_some() || self.history_nav.is_some() {
+            return;
+        }
+        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+            self.push_session("set both input and output folders before VMAF");
+            self.log_open = true;
+            return;
+        }
+        let input = self.prefs.input_dir.clone();
+        let output = self.prefs.output_dir.clone();
+        let targets = OutputTargets {
+            opaque_video: self.prefs.opaque_video,
+            opaque_container: self.prefs.opaque_container,
+            alpha_video: self.prefs.alpha_video,
+            alpha_container: self.prefs.alpha_container,
+        };
+        self.cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.cancel);
+        let (tx, rx) = mpsc::channel();
+        self.busy = true;
+        self.job = Some(JobKind::Vmaf);
+        self.event_rx = Some(rx);
+        let label = only_name
+            .as_deref()
+            .map(|n| format!("VMAF started — {n}"))
+            .unwrap_or_else(|| "VMAF started — all pairs".into());
+        self.push_session(label);
+        self.log_open = true;
+        self.encode_progress = None;
+        thread::spawn(move || {
+            let tx_ev = tx.clone();
+            let result = run_vmaf(
+                &input,
+                &output,
+                targets,
+                only_name,
+                &cancel,
+                |ev| {
+                    let _ = tx_ev.send(AppEvent::Vmaf(ev));
+                },
+            );
+            let _ = tx.send(AppEvent::VmafDone(result));
+        });
+    }
+
     fn poll_events(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.event_rx.take() else {
             return;
@@ -2313,6 +2469,74 @@ impl GigaMuxApp {
                     }
                     self.refresh_lists();
                 }
+                AppEvent::Vmaf(ev) => match ev {
+                    VmafEvent::Log(msg) => {
+                        self.push_session(msg);
+                    }
+                    VmafEvent::BatchStarted {
+                        total_files,
+                        total_duration_s,
+                    } => {
+                        let now = Instant::now();
+                        self.encode_progress = Some(EncodeProgress {
+                            total_files,
+                            total_duration_s,
+                            file_index: 0,
+                            file_total: total_files,
+                            file_name: String::new(),
+                            file_duration_s: 0.0,
+                            file_out_time_s: 0.0,
+                            completed_duration_s: 0.0,
+                            batch_started: now,
+                            file_started: now,
+                            live_texture: None,
+                        });
+                    }
+                    VmafEvent::FileStarted {
+                        name,
+                        index,
+                        total,
+                        duration_s,
+                    } => {
+                        self.select_file(FileSide::Input, name.clone());
+                        if let Some(p) = &mut self.encode_progress {
+                            p.file_index = index;
+                            p.file_total = total;
+                            p.file_name = name;
+                            p.file_duration_s = duration_s;
+                            p.file_out_time_s = 0.0;
+                            p.file_started = Instant::now();
+                            p.live_texture = None;
+                        }
+                    }
+                    VmafEvent::FileProgress { out_time_s } => {
+                        if let Some(p) = &mut self.encode_progress {
+                            p.file_out_time_s = out_time_s.max(p.file_out_time_s);
+                        }
+                    }
+                    VmafEvent::FileDone { name: _, score: _ } => {
+                        if let Some(p) = &mut self.encode_progress {
+                            p.completed_duration_s += p.file_duration_s;
+                            p.file_out_time_s = p.file_duration_s;
+                        }
+                    }
+                    VmafEvent::FileFailed { name: _, error: _ } => {
+                        if let Some(p) = &mut self.encode_progress {
+                            p.completed_duration_s += p.file_duration_s;
+                            p.file_out_time_s = 0.0;
+                        }
+                    }
+                    VmafEvent::Finished { ok, failed } => {
+                        self.push_session(format!("VMAF finished — scored={ok} failed={failed}"));
+                    }
+                },
+                AppEvent::VmafDone(result) => {
+                    finished = true;
+                    match result {
+                        Ok(report) => self.apply_vmaf_report(report),
+                        Err(e) => self.push_session(format!("VMAF failed: {e}")),
+                    }
+                }
             }
         }
         if finished {
@@ -2324,6 +2548,33 @@ impl GigaMuxApp {
             self.event_rx = Some(rx);
             // Snappy refresh while ffmpeg progress lines stream in.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Persist VMAF scores into preview meta (session lines already streamed via [`VmafEvent`]).
+    fn apply_vmaf_report(&mut self, report: VmafReport) {
+        self.log_open = true;
+        self.log_show_session = true;
+        let mut ok = 0usize;
+        for r in &report.results {
+            if let Some(s) = r.score {
+                ok += 1;
+                let line = format!("VMAF {} → {}: {s:.4}", r.input, r.output);
+                self.push_file_log(&r.input, &line);
+                // Stick score on both sides of the pair so either meta table shows it.
+                for (side, name) in [
+                    (FileSide::Input, r.input.as_str()),
+                    (FileSide::Output, r.output.as_str()),
+                ] {
+                    let key = Self::preview_key(side, name);
+                    if let Some(e) = self.preview_cache.get_mut(&key) {
+                        e.vmaf_score = Some(s);
+                    }
+                }
+            }
+        }
+        if ok > 0 {
+            self.save_preview_cache_to_disk();
         }
     }
 
@@ -2826,6 +3077,17 @@ impl GigaMuxApp {
                                     self.start_encode(Some(name.clone()));
                                     ui.close();
                                 }
+                                if ui
+                                    .add_enabled(!self.busy, egui::Button::new("VMAF this file"))
+                                    .on_hover_text(
+                                        "libvmaf: this file’s input vs matching output (same stem)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.select_file(side, name.clone());
+                                    self.start_vmaf(Some(name.clone()));
+                                    ui.close();
+                                }
                                 if ui.button("Open in player").clicked() {
                                     self.select_file(side, name.clone());
                                     if let Err(e) = open_path_in_os(path) {
@@ -2993,7 +3255,7 @@ impl GigaMuxApp {
     fn ui_center(&mut self, ui: &mut egui::Ui) {
         // Split preview vs actions into separate bands so log expand/collapse never lets Settings / Encode / Check overlap the preview (or each other).
         let full = ui.available_size();
-        let actions_h = 130.0;
+        let actions_h = 160.0;
         let preview_h = (full.y - actions_h).max(48.0);
 
         ui.allocate_ui_with_layout(
@@ -3041,10 +3303,23 @@ impl GigaMuxApp {
                 if check.clicked() {
                     self.start_check();
                 }
+                ui.add_space(6.0);
+                let vmaf = ui
+                    .add_enabled(
+                        !self.busy,
+                        egui::Button::new("VMAF").min_size(egui::vec2(120.0, 28.0)),
+                    )
+                    .on_hover_text(
+                        "libvmaf all input→output pairs. Right-click a file for one pair. Esc cancels.",
+                    );
+                if vmaf.clicked() {
+                    self.start_vmaf(None);
+                }
                 if self.busy && self.encode_progress.is_none() {
                     let label = match self.job {
                         Some(JobKind::Encode) => "Encoding…",
                         Some(JobKind::Check) => "Checking…",
+                        Some(JobKind::Vmaf) => "VMAF…",
                         None => "Busy…",
                     };
                     ui.label(label);
@@ -3053,13 +3328,18 @@ impl GigaMuxApp {
         );
     }
 
-    /// Dual encode bars sit in their own bottom panel (above the log), so the log strip never clips them.
+    /// Dual encode/VMAF bars sit in their own bottom panel (above the log), so the log strip never clips them.
     fn ui_progress_panel(&mut self, ui: &mut egui::Ui) {
         let Some(prog) = self.encode_progress.as_ref() else {
             return;
         };
+        let is_vmaf = matches!(self.job, Some(JobKind::Vmaf));
         let file_caption = if prog.file_name.is_empty() {
-            "Current".into()
+            if is_vmaf {
+                "Current pair".into()
+            } else {
+                "Current".into()
+            }
         } else {
             format!(
                 "{} ({}/{})",
@@ -3070,11 +3350,19 @@ impl GigaMuxApp {
         let file_label = prog.file_label();
         let batch_frac = prog.batch_frac();
         let batch_label = prog.batch_label();
-        let batch_caption = format!(
-            "All tasks ({} file{})",
-            prog.total_files,
-            if prog.total_files == 1 { "" } else { "s" }
-        );
+        let batch_caption = if is_vmaf {
+            format!(
+                "All pairs ({} file{})",
+                prog.total_files,
+                if prog.total_files == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "All tasks ({} file{})",
+                prog.total_files,
+                if prog.total_files == 1 { "" } else { "s" }
+            )
+        };
 
         egui::Panel::bottom("encode_progress")
             .exact_size(78.0)
@@ -3163,6 +3451,8 @@ impl GigaMuxApp {
             ui.colored_label(egui::Color32::from_rgb(200, 100, 80), format!("thumb: {e}"));
         }
         let bitrates_ready = entry.bitrates_ready;
+        // Hide score unless the live pair still exists with a matching score on both sides.
+        let vmaf_score = self.live_vmaf_score(side, &name);
         // Output meta: ↓/% green or ↑/% red vs same-stem input when both sizes are known.
         let size_vs_input = if side == FileSide::Output {
             self.counterpart_name(side, &name).and_then(|in_name| {
@@ -3193,7 +3483,7 @@ impl GigaMuxApp {
         match &entry.summary {
             Some(Ok(s)) => {
                 ui.add_space(8.0);
-                Self::ui_meta_table(ui, s, bitrates_ready, size_vs_input);
+                Self::ui_meta_table(ui, s, bitrates_ready, size_vs_input, vmaf_score);
             }
             Some(Err(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(200, 100, 80), e);
@@ -3207,6 +3497,7 @@ impl GigaMuxApp {
         s: &MediaSummary,
         bitrates_ready: bool,
         size_vs_input: Option<SizeDelta>,
+        vmaf_score: Option<f64>,
     ) {
         let yes_no = |b: bool| if b { "yes" } else { "no" };
         let timing = match s.timing {
@@ -3335,6 +3626,14 @@ impl GigaMuxApp {
                         format!("yes ({})", s.chapter_count)
                     } else {
                         "no".into()
+                    },
+                );
+                row(
+                    ui,
+                    "VMAF",
+                    &match vmaf_score {
+                        Some(v) => format!("{v:.4}"),
+                        None => "—".into(),
                     },
                 );
 
@@ -3509,7 +3808,7 @@ impl GigaMuxApp {
                 ui.label(egui::RichText::new("Logs").strong().small());
                 ui.checkbox(&mut prompt.session_log, "Session log");
                 ui.checkbox(&mut prompt.file_logs, "Per-file logs (this session)");
-                ui.checkbox(&mut prompt.job_logs, "Encode job logs (AppData)");
+                ui.checkbox(&mut prompt.job_logs, "Job logs (encode + VMAF, AppData)");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let can = prompt.any_selected();

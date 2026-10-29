@@ -8,13 +8,14 @@ pub mod prefs;
 pub mod preview_cache;
 pub mod probe;
 pub mod targets;
+pub mod vmaf;
 
 pub use check::{
     deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, restore_trashed_file,
     run_check, trash_file, CheckIssue, CheckReport,
 };
 pub use encode::{run_batch, EncodeEvent, EncodeOptions};
-pub use job_log::{encode_logs_dir, EncodeJobLog};
+pub use job_log::{encode_logs_dir, job_logs_dir, EncodeJobLog, JobLog, JobLogKind};
 pub use gpu::{
     av1_nvenc_available, list_av1_nvenc_devices, list_nvenc_devices, list_nvenc_devices_for,
     nvenc_encoder_works, GpuChoice, NvencDevice,
@@ -33,3 +34,4 @@ pub use targets::{
     AudioEncode, OpaqueVideo, OutContainer,
     OutputTargets,
 };
+pub use vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport, VmafResult};
