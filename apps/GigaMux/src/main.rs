@@ -250,6 +250,8 @@ struct GigaMuxApp {
     /// Last-frame hit rects for folder drag-and-drop targeting.
     input_rect: Option<egui::Rect>,
     output_rect: Option<egui::Rect>,
+    /// Pane under the cursor during an OS file drag (Windows often has no reliable pointer on the drop frame).
+    dnd_hover_side: Option<FileSide>,
     /// Visible row count for PgUp/PgDn (updated while painting the active folder list).
     folder_page_rows: usize,
     /// After keyboard nav, scroll the primary row into view once.
@@ -444,6 +446,7 @@ impl GigaMuxApp {
             history_nav: None,
             input_rect: None,
             output_rect: None,
+            dnd_hover_side: None,
             folder_page_rows: 10,
             scroll_sel_into_view: false,
             cache_gen: Arc::new(AtomicU64::new(0)),
@@ -1070,7 +1073,25 @@ impl GigaMuxApp {
         self.refresh_lists();
     }
 
-    /// Route OS file drops onto the input/output pane under the pointer.
+    /// Pointer for folder DnD: egui often has none during an OS drag on Windows.
+    fn dnd_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
+        ctx.pointer_interact_pos()
+            .or_else(|| ctx.pointer_latest_pos())
+            .or_else(|| win32_cursor_egui_pos(ctx))
+    }
+
+    /// Which pane contains `p`, if either.
+    fn pane_at(&self, p: egui::Pos2) -> Option<FileSide> {
+        if self.input_rect.is_some_and(|r| r.contains(p)) {
+            Some(FileSide::Input)
+        } else if self.output_rect.is_some_and(|r| r.contains(p)) {
+            Some(FileSide::Output)
+        } else {
+            None
+        }
+    }
+
+    /// Apply OS file drops using the pane under the cursor (Win32 fallback when egui has no pos).
     fn handle_folder_dnd(&mut self, ctx: &egui::Context) {
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1081,45 +1102,51 @@ impl GigaMuxApp {
                 .collect()
         });
 
-        let pointer = ctx.pointer_interact_pos().or_else(|| ctx.pointer_latest_pos());
-        let target_input = pointer
-            .and_then(|p| self.input_rect.map(|r| (r, p)))
-            .is_some_and(|(r, p)| r.contains(p));
-        let target_output = pointer
-            .and_then(|p| self.output_rect.map(|r| (r, p)))
-            .is_some_and(|(r, p)| r.contains(p));
-
-        // Highlight the pane under a folder drag.
+        // Live hit-test every drag frame (Win32 cursor) so outline works even if egui pointer is dead.
         if hovering {
+            if let Some(p) = Self::dnd_pointer(ctx) {
+                self.dnd_hover_side = self.pane_at(p);
+            }
             let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255));
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 egui::Id::unique("dnd_overlay"),
             ));
-            if target_input {
-                if let Some(r) = self.input_rect {
-                    painter.rect_stroke(r, 4.0, stroke, egui::StrokeKind::Inside);
+            match self.dnd_hover_side {
+                Some(FileSide::Input) => {
+                    if let Some(r) = self.input_rect {
+                        painter.rect_stroke(r, 4.0, stroke, egui::StrokeKind::Inside);
+                    }
                 }
-            } else if target_output {
-                if let Some(r) = self.output_rect {
-                    painter.rect_stroke(r, 4.0, stroke, egui::StrokeKind::Inside);
+                Some(FileSide::Output) => {
+                    if let Some(r) = self.output_rect {
+                        painter.rect_stroke(r, 4.0, stroke, egui::StrokeKind::Inside);
+                    }
                 }
+                None => {}
             }
+            ctx.request_repaint();
         }
 
         if dropped.is_empty() {
             return;
         }
+
         let Some(path) = dropped.into_iter().next() else {
             return;
         };
-        if target_input {
-            self.set_folder_from_path(true, path);
-        } else if target_output {
-            self.set_folder_from_path(false, path);
-        } else {
-            self.push_session("drop a folder onto the Input or Output pane to set it");
-            self.log_open = true;
+        let pointer = Self::dnd_pointer(ctx);
+        let side = self
+            .dnd_hover_side
+            .or_else(|| pointer.and_then(|p| self.pane_at(p)));
+        self.dnd_hover_side = None;
+        match side {
+            Some(FileSide::Input) => self.set_folder_from_path(true, path),
+            Some(FileSide::Output) => self.set_folder_from_path(false, path),
+            None => {
+                self.push_session("drop a folder onto the Input or Output pane to set it");
+                self.log_open = true;
+            }
         }
     }
 
@@ -3920,6 +3947,25 @@ fn trim_log(lines: &mut Vec<String>) {
     }
 }
 
+/// Screen cursor → egui viewport coordinates. Used when egui's pointer is dead during OS DnD.
+#[cfg(windows)]
+fn win32_cursor_egui_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt) }.ok()?;
+    let ppp = ctx.pixels_per_point();
+    let inner = ctx.input(|i| i.viewport().inner_rect)?;
+    let screen = egui::pos2(pt.x as f32 / ppp, pt.y as f32 / ppp);
+    Some(egui::pos2(screen.x - inner.min.x, screen.y - inner.min.y))
+}
+
+#[cfg(not(windows))]
+fn win32_cursor_egui_pos(_ctx: &egui::Context) -> Option<egui::Pos2> {
+    None
+}
+
 fn short_path(path: &Path) -> String {
     let s = path.display().to_string();
     if s.len() <= 48 {
@@ -3981,8 +4027,6 @@ impl eframe::App for GigaMuxApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // DnD paints an overlay, so it belongs in ui (not logic).
-        self.handle_folder_dnd(&ctx);
         self.ui_menu(ui);
         // Bottom panels stack upward: log first (edge), then progress above it.
         self.ui_log_panel(ui);
@@ -3994,13 +4038,16 @@ impl eframe::App for GigaMuxApp {
             let scroll = content_w > total.x + 0.5;
 
             let mut show_cols = |ui: &mut egui::Ui| {
+                let in_size = egui::vec2(in_w, total.y);
                 let in_resp = ui.allocate_ui_with_layout(
-                    egui::vec2(in_w, total.y),
+                    in_size,
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         let files = self.input_files.clone();
                         let dir = self.prefs.input_dir.clone();
                         self.ui_folder_pane(ui, "Input", &dir, true, &files);
+                        // allocate_ui shrink-wraps; claim the full column so DnD hits empty space too.
+                        ui.expand_to_include_rect(ui.max_rect());
                     },
                 );
                 self.input_rect = Some(in_resp.response.rect);
@@ -4011,13 +4058,15 @@ impl eframe::App for GigaMuxApp {
                     |ui| self.ui_center(ui),
                 );
                 ui.separator();
+                let out_size = egui::vec2(out_w, total.y);
                 let out_resp = ui.allocate_ui_with_layout(
-                    egui::vec2(out_w, total.y),
+                    out_size,
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         let files = self.output_files.clone();
                         let dir = self.prefs.output_dir.clone();
                         self.ui_folder_pane(ui, "Output", &dir, false, &files);
+                        ui.expand_to_include_rect(ui.max_rect());
                     },
                 );
                 self.output_rect = Some(out_resp.response.rect);
@@ -4034,6 +4083,9 @@ impl eframe::App for GigaMuxApp {
                 ui.horizontal(|ui| show_cols(ui));
             }
         });
+
+        // After pane rects are set — DnD needs them, and paints a foreground overlay.
+        self.handle_folder_dnd(&ctx);
 
         self.ui_settings(&ctx);
         self.ui_av1_nvenc_prompt(&ctx);

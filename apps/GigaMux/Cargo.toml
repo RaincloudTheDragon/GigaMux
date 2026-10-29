@@ -18,5 +18,6 @@ rfd = { workspace = true }
 chrono = { workspace = true }
 
 # Force gpu-allocator onto the same `windows` as wgpu-hal (0.62); otherwise the lockfile can pick windows 0.58 for gpu-allocator and break the D3D12 build with egui/eframe 0.37.
+# Win32 cursor read: egui often has no pointer pos during OS file drag/drop on Windows.
 [target.'cfg(windows)'.dependencies]
-windows = "0.62"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
