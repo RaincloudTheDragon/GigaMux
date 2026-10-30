@@ -305,11 +305,33 @@ struct GigaMuxApp {
     rename_edit: Option<RenameEdit>,
 }
 
+/// How to commit an inline F2 rename.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenameCommitMode {
+    /// Enter / click-away: one file, or multi numbered `stem (n).ext`.
+    Default,
+    /// Alt+Enter: spread baseline→draft affixes across the selection.
+    Pattern,
+}
+
+/// Prefix/suffix strip + add inferred from editing one name (Alt+Enter multi).
+#[derive(Clone, Debug)]
+struct RenameAffixEdit {
+    rem_pre: String,
+    rem_suf: String,
+    add_pre: String,
+    add_suf: String,
+}
+
 /// In-list rename draft (F2 on the active file).
 struct RenameEdit {
     side: FileSide,
     old_name: String,
     draft: String,
+    /// Draft when rename opened — Alt+Enter pattern is relative to this.
+    baseline: String,
+    /// Multi-select F2 edits the stem only; each file keeps its own extension.
+    stem_only: bool,
     /// Request TextEdit focus once after opening.
     request_focus: bool,
 }
@@ -353,10 +375,24 @@ struct DeleteUndoBatch {
     paths: Vec<PathBuf>,
 }
 
+/// One F2 / context-rename gesture — pairs are `(before, after)` basenames on `side`.
+#[derive(Clone)]
+struct RenameUndoBatch {
+    side: FileSide,
+    pairs: Vec<(String, String)>,
+}
+
+/// History waypoint: delete (Recycle Bin) or rename (in-place basename swap).
+#[derive(Clone)]
+enum UndoStep {
+    Delete(DeleteUndoBatch),
+    Rename(RenameUndoBatch),
+}
+
 /// Waypoint history: `cursor == 0` is Original; `cursor == steps.len()` is the tip.
 struct UndoHistory {
-    /// Delete steps oldest → newest. Truncated when a new delete happens while not at the tip.
-    steps: Vec<DeleteUndoBatch>,
+    /// Steps oldest → newest. Truncated when a new action happens while not at the tip.
+    steps: Vec<UndoStep>,
     cursor: usize,
 }
 
@@ -379,16 +415,16 @@ impl UndoHistory {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistoryDir {
-    /// Restore files from the Recycle Bin (move cursor down).
+    /// Restore / reverse toward Original (move cursor down).
     Undo,
-    /// Re-trash files (move cursor up / redo).
+    /// Re-apply toward the tip (move cursor up / redo).
     Redo,
 }
 
-/// One history jump: pending batches, then a per-file cascade for the active batch.
+/// One history jump: pending batches, then a per-file cascade for delete batches.
 struct HistoryNav {
     target: usize,
-    pending: VecDeque<(HistoryDir, DeleteUndoBatch)>,
+    pending: VecDeque<(HistoryDir, UndoStep)>,
     dir: HistoryDir,
     side: FileSide,
     remaining: VecDeque<PathBuf>,
@@ -414,6 +450,33 @@ impl DeleteUndoBatch {
                 names[1],
                 names.len()
             ),
+        }
+    }
+}
+
+impl RenameUndoBatch {
+    /// Menu / session label (e.g. `Rename "a.mp4" → "b.mp4"`).
+    fn action_label(&self) -> String {
+        match self.pairs.as_slice() {
+            [] => "Rename".into(),
+            [(o, n)] => format!("Rename \"{o}\" → \"{n}\""),
+            _ => format!("Rename {} files", self.pairs.len()),
+        }
+    }
+}
+
+impl UndoStep {
+    fn action_label(&self) -> String {
+        match self {
+            Self::Delete(b) => b.action_label(),
+            Self::Rename(b) => b.action_label(),
+        }
+    }
+
+    fn side(&self) -> FileSide {
+        match self {
+            Self::Delete(b) => b.side,
+            Self::Rename(b) => b.side,
         }
     }
 }
@@ -846,8 +909,10 @@ impl GigaMuxApp {
             }
         };
         for batch in &self.undo_history.steps {
-            for path in &batch.paths {
-                park(batch.side, path);
+            if let UndoStep::Delete(d) = batch {
+                for path in &d.paths {
+                    park(d.side, path);
+                }
             }
         }
         if let Some(q) = &self.delete_queue {
@@ -861,8 +926,10 @@ impl GigaMuxApp {
             }
             for (d, batch) in &nav.pending {
                 let _ = d;
-                for path in &batch.paths {
-                    park(batch.side, path);
+                if let UndoStep::Delete(del) = batch {
+                    for path in &del.paths {
+                        park(del.side, path);
+                    }
                 }
             }
         }
@@ -1725,7 +1792,31 @@ impl GigaMuxApp {
         }
     }
 
-    /// F2: start inline rename of the primary selection.
+    /// Stem + extension (extension includes the leading `.`, or empty).
+    fn split_file_name(name: &str) -> (String, String) {
+        let p = Path::new(name);
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name)
+            .to_string();
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        (stem, ext)
+    }
+
+    /// True when `name` is illegal as a basename.
+    fn rename_name_invalid(name: &str) -> bool {
+        name.is_empty()
+            || name.contains(['/', '\\', '\0'])
+            || name == "."
+            || name == ".."
+    }
+
+    /// F2: start inline rename on the active row (bulk applies to the whole selection on commit).
     fn begin_rename_active(&mut self) {
         let Some((side, name)) = self.active.clone() else {
             return;
@@ -1738,65 +1829,314 @@ impl GigaMuxApp {
         {
             return;
         }
+        // Multi-select: draft the stem only (Explorer-style); each file keeps its own extension.
+        let stem_only = self.selected.len() > 1;
+        let draft = if stem_only {
+            Self::split_file_name(&name).0
+        } else {
+            name.clone()
+        };
         self.rename_edit = Some(RenameEdit {
             side,
-            old_name: name.clone(),
-            draft: name,
+            old_name: name,
+            baseline: draft.clone(),
+            draft,
+            stem_only,
             request_focus: true,
         });
     }
 
-    /// Apply the inline rename draft to disk and remapping UI caches.
-    fn commit_rename(&mut self) {
+    /// Longest contiguous shared run of `a`/`b` as byte offsets `(a0, b0, len)`.
+    fn longest_common_substring(a: &str, b: &str) -> Option<(usize, usize, usize)> {
+        let ac: Vec<char> = a.chars().collect();
+        let bc: Vec<char> = b.chars().collect();
+        let mut best_i = 0usize;
+        let mut best_j = 0usize;
+        let mut best_len = 0usize;
+        for i in 0..ac.len() {
+            for j in 0..bc.len() {
+                let mut k = 0;
+                while i + k < ac.len() && j + k < bc.len() && ac[i + k] == bc[j + k] {
+                    k += 1;
+                }
+                if k > best_len {
+                    best_i = i;
+                    best_j = j;
+                    best_len = k;
+                }
+            }
+        }
+        if best_len == 0 {
+            return None;
+        }
+        let byte_len = |chars: &[char], start: usize, n: usize| -> usize {
+            chars[start..start + n].iter().map(|c| c.len_utf8()).sum()
+        };
+        let a0 = byte_len(&ac, 0, best_i);
+        let b0 = byte_len(&bc, 0, best_j);
+        let n = byte_len(&ac, best_i, best_len);
+        Some((a0, b0, n))
+    }
+
+    /// Infer strip/add affixes from editing `baseline` into `draft` (shared core via LCS).
+    fn infer_rename_affix_edit(baseline: &str, draft: &str) -> Option<RenameAffixEdit> {
+        if baseline.is_empty() {
+            return None;
+        }
+        if baseline == draft {
+            return Some(RenameAffixEdit {
+                rem_pre: String::new(),
+                rem_suf: String::new(),
+                add_pre: String::new(),
+                add_suf: String::new(),
+            });
+        }
+        let (a0, b0, n) = Self::longest_common_substring(baseline, draft)?;
+        Some(RenameAffixEdit {
+            rem_pre: baseline[..a0].to_string(),
+            rem_suf: baseline[a0 + n..].to_string(),
+            add_pre: draft[..b0].to_string(),
+            add_suf: draft[b0 + n..].to_string(),
+        })
+    }
+
+    /// Apply a multi-select affix edit to one stem/basename unit.
+    fn apply_rename_affix_edit(unit: &str, edit: &RenameAffixEdit) -> Result<String, String> {
+        let mut s = unit;
+        if !edit.rem_pre.is_empty() {
+            s = s.strip_prefix(&edit.rem_pre).ok_or_else(|| {
+                format!("\"{unit}\" is missing prefix \"{}\"", edit.rem_pre)
+            })?;
+        }
+        if !edit.rem_suf.is_empty() {
+            s = s.strip_suffix(&edit.rem_suf).ok_or_else(|| {
+                format!("\"{unit}\" is missing suffix \"{}\"", edit.rem_suf)
+            })?;
+        }
+        Ok(format!("{}{s}{}", edit.add_pre, edit.add_suf))
+    }
+
+    /// Remap caches/selection after one basename changes on `side`.
+    fn remap_after_rename(&mut self, side: FileSide, old_name: &str, new_name: &str, new_path: &Path) {
+        let old_key = Self::preview_key(side, old_name);
+        let new_key = Self::preview_key(side, new_name);
+        if let Some(mut entry) = self.preview_cache.remove(&old_key) {
+            entry.source_path = Some(new_path.to_path_buf());
+            self.preview_cache.insert(new_key, entry);
+        }
+        if side == FileSide::Input {
+            if let Some(lines) = self.file_logs.remove(old_name) {
+                self.file_logs.insert(new_name.to_string(), lines);
+            }
+        }
+        if self.selected.remove(old_name) {
+            self.selected.insert(new_name.to_string());
+        }
+        if self.selection_anchor.as_deref() == Some(old_name) {
+            self.selection_anchor = Some(new_name.to_string());
+        }
+    }
+
+    /// Two-phase basename swap on `side`. `pairs` are `(from, to)`; skips identity. Returns applied pairs.
+    fn apply_rename_pairs(
+        &mut self,
+        side: FileSide,
+        pairs: &[(String, String)],
+    ) -> Result<Vec<(String, String)>, String> {
+        let dir = match side {
+            FileSide::Input => self.prefs.input_dir.clone(),
+            FileSide::Output => self.prefs.output_dir.clone(),
+        };
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .filter(|(a, b)| a != b)
+            .cloned()
+            .collect();
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let from_set: HashSet<String> = pairs.iter().map(|(o, _)| o.clone()).collect();
+        for (_, new_name) in &pairs {
+            if Self::rename_name_invalid(new_name) {
+                return Err(format!("invalid name ({new_name})"));
+            }
+            let dest = dir.join(new_name);
+            if dest.exists() && !from_set.contains(new_name) {
+                return Err(format!("{new_name} already exists"));
+            }
+        }
+        {
+            let mut seen = HashSet::new();
+            for (_, new_name) in &pairs {
+                if !seen.insert(new_name.clone()) {
+                    return Err(format!("duplicate target {new_name}"));
+                }
+            }
+        }
+        // Two-phase so A→B and B→C can't clobber mid-batch.
+        let mut temps: Vec<(String, PathBuf, String)> = Vec::new();
+        for (i, (old_name, new_name)) in pairs.iter().enumerate() {
+            let from = dir.join(old_name);
+            let temp = dir.join(format!(".gigamux_renaming_{i}_{}", std::process::id()));
+            std::fs::rename(&from, &temp).map_err(|e| format!("{old_name}: {e}"))?;
+            temps.push((old_name.clone(), temp, new_name.clone()));
+        }
+        let mut done: Vec<(String, String)> = Vec::new();
+        for (old_name, temp, new_name) in temps {
+            let to = dir.join(&new_name);
+            std::fs::rename(&temp, &to).map_err(|e| format!("{old_name} → {new_name}: {e}"))?;
+            self.remap_after_rename(side, &old_name, &new_name, &to);
+            done.push((old_name, new_name));
+        }
+        Ok(done)
+    }
+
+    /// Apply the inline rename draft (Enter = single / numbered multi; Alt+Enter = affix pattern).
+    fn commit_rename(&mut self, mode: RenameCommitMode) {
         let Some(edit) = self.rename_edit.take() else {
             return;
         };
-        let new_name = edit.draft.trim().to_string();
-        if new_name.is_empty() || new_name == edit.old_name {
-            return;
+        let mut draft = edit.draft.trim().to_string();
+        // Stem-only edit: ignore a typed active extension so numbering/pattern stay on stems.
+        if edit.stem_only {
+            let (_, ext) = Self::split_file_name(&edit.old_name);
+            if !ext.is_empty() && draft.ends_with(&ext) {
+                draft.truncate(draft.len() - ext.len());
+            }
         }
-        if new_name.contains(['/', '\\', '\0']) || new_name == "." || new_name == ".." {
+        if Self::rename_name_invalid(&draft) {
             self.push_session("rename failed: invalid name");
             self.log_open = true;
             return;
         }
-        let dir = match edit.side {
-            FileSide::Input => self.prefs.input_dir.clone(),
-            FileSide::Output => self.prefs.output_dir.clone(),
+        // Selection on this side, list order; always includes the edited active when multi.
+        let mut names = self.selected_names_ordered();
+        if names.is_empty() {
+            names.push(edit.old_name.clone());
+        }
+        if !names.iter().any(|n| n == &edit.old_name) {
+            names.push(edit.old_name.clone());
+        }
+
+        let bulk = names.len() > 1;
+        let pairs: Vec<(String, String)> = match mode {
+            RenameCommitMode::Default if !bulk => {
+                // Single: draft is the new basename (stem + kept ext when stem_only).
+                let new_name = if edit.stem_only {
+                    let (_, ext) = Self::split_file_name(&edit.old_name);
+                    format!("{draft}{ext}")
+                } else {
+                    draft.clone()
+                };
+                if new_name == edit.old_name {
+                    return;
+                }
+                vec![(edit.old_name.clone(), new_name)]
+            }
+            RenameCommitMode::Default => {
+                // Multi Enter: `stem (1).ext` … keeping each file's original extension.
+                let (stem, _) = Self::split_file_name(&draft);
+                if Self::rename_name_invalid(&stem) {
+                    self.push_session("rename failed: invalid name");
+                    self.log_open = true;
+                    return;
+                }
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, old)| {
+                        let (_, ext) = Self::split_file_name(old);
+                        let new_name = format!("{stem} ({}){ext}", i + 1);
+                        (old.clone(), new_name)
+                    })
+                    .collect()
+            }
+            RenameCommitMode::Pattern => {
+                // Alt+Enter: same strip/add that turned baseline → draft across selection.
+                let Some(affix) = Self::infer_rename_affix_edit(&edit.baseline, &draft) else {
+                    self.push_session(
+                        "rename pattern failed: could not match edit to the original name",
+                    );
+                    self.log_open = true;
+                    return;
+                };
+                let mut pairs = Vec::with_capacity(names.len());
+                for old in &names {
+                    let (unit, ext) = if edit.stem_only {
+                        let (stem, ext) = Self::split_file_name(old);
+                        (stem, ext)
+                    } else {
+                        (old.clone(), String::new())
+                    };
+                    match Self::apply_rename_affix_edit(&unit, &affix) {
+                        Ok(new_unit) => {
+                            let new_name = format!("{new_unit}{ext}");
+                            if Self::rename_name_invalid(&new_name) {
+                                self.push_session(format!(
+                                    "rename failed: invalid name ({new_name})"
+                                ));
+                                self.log_open = true;
+                                return;
+                            }
+                            pairs.push((old.clone(), new_name));
+                        }
+                        Err(e) => {
+                            self.push_session(format!("rename pattern failed: {e}"));
+                            self.log_open = true;
+                            return;
+                        }
+                    }
+                }
+                pairs
+            }
         };
-        let from = dir.join(&edit.old_name);
-        let to = dir.join(&new_name);
-        if to.exists() {
-            self.push_session(format!("rename failed: {new_name} already exists"));
-            self.log_open = true;
+        // Full target set before identity filter (needed so multi-select survives no-op members).
+        let bulk_targets: Vec<String> = pairs.iter().map(|(_, n)| n.clone()).collect();
+
+        let done = match self.apply_rename_pairs(edit.side, &pairs) {
+            Ok(d) => d,
+            Err(e) => {
+                self.push_session(format!("rename failed: {e}"));
+                self.log_open = true;
+                return;
+            }
+        };
+        if done.is_empty() {
             return;
         }
-        if let Err(e) = std::fs::rename(&from, &to) {
-            self.push_session(format!("rename failed: {e}"));
-            self.log_open = true;
-            return;
-        }
-        // Remap preview cache + per-file logs keyed by basename.
-        let old_key = Self::preview_key(edit.side, &edit.old_name);
-        let new_key = Self::preview_key(edit.side, &new_name);
-        if let Some(mut entry) = self.preview_cache.remove(&old_key) {
-            entry.source_path = Some(to.clone());
-            self.preview_cache.insert(new_key, entry);
-        }
-        if edit.side == FileSide::Input {
-            if let Some(lines) = self.file_logs.remove(&edit.old_name) {
-                self.file_logs.insert(new_name.clone(), lines);
+
+        self.push_undo_step(UndoStep::Rename(RenameUndoBatch {
+            side: edit.side,
+            pairs: done.clone(),
+        }));
+
+        self.refresh_lists();
+        // Keep focus on the renamed active (its new name).
+        let focus = done
+            .iter()
+            .find(|(o, _)| o == &edit.old_name)
+            .map(|(_, n)| n.clone())
+            .or_else(|| done.last().map(|(_, n)| n.clone()));
+        if let Some(n) = focus {
+            if bulk {
+                // Restore the whole batch so a follow-up F2 still multi-selects.
+                let set: HashSet<String> = bulk_targets.iter().cloned().collect();
+                self.selection_anchor = self
+                    .names_for(edit.side)
+                    .into_iter()
+                    .find(|x| set.contains(x));
+                self.selected = set;
+                self.set_primary(edit.side, n);
+            } else {
+                self.select_file(edit.side, n);
             }
         }
-        if self.selected.remove(&edit.old_name) {
-            self.selected.insert(new_name.clone());
+        if done.len() == 1 {
+            let (o, n) = &done[0];
+            self.push_session(format!("renamed: {o} → {n}"));
+        } else {
+            self.push_session(format!("renamed {} files", done.len()));
         }
-        if self.selection_anchor.as_deref() == Some(edit.old_name.as_str()) {
-            self.selection_anchor = Some(new_name.clone());
-        }
-        self.refresh_lists();
-        self.select_file(edit.side, new_name.clone());
-        self.push_session(format!("renamed: {} → {new_name}", edit.old_name));
         self.save_preview_cache_to_disk();
     }
 
@@ -1866,10 +2206,10 @@ impl GigaMuxApp {
         let side = q.side;
         let next_name = q.next_name;
         if !q.recycled.is_empty() {
-            self.push_delete_undo_batch(DeleteUndoBatch {
+            self.push_undo_step(UndoStep::Delete(DeleteUndoBatch {
                 side,
                 paths: q.recycled,
-            });
+            }));
         }
         self.finish_delete_selection(side, next_name);
     }
@@ -1986,14 +2326,18 @@ impl GigaMuxApp {
         }
     }
 
-    /// Register a completed delete at the tip (truncates any redo branch first).
-    fn push_delete_undo_batch(&mut self, batch: DeleteUndoBatch) {
-        if batch.paths.is_empty() {
+    /// Register a completed action at the tip (truncates any redo branch first).
+    fn push_undo_step(&mut self, step: UndoStep) {
+        let empty = match &step {
+            UndoStep::Delete(b) => b.paths.is_empty(),
+            UndoStep::Rename(b) => b.pairs.is_empty(),
+        };
+        if empty {
             return;
         }
         let h = &mut self.undo_history;
         h.steps.truncate(h.cursor);
-        h.steps.push(batch);
+        h.steps.push(step);
         h.cursor = h.steps.len();
         while h.steps.len() > DELETE_UNDO_CAP {
             h.steps.remove(0);
@@ -2112,26 +2456,64 @@ impl GigaMuxApp {
                     (self.undo_history.cursor + 1).min(self.undo_history.steps.len());
             }
         }
-        let remaining: VecDeque<PathBuf> = match dir {
-            // Last-trashed file reappears first.
-            HistoryDir::Undo => batch.paths.into_iter().rev().collect(),
-            // Same order as the original delete cascade.
-            HistoryDir::Redo => batch.paths.into_iter().collect(),
-        };
-        let side = batch.side;
-        if let Some(nav) = self.history_nav.as_mut() {
-            nav.dir = dir;
-            nav.side = side;
-            nav.remaining = remaining;
-            nav.next_at = Instant::now();
-            nav.touched.clear();
-        }
-        if self
-            .history_nav
-            .as_ref()
-            .is_some_and(|n| n.remaining.is_empty())
-        {
-            self.history_nav_start_next_batch();
+        let side = batch.side();
+        match batch {
+            // Rename is instantaneous (no Recycle Bin pacing).
+            UndoStep::Rename(ren) => {
+                let pairs: Vec<(String, String)> = match dir {
+                    HistoryDir::Undo => ren.pairs.into_iter().map(|(o, n)| (n, o)).collect(),
+                    HistoryDir::Redo => ren.pairs,
+                };
+                match self.apply_rename_pairs(side, &pairs) {
+                    Ok(done) => {
+                        let names: Vec<String> = done.iter().map(|(_, n)| n.clone()).collect();
+                        if let Some(nav) = self.history_nav.as_mut() {
+                            nav.side = side;
+                            nav.dir = dir;
+                            nav.remaining.clear();
+                            nav.touched = names.clone();
+                        }
+                        self.refresh_lists();
+                        if !names.is_empty() {
+                            self.select_restored(side, &names);
+                        }
+                        self.save_preview_cache_to_disk();
+                        if done.len() == 1 {
+                            let (o, n) = &done[0];
+                            self.push_session(format!("renamed: {o} → {n}"));
+                        } else if !done.is_empty() {
+                            self.push_session(format!("renamed {} files", done.len()));
+                        }
+                    }
+                    Err(e) => {
+                        self.push_session(format!("rename undo/redo failed: {e}"));
+                        self.log_open = true;
+                    }
+                }
+                self.history_nav_start_next_batch();
+            }
+            UndoStep::Delete(del) => {
+                let remaining: VecDeque<PathBuf> = match dir {
+                    // Last-trashed file reappears first.
+                    HistoryDir::Undo => del.paths.into_iter().rev().collect(),
+                    // Same order as the original delete cascade.
+                    HistoryDir::Redo => del.paths.into_iter().collect(),
+                };
+                if let Some(nav) = self.history_nav.as_mut() {
+                    nav.dir = dir;
+                    nav.side = side;
+                    nav.remaining = remaining;
+                    nav.next_at = Instant::now();
+                    nav.touched.clear();
+                }
+                if self
+                    .history_nav
+                    .as_ref()
+                    .is_some_and(|n| n.remaining.is_empty())
+                {
+                    self.history_nav_start_next_batch();
+                }
+            }
         }
     }
 
@@ -3195,7 +3577,7 @@ impl GigaMuxApp {
                             let renaming = self.rename_edit.as_ref().is_some_and(|e| {
                                 e.side == side && e.old_name == name
                             });
-                            let mut commit_rename = false;
+                            let mut commit_rename: Option<RenameCommitMode> = None;
                             let row = ui.horizontal(|ui| {
                                 let resp = if renaming {
                                     let edit = self.rename_edit.as_mut().unwrap();
@@ -3203,14 +3585,27 @@ impl GigaMuxApp {
                                         .desired_width(ui.available_width().min(280.0).max(120.0))
                                         .font(egui::TextStyle::Monospace)
                                         .id_salt(("rename", side as u8, &edit.old_name));
-                                    let resp = ui.add(te);
+                                    let resp = ui
+                                        .add(te)
+                                        .on_hover_text(
+                                            "Enter: rename (multi → stem (n).ext). Alt+Enter: apply prefix/suffix edit to all selected.",
+                                        );
                                     if edit.request_focus {
                                         resp.request_focus();
                                         edit.request_focus = false;
                                     }
-                                    // Enter / click-away commit; Esc clears `rename_edit` in shortcuts.
-                                    if resp.lost_focus() {
-                                        commit_rename = true;
+                                    // Enter = default (single or numbered multi); Alt+Enter = affix pattern. Skip focus-loss commit while Alt is held — Alt alone can blur the TextEdit before Enter arrives.
+                                    let (enter, alt) = ui.input(|i| {
+                                        (i.key_pressed(egui::Key::Enter), i.modifiers.alt)
+                                    });
+                                    if enter {
+                                        commit_rename = Some(if alt {
+                                            RenameCommitMode::Pattern
+                                        } else {
+                                            RenameCommitMode::Default
+                                        });
+                                    } else if resp.lost_focus() && !alt {
+                                        commit_rename = Some(RenameCommitMode::Default);
                                     }
                                     resp
                                 } else {
@@ -3237,8 +3632,8 @@ impl GigaMuxApp {
                                 }
                                 resp
                             });
-                            if commit_rename {
-                                self.commit_rename();
+                            if let Some(mode) = commit_rename {
+                                self.commit_rename(mode);
                             }
                             let resp = row.inner;
                             // Full row (name + chips) for marquee hit-testing.
@@ -3292,12 +3687,25 @@ impl GigaMuxApp {
                                     }
                                     ui.close();
                                 }
+                                let rename_label = if self.is_selected(side, &name)
+                                    && self.selected.len() > 1
+                                {
+                                    format!("Rename {} selected", self.selected.len())
+                                } else {
+                                    "Rename".into()
+                                };
                                 if ui
-                                    .add_enabled(!self.busy, egui::Button::new("Rename"))
-                                    .on_hover_text("F2")
+                                    .add_enabled(!self.busy, egui::Button::new(rename_label))
+                                    .on_hover_text(
+                                        "F2 — Enter renames (multi → stem (n).ext); Alt+Enter applies the edit to all selected",
+                                    )
                                     .clicked()
                                 {
-                                    self.select_file(side, name.clone());
+                                    if !self.is_selected(side, &name) {
+                                        self.select_file(side, name.clone());
+                                    } else {
+                                        self.set_primary(side, name.clone());
+                                    }
                                     self.begin_rename_active();
                                     ui.close();
                                 }
@@ -4408,10 +4816,10 @@ impl GigaMuxApp {
                         if ui.button("Delete outputs").clicked() {
                             let (deleted, failed, trashed) =
                                 delete_issue_outputs(&self.prefs.output_dir, &prompt.deletable);
-                            self.push_delete_undo_batch(DeleteUndoBatch {
+                            self.push_undo_step(UndoStep::Delete(DeleteUndoBatch {
                                 side: FileSide::Output,
                                 paths: trashed,
-                            });
+                            }));
                             self.push_session(format!(
                                 "Recycle Bin: {deleted} output(s); failed {failed}"
                             ));
