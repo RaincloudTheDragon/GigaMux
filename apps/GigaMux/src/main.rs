@@ -132,6 +132,17 @@ enum JobKind {
     Vmaf,
 }
 
+/// Left-rail category in the Settings second window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Encode,
+    Files,
+}
+
+fn settings_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("gigamux_settings")
+}
+
 enum AppEvent {
     Encode(EncodeEvent),
     CheckDone(Result<CheckReport, String>),
@@ -261,6 +272,10 @@ struct GigaMuxApp {
     /// When true, log panel shows the session log even if a file is active.
     log_show_session: bool,
     show_settings: bool,
+    /// Active left-rail tab inside the Settings viewport.
+    settings_tab: SettingsTab,
+    /// Raise/focus the Settings viewport once after opening via the cog.
+    settings_raise: bool,
     busy: bool,
     job: Option<JobKind>,
     cancel: Arc<AtomicBool>,
@@ -596,6 +611,8 @@ impl GigaMuxApp {
             log_open: false,
             log_show_session: true,
             show_settings: false,
+            settings_tab: SettingsTab::Encode,
+            settings_raise: false,
             busy: false,
             job: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -3869,7 +3886,8 @@ impl GigaMuxApp {
     fn ui_center(&mut self, ui: &mut egui::Ui) {
         // Split preview vs actions into separate bands so log expand/collapse never lets Settings / Encode / Check overlap the preview (or each other).
         let full = ui.available_size();
-        let actions_h = 160.0;
+        // Cog + Encode/Check/VMAF + gaps; leave a little air above the log strip.
+        let actions_h = 184.0;
         let preview_h = (full.y - actions_h).max(48.0);
 
         ui.allocate_ui_with_layout(
@@ -3892,10 +3910,15 @@ impl GigaMuxApp {
             |ui| {
                 ui.add_space(8.0);
                 if ui
-                    .add_sized([72.0, 28.0], egui::Button::new("Settings"))
+                    .add_sized(
+                        [40.0, 40.0],
+                        egui::Button::new(egui::RichText::new("\u{2699}").size(22.0)),
+                    )
+                    .on_hover_text("Settings")
                     .clicked()
                 {
                     self.show_settings = true;
+                    self.settings_raise = true;
                 }
                 ui.add_space(10.0);
                 let encode = ui
@@ -3938,6 +3961,7 @@ impl GigaMuxApp {
                     };
                     ui.label(label);
                 }
+                ui.add_space(8.0);
             },
         );
     }
@@ -4290,122 +4314,191 @@ impl GigaMuxApp {
         (side, center, side, content)
     }
 
+    /// Second OS window (Adobe-style left tabs). Immediate viewport so panes can mutate prefs live.
     fn ui_settings(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
         }
-        egui::Window::new("Settings")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let hw_ok = !self.prefs.opaque_video.hardware_encode_unavailable();
-                    if !hw_ok {
-                        self.prefs.use_hardware = false;
-                    }
-                    ui.add_enabled_ui(hw_ok, |ui| {
-                        if ui
-                            .checkbox(&mut self.prefs.use_hardware, "Use hardware")
-                            .on_hover_text(
-                                "On: NVENC for HEVC/H.264/AV1; QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm. Off: CPU. Opaque VP8 has no HW path.",
-                            )
-                            .changed()
-                        {
-                            let _ = prefs::save(&self.prefs);
-                        }
-                    });
-                    self.ui_maxrate_override(ui);
-                });
-                if let Some(warn) = self.av1_nvenc_warning() {
-                    ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+        let vp_id = settings_viewport_id();
+        if self.settings_raise {
+            ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::Focus);
+            self.settings_raise = false;
+        }
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            vp_id,
+            egui::ViewportBuilder::default()
+                .with_title("GigaMux Settings")
+                .with_inner_size([560.0, 420.0])
+                .with_min_inner_size([480.0, 360.0]),
+            |ui, _class| {
+                // Esc or title-bar X dismisses and persists.
+                if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
+                {
+                    close = true;
                 }
-                if let Some(warn) = self.qsv_vp9_warning() {
-                    ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
-                }
-                ui.add_enabled_ui(self.prefs.use_hardware, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("GPU");
-                        let mut selected = match self.prefs.gpu {
-                            GpuChoice::Any => None,
-                            GpuChoice::Index(i) => Some(i),
-                        };
-                        egui::ComboBox::from_id_salt("gpu_settings")
-                            .selected_text(match self.prefs.gpu {
-                                GpuChoice::Any => "Any".to_string(),
-                                GpuChoice::Index(i) => self
-                                    .devices
-                                    .iter()
-                                    .find(|d| d.index == i)
-                                    .map(|d| format!("#{i} {}", d.name))
-                                    .unwrap_or_else(|| format!("#{i}")),
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut selected, None, "Any");
-                                for d in &self.devices {
-                                    ui.selectable_value(
-                                        &mut selected,
-                                        Some(d.index),
-                                        format!("#{} {}", d.index, d.name),
-                                    );
-                                }
-                            });
-                        self.prefs.gpu = match selected {
-                            None => GpuChoice::Any,
-                            Some(i) => GpuChoice::Index(i),
-                        };
-                        if ui.button("Refresh").clicked() {
-                            match list_nvenc_devices() {
-                                Ok(d) => {
-                                    let (gpu, warn) = self.prefs.gpu.sanitize(&d);
-                                    self.prefs.gpu = gpu;
-                                    self.gpu_warn = warn;
-                                    self.devices = d;
-                                }
-                                Err(e) => self.push_session(format!("GPU probe failed: {e}")),
+                egui::Panel::bottom("settings_bottom")
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Close").clicked() {
+                                close = true;
                             }
-                            self.av1_devices = list_av1_nvenc_devices(&self.devices);
-                            self.qsv_available = qsv_vp9_available();
-                        }
+                        });
                     });
+                egui::Panel::left("settings_tabs")
+                    .exact_size(140.0)
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .show(ui, |ui| {
+                        ui.add_space(8.0);
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::Encode, "Encode");
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::Files, "Files");
+                    });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.add_space(6.0);
+                    match self.settings_tab {
+                        SettingsTab::Encode => self.ui_settings_encode(ui),
+                        SettingsTab::Files => self.ui_settings_files(ui),
+                    }
                 });
-                if let Some(w) = &self.gpu_warn {
-                    ui.colored_label(egui::Color32::from_rgb(200, 140, 40), w);
-                }
-                ui.checkbox(
-                    &mut self.prefs.preserve_obs_metadata,
-                    "Preserve OBS metadata",
-                )
-                .on_hover_text(
-                    "Keep creation time / chapters / tags from OBS Hybrid MP4 across re-encode",
-                );
-                ui.checkbox(
-                    &mut self.prefs.use_peak_bitrate,
-                    "Ceiling from peak rate",
-                )
-                .on_hover_text(
-                    "Off (default): use average video bitrate. On: use 1s video peak.",
-                );
-                ui.checkbox(
-                    &mut self.prefs.warn_recycle_delete,
-                    "Warn before Recycle Bin",
-                )
-                .on_hover_text(
-                    "Confirm before moving a file to the Recycle Bin. Uncheck via the dialog’s “Don’t ask again.”",
-                );
-                ui.checkbox(
-                    &mut self.prefs.warn_permanent_delete,
-                    "Warn before permanent delete",
-                )
-                .on_hover_text(
-                    "When Recycle Bin fails, confirm before permanently deleting. Uncheck via the dialog’s “Don’t ask again.”",
-                );
-                ui.separator();
-                if ui.button("Close").clicked() {
+            },
+        );
+        if close {
+            let _ = prefs::save(&self.prefs);
+            self.show_settings = false;
+        }
+    }
+
+    /// Encode tab: hardware, GPU, maxrate, peak ceiling (CQ override lands here later).
+    fn ui_settings_encode(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let hw_ok = !self.prefs.opaque_video.hardware_encode_unavailable();
+            if !hw_ok {
+                self.prefs.use_hardware = false;
+            }
+            ui.add_enabled_ui(hw_ok, |ui| {
+                if ui
+                    .checkbox(&mut self.prefs.use_hardware, "Use hardware")
+                    .on_hover_text(
+                        "On: NVENC for HEVC/H.264/AV1; QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm. Off: CPU. Opaque VP8 has no HW path.",
+                    )
+                    .changed()
+                {
                     let _ = prefs::save(&self.prefs);
-                    self.show_settings = false;
                 }
             });
+            self.ui_maxrate_override(ui);
+        });
+        if let Some(warn) = self.av1_nvenc_warning() {
+            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+        }
+        if let Some(warn) = self.qsv_vp9_warning() {
+            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+        }
+        ui.add_enabled_ui(self.prefs.use_hardware, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("GPU");
+                let mut selected = match self.prefs.gpu {
+                    GpuChoice::Any => None,
+                    GpuChoice::Index(i) => Some(i),
+                };
+                egui::ComboBox::from_id_salt("gpu_settings")
+                    .selected_text(match self.prefs.gpu {
+                        GpuChoice::Any => "Any".to_string(),
+                        GpuChoice::Index(i) => self
+                            .devices
+                            .iter()
+                            .find(|d| d.index == i)
+                            .map(|d| format!("#{i} {}", d.name))
+                            .unwrap_or_else(|| format!("#{i}")),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut selected, None, "Any");
+                        for d in &self.devices {
+                            ui.selectable_value(
+                                &mut selected,
+                                Some(d.index),
+                                format!("#{} {}", d.index, d.name),
+                            );
+                        }
+                    });
+                self.prefs.gpu = match selected {
+                    None => GpuChoice::Any,
+                    Some(i) => GpuChoice::Index(i),
+                };
+                if ui.button("Refresh").clicked() {
+                    match list_nvenc_devices() {
+                        Ok(d) => {
+                            let (gpu, warn) = self.prefs.gpu.sanitize(&d);
+                            self.prefs.gpu = gpu;
+                            self.gpu_warn = warn;
+                            self.devices = d;
+                        }
+                        Err(e) => self.push_session(format!("GPU probe failed: {e}")),
+                    }
+                    self.av1_devices = list_av1_nvenc_devices(&self.devices);
+                    self.qsv_available = qsv_vp9_available();
+                    let _ = prefs::save(&self.prefs);
+                }
+            });
+        });
+        if let Some(w) = &self.gpu_warn {
+            ui.colored_label(egui::Color32::from_rgb(200, 140, 40), w.clone());
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.use_peak_bitrate,
+                "Ceiling from peak rate",
+            )
+            .on_hover_text(
+                "Off (default): use average video bitrate. On: use 1s video peak.",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
+    }
+
+    /// Files tab: metadata + delete confirms.
+    fn ui_settings_files(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(
+                &mut self.prefs.preserve_obs_metadata,
+                "Preserve OBS metadata",
+            )
+            .on_hover_text(
+                "Keep creation time / chapters / tags from OBS Hybrid MP4 across re-encode",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.warn_recycle_delete,
+                "Warn before Recycle Bin",
+            )
+            .on_hover_text(
+                "Confirm before moving a file to the Recycle Bin. Uncheck via the dialog’s “Don’t ask again.”",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.warn_permanent_delete,
+                "Warn before permanent delete",
+            )
+            .on_hover_text(
+                "When Recycle Bin fails, confirm before permanently deleting. Uncheck via the dialog’s “Don’t ask again.”",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
     }
 
     /// Alt-at-launch: pick which prefs slices / logs to purge.
