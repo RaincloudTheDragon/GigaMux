@@ -31,7 +31,7 @@ use gigamux_core::probe::{
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
-    pix_fmt_convert_warning, AudioEncode, OpaqueVideo, OutContainer, OutputTargets,
+    pix_fmt_convert_warning, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer, OutputTargets,
 };
 
 /// Live dual-bar encode progress (current file + whole batch).
@@ -952,15 +952,25 @@ impl GigaMuxApp {
         }
     }
 
-    /// True when an encode job is using software libvpx (opaque VP8/9 or any α file).
+    /// True when an encode job is using heavy software libvpx (opaque VP8/9 CPU or non-hybrid α).
     fn cpu_encode_active(&self) -> bool {
         if !(self.busy && matches!(self.job, Some(JobKind::Encode))) {
             return false;
         }
-        if self.prefs.opaque_video.is_libvpx() {
+        // Opaque VP9 + hardware uses QSV — don't throttle previews as a CPU encode.
+        if self.prefs.opaque_video.is_libvpx()
+            && !(self.prefs.use_hardware && self.prefs.opaque_video.is_qsv())
+        {
             return true;
         }
-        // Alpha delivers always use libvpx — throttle if any known-α input is in the batch.
+        // α VP9/.webm + hardware uses QSV+libvpx hybrid — keep previews responsive.
+        let hybrid_alpha = self.prefs.use_hardware
+            && self.prefs.alpha_video == AlphaVideo::Vp9
+            && self.prefs.alpha_container == OutContainer::Webm;
+        if hybrid_alpha {
+            return false;
+        }
+        // Other α delivers use full libvpx — throttle if any known-α input is in the batch.
         self.input_files.iter().any(|p| {
             let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
                 return false;
@@ -2910,7 +2920,7 @@ impl GigaMuxApp {
             if ui
                 .checkbox(&mut self.prefs.use_hardware, "Use hardware")
                 .on_hover_text(
-                    "On: NVIDIA NVENC — matches source chroma when supported (no 4:2:2; warns on fallback). Off: CPU and keep source chroma. VP8/VP9 and α stay 4:2:0.",
+                    "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm (falls back to full libvpx). Off: CPU. VP8 α stays libvpx.",
                 )
                 .changed()
             {
@@ -3705,7 +3715,7 @@ impl GigaMuxApp {
                     if ui
                         .checkbox(&mut self.prefs.use_hardware, "Use hardware")
                         .on_hover_text(
-                            "On: NVIDIA NVENC — match source chroma when supported; warn on fallback. Off: CPU keep source.",
+                            "On: NVENC for HEVC/H.264/AV1; QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm. Off: CPU.",
                         )
                         .changed()
                     {
