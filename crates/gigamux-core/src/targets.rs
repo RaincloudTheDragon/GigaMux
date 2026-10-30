@@ -48,6 +48,11 @@ impl OpaqueVideo {
         matches!(self, Self::Vp9)
     }
 
+    /// Opaque VP8 has no NVENC/QSV encode path — Use hardware should stay off/disabled.
+    pub fn hardware_encode_unavailable(self) -> bool {
+        matches!(self, Self::Vp8)
+    }
+
     /// ffmpeg `-c:v` — NVENC / QSV when `hardware` and codec supports it, else CPU.
     pub fn ffmpeg_encoder(self, hardware: bool) -> &'static str {
         match self {

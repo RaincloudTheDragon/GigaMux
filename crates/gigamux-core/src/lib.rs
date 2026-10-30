@@ -22,7 +22,7 @@ pub use job_log::{
 };
 pub use gpu::{
     av1_nvenc_available, list_av1_nvenc_devices, list_nvenc_devices, list_nvenc_devices_for,
-    nvenc_encoder_works, GpuChoice, NvencDevice,
+    nvenc_encoder_works, qsv_vp9_available, GpuChoice, NvencDevice,
 };
 pub use prefs::{logs_dir, Prefs};
 pub use probe::{

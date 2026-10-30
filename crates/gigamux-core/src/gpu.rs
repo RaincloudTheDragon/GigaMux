@@ -130,6 +130,34 @@ pub fn av1_nvenc_available() -> bool {
     nvenc_encoder_works("av1_nvenc", None)
 }
 
+/// True when Intel QSV can open `vp9_qsv` (false on AMD / Intel F / no iGPU / missing ffmpeg QSV).
+pub fn qsv_vp9_available() -> bool {
+    Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-init_hw_device",
+            "qsv=hw",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=256x256:d=0.1",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "vp9_qsv",
+            "-pix_fmt",
+            "nv12",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn parse_gpu_list(stderr: &str) -> Result<Vec<NvencDevice>, String> {
     // e.g. [h264_nvenc @ ...] [ GPU #0 - < NVIDIA GeForce RTX 3060 > has Compute SM 8.6 ]
     let re = Regex::new(r"GPU #(\d+)\s*-\s*<\s*([^>]+?)\s*>")

@@ -20,7 +20,9 @@ use gigamux_core::check::{
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::vmaf::{run_vmaf, VmafEvent, VmafReport};
-use gigamux_core::gpu::{list_av1_nvenc_devices, list_nvenc_devices, GpuChoice, NvencDevice};
+use gigamux_core::gpu::{
+    list_av1_nvenc_devices, list_nvenc_devices, qsv_vp9_available, GpuChoice, NvencDevice,
+};
 use gigamux_core::job_log;
 use gigamux_core::prefs::{self, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
@@ -238,6 +240,8 @@ struct GigaMuxApp {
     devices: Vec<NvencDevice>,
     /// GPUs that can open `av1_nvenc` (empty on pre-Ada / no AV1 NVENC).
     av1_devices: Vec<NvencDevice>,
+    /// Intel QSV can open `vp9_qsv` (false on AMD / Intel F / no capable iGPU).
+    qsv_available: bool,
     gpu_warn: Option<String>,
     input_files: Vec<PathBuf>,
     output_files: Vec<PathBuf>,
@@ -269,6 +273,8 @@ struct GigaMuxApp {
     pending_permanent_delete: Option<PermanentDeletePrompt>,
     /// AV1 + hardware but no `av1_nvenc` — holds queued encode selection until dismissed/fixed.
     pending_av1_nvenc: Option<Option<String>>,
+    /// VP9 + hardware but no `vp9_qsv` — holds queued encode selection until dismissed/fixed.
+    pending_qsv_vp9: Option<Option<String>>,
     /// Alt held at launch — choose which prefs / logs to purge.
     pending_purge: Option<PurgePrompt>,
     /// One-by-one delete cascade (list shrinks between each file).
@@ -485,8 +491,14 @@ impl GigaMuxApp {
         };
         // Real one-frame smoke — `-gpu list` falsely reports AV1 on pre-Ada cards.
         let av1_devices = list_av1_nvenc_devices(&devices);
+        // Same idea for QSV: device present ≠ `vp9_qsv` encode works.
+        let qsv_available = qsv_vp9_available();
         let (gpu, warn) = prefs.gpu.sanitize(&devices);
         prefs.gpu = gpu;
+        // Opaque VP8 never has a HW encoder — don't leave a stale toggle on.
+        if prefs.opaque_video.hardware_encode_unavailable() {
+            prefs.use_hardware = false;
+        }
         let maxrate_override_edit = prefs
             .maxrate_override_k
             .map(|k| k.to_string())
@@ -496,6 +508,7 @@ impl GigaMuxApp {
             maxrate_override_edit,
             devices,
             av1_devices,
+            qsv_available,
             gpu_warn: warn,
             input_files: Vec::new(),
             output_files: Vec::new(),
@@ -517,6 +530,7 @@ impl GigaMuxApp {
             pending_recycle_delete: None,
             pending_permanent_delete: None,
             pending_av1_nvenc: None,
+            pending_qsv_vp9: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
             delete_queue: None,
             undo_history: UndoHistory::new(),
@@ -1540,7 +1554,7 @@ impl GigaMuxApp {
         if self.busy || self.delete_queue.is_some() || self.history_nav.is_some() {
             return;
         }
-        if self.pending_av1_nvenc.is_some() {
+        if self.pending_av1_nvenc.is_some() || self.pending_qsv_vp9.is_some() {
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
@@ -1554,10 +1568,15 @@ impl GigaMuxApp {
             self.pending_av1_nvenc = Some(only_name);
             return;
         }
+        // Same gate for opaque VP9 without Intel QSV.
+        if self.qsv_vp9_warning().is_some() {
+            self.pending_qsv_vp9 = Some(only_name);
+            return;
+        }
         self.start_encode_now(only_name);
     }
 
-    /// Spawn the encode worker (caller already cleared AV1 NVENC / folder guards).
+    /// Spawn the encode worker (caller already cleared AV1/QSV / folder guards).
     fn start_encode_now(&mut self, only_name: Option<String>) {
         let _ = prefs::save(&self.prefs);
         self.cancel.store(false, Ordering::Relaxed);
@@ -2227,6 +2246,8 @@ impl GigaMuxApp {
                 self.pending_purge = None;
             } else if self.pending_av1_nvenc.is_some() {
                 self.pending_av1_nvenc = None;
+            } else if self.pending_qsv_vp9.is_some() {
+                self.pending_qsv_vp9 = None;
             } else if self.pending_permanent_delete.is_some() {
                 self.pending_permanent_delete = None;
                 if let Some(q) = self.delete_queue.as_mut() {
@@ -2810,6 +2831,20 @@ impl GigaMuxApp {
         }
     }
 
+    /// Amber when opaque VP9 + hardware but `vp9_qsv` smoke failed (no capable Intel iGPU).
+    fn qsv_vp9_warning(&self) -> Option<String> {
+        if !self.prefs.use_hardware || self.prefs.opaque_video != OpaqueVideo::Vp9 {
+            return None;
+        }
+        if self.qsv_available {
+            return None;
+        }
+        Some(
+            "Intel QSV VP9 not available — turn off Use hardware (libvpx) or pick HEVC/H.264/AV1"
+                .into(),
+        )
+    }
+
     /// Amber line when any input’s chroma/bit-depth can’t be matched for the current target.
     fn chroma_convert_warning(&self) -> Option<String> {
         for path in &self.input_files {
@@ -2890,6 +2925,10 @@ impl GigaMuxApp {
                 self.prefs.opaque_video = next;
                 self.prefs.opaque_container =
                     gigamux_core::targets::clamp_opaque_container(next, self.prefs.opaque_container);
+                // VP8 has no HW encode path — force software.
+                if next.hardware_encode_unavailable() {
+                    self.prefs.use_hardware = false;
+                }
                 self.save_targets();
             }
             let c = self.prefs.opaque_container;
@@ -2917,18 +2956,27 @@ impl GigaMuxApp {
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui
-                .checkbox(&mut self.prefs.use_hardware, "Use hardware")
-                .on_hover_text(
-                    "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm (falls back to full libvpx). Off: CPU. VP8 α stays libvpx.",
-                )
-                .changed()
-            {
-                self.save_targets();
+            let hw_ok = !self.prefs.opaque_video.hardware_encode_unavailable();
+            if !hw_ok {
+                self.prefs.use_hardware = false;
             }
+            ui.add_enabled_ui(hw_ok, |ui| {
+                if ui
+                    .checkbox(&mut self.prefs.use_hardware, "Use hardware")
+                    .on_hover_text(
+                        "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm (falls back to full libvpx). Off: CPU. Opaque VP8 has no HW path.",
+                    )
+                    .changed()
+                {
+                    self.save_targets();
+                }
+            });
             self.ui_maxrate_override(ui);
         });
         if let Some(warn) = self.av1_nvenc_warning() {
+            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+        }
+        if let Some(warn) = self.qsv_vp9_warning() {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
         }
         if let Some(warn) = self.chroma_convert_warning() {
@@ -3712,18 +3760,27 @@ impl GigaMuxApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .checkbox(&mut self.prefs.use_hardware, "Use hardware")
-                        .on_hover_text(
-                            "On: NVENC for HEVC/H.264/AV1; QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm. Off: CPU.",
-                        )
-                        .changed()
-                    {
-                        let _ = prefs::save(&self.prefs);
+                    let hw_ok = !self.prefs.opaque_video.hardware_encode_unavailable();
+                    if !hw_ok {
+                        self.prefs.use_hardware = false;
                     }
+                    ui.add_enabled_ui(hw_ok, |ui| {
+                        if ui
+                            .checkbox(&mut self.prefs.use_hardware, "Use hardware")
+                            .on_hover_text(
+                                "On: NVENC for HEVC/H.264/AV1; QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm. Off: CPU. Opaque VP8 has no HW path.",
+                            )
+                            .changed()
+                        {
+                            let _ = prefs::save(&self.prefs);
+                        }
+                    });
                     self.ui_maxrate_override(ui);
                 });
                 if let Some(warn) = self.av1_nvenc_warning() {
+                    ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+                }
+                if let Some(warn) = self.qsv_vp9_warning() {
                     ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
                 }
                 ui.add_enabled_ui(self.prefs.use_hardware, |ui| {
@@ -3768,6 +3825,7 @@ impl GigaMuxApp {
                                 Err(e) => self.push_session(format!("GPU probe failed: {e}")),
                             }
                             self.av1_devices = list_av1_nvenc_devices(&self.devices);
+                            self.qsv_available = qsv_vp9_available();
                         }
                     });
                 });
@@ -4023,6 +4081,56 @@ impl GigaMuxApp {
                             );
                         self.save_targets();
                         self.pending_av1_nvenc = None;
+                        self.start_encode_now(only_name);
+                    }
+                });
+            });
+    }
+
+    /// Block encode when VP9 + hardware but `vp9_qsv` is missing; offer fix-and-continue.
+    fn ui_qsv_vp9_prompt(&mut self, ctx: &egui::Context) {
+        let Some(only_name) = self.pending_qsv_vp9.clone() else {
+            return;
+        };
+        let msg = self.qsv_vp9_warning().unwrap_or_else(|| {
+            "Intel QSV VP9 is not available on this system.".into()
+        });
+        egui::Window::new("Intel QSV VP9 unavailable")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), &msg);
+                ui.add_space(4.0);
+                ui.label("Encode would fail with the current targets. Fix the setting, then continue:");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.pending_qsv_vp9 = None;
+                    }
+                    if ui
+                        .button("Turn off hardware")
+                        .on_hover_text("Use libvpx-vp9 (CPU) for this encode")
+                        .clicked()
+                    {
+                        self.prefs.use_hardware = false;
+                        self.save_targets();
+                        self.pending_qsv_vp9 = None;
+                        self.start_encode_now(only_name.clone());
+                    }
+                    if ui
+                        .button("Use HEVC")
+                        .on_hover_text("Switch opaque target to HEVC (NVENC when available)")
+                        .clicked()
+                    {
+                        self.prefs.opaque_video = OpaqueVideo::Hevc;
+                        self.prefs.opaque_container =
+                            gigamux_core::targets::clamp_opaque_container(
+                                OpaqueVideo::Hevc,
+                                self.prefs.opaque_container,
+                            );
+                        self.save_targets();
+                        self.pending_qsv_vp9 = None;
                         self.start_encode_now(only_name);
                     }
                 });
@@ -4619,6 +4727,7 @@ impl eframe::App for GigaMuxApp {
         self.ui_settings(&ctx);
         self.ui_purge_prefs_prompt(&ctx);
         self.ui_av1_nvenc_prompt(&ctx);
+        self.ui_qsv_vp9_prompt(&ctx);
         self.ui_check_prompt(&ctx);
         self.ui_recycle_delete_prompt(&ctx);
         self.ui_permanent_delete_prompt(&ctx);
