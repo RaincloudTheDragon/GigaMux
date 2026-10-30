@@ -301,6 +301,17 @@ struct GigaMuxApp {
     /// Taskbar overlay is currently showing (Windows); used to clear once when the job ends.
     #[cfg(windows)]
     taskbar_showing: bool,
+    /// Inline F2 rename of the active list row.
+    rename_edit: Option<RenameEdit>,
+}
+
+/// In-list rename draft (F2 on the active file).
+struct RenameEdit {
+    side: FileSide,
+    old_name: String,
+    draft: String,
+    /// Request TextEdit focus once after opening.
+    request_focus: bool,
 }
 
 /// Pace between one-by-one delete / restore steps so the list visibly moves.
@@ -546,6 +557,7 @@ impl GigaMuxApp {
             encode_progress: None,
             #[cfg(windows)]
             taskbar_showing: false,
+            rename_edit: None,
         };
         app.load_preview_cache_from_disk();
         app.refresh_lists();
@@ -555,6 +567,7 @@ impl GigaMuxApp {
     }
 
     fn clear_active(&mut self) {
+        self.rename_edit = None;
         self.active = None;
         self.selected.clear();
         self.selection_anchor = None;
@@ -1712,6 +1725,81 @@ impl GigaMuxApp {
         }
     }
 
+    /// F2: start inline rename of the primary selection.
+    fn begin_rename_active(&mut self) {
+        let Some((side, name)) = self.active.clone() else {
+            return;
+        };
+        if self.busy
+            || self.delete_queue.is_some()
+            || self.history_nav.is_some()
+            || self.pending_recycle_delete.is_some()
+            || self.pending_permanent_delete.is_some()
+        {
+            return;
+        }
+        self.rename_edit = Some(RenameEdit {
+            side,
+            old_name: name.clone(),
+            draft: name,
+            request_focus: true,
+        });
+    }
+
+    /// Apply the inline rename draft to disk and remapping UI caches.
+    fn commit_rename(&mut self) {
+        let Some(edit) = self.rename_edit.take() else {
+            return;
+        };
+        let new_name = edit.draft.trim().to_string();
+        if new_name.is_empty() || new_name == edit.old_name {
+            return;
+        }
+        if new_name.contains(['/', '\\', '\0']) || new_name == "." || new_name == ".." {
+            self.push_session("rename failed: invalid name");
+            self.log_open = true;
+            return;
+        }
+        let dir = match edit.side {
+            FileSide::Input => self.prefs.input_dir.clone(),
+            FileSide::Output => self.prefs.output_dir.clone(),
+        };
+        let from = dir.join(&edit.old_name);
+        let to = dir.join(&new_name);
+        if to.exists() {
+            self.push_session(format!("rename failed: {new_name} already exists"));
+            self.log_open = true;
+            return;
+        }
+        if let Err(e) = std::fs::rename(&from, &to) {
+            self.push_session(format!("rename failed: {e}"));
+            self.log_open = true;
+            return;
+        }
+        // Remap preview cache + per-file logs keyed by basename.
+        let old_key = Self::preview_key(edit.side, &edit.old_name);
+        let new_key = Self::preview_key(edit.side, &new_name);
+        if let Some(mut entry) = self.preview_cache.remove(&old_key) {
+            entry.source_path = Some(to.clone());
+            self.preview_cache.insert(new_key, entry);
+        }
+        if edit.side == FileSide::Input {
+            if let Some(lines) = self.file_logs.remove(&edit.old_name) {
+                self.file_logs.insert(new_name.clone(), lines);
+            }
+        }
+        if self.selected.remove(&edit.old_name) {
+            self.selected.insert(new_name.clone());
+        }
+        if self.selection_anchor.as_deref() == Some(edit.old_name.as_str()) {
+            self.selection_anchor = Some(new_name.clone());
+        }
+        self.refresh_lists();
+        self.select_file(edit.side, new_name.clone());
+        self.push_session(format!("renamed: {} → {new_name}", edit.old_name));
+        self.save_preview_cache_to_disk();
+    }
+
     /// Delete all selected files (Del). Refuses while a job / delete cascade is running.
     /// Warns before Recycle Bin / permanent delete unless the user opted out.
     fn delete_active(&mut self) {
@@ -2190,6 +2278,7 @@ impl GigaMuxApp {
             page_up,
             page_down,
             delete,
+            f2,
             ctrl,
             shift,
         ) = ctx.input(|i| {
@@ -2212,6 +2301,7 @@ impl GigaMuxApp {
                 i.key_pressed(egui::Key::PageUp),
                 i.key_pressed(egui::Key::PageDown),
                 i.key_pressed(egui::Key::Delete),
+                i.key_pressed(egui::Key::F2),
                 i.modifiers.command,
                 i.modifiers.shift,
             )
@@ -2220,9 +2310,17 @@ impl GigaMuxApp {
         if ctrl_j {
             self.log_open = !self.log_open;
         }
+        // Esc cancels an in-list rename even while the TextEdit holds focus.
+        if esc && self.rename_edit.is_some() {
+            self.rename_edit = None;
+            return;
+        }
         // Skip remaining keys when a text field has focus.
         if ctx.egui_wants_keyboard_input() {
             return;
+        }
+        if f2 {
+            self.begin_rename_active();
         }
         if ctrl_shift_z {
             self.redo_last_delete();
@@ -3094,8 +3192,30 @@ impl GigaMuxApp {
                                     )
                                 })
                             });
+                            let renaming = self.rename_edit.as_ref().is_some_and(|e| {
+                                e.side == side && e.old_name == name
+                            });
+                            let mut commit_rename = false;
                             let row = ui.horizontal(|ui| {
-                                let resp = ui.selectable_label(selected, &name);
+                                let resp = if renaming {
+                                    let edit = self.rename_edit.as_mut().unwrap();
+                                    let te = egui::TextEdit::singleline(&mut edit.draft)
+                                        .desired_width(ui.available_width().min(280.0).max(120.0))
+                                        .font(egui::TextStyle::Monospace)
+                                        .id_salt(("rename", side as u8, &edit.old_name));
+                                    let resp = ui.add(te);
+                                    if edit.request_focus {
+                                        resp.request_focus();
+                                        edit.request_focus = false;
+                                    }
+                                    // Enter / click-away commit; Esc clears `rename_edit` in shortcuts.
+                                    if resp.lost_focus() {
+                                        commit_rename = true;
+                                    }
+                                    resp
+                                } else {
+                                    ui.selectable_label(selected, &name)
+                                };
                                 match &tags {
                                     Some((None, _, _, _)) => codec_chip(ui, "…"),
                                     Some((Some(tag), has_alpha, chroma, rate)) => {
@@ -3117,6 +3237,9 @@ impl GigaMuxApp {
                                 }
                                 resp
                             });
+                            if commit_rename {
+                                self.commit_rename();
+                            }
                             let resp = row.inner;
                             // Full row (name + chips) for marquee hit-testing.
                             row_rects.push((name.clone(), row.response.rect));
@@ -3129,7 +3252,7 @@ impl GigaMuxApp {
                                 resp.scroll_to_me(Some(egui::Align::Center));
                                 self.scroll_sel_into_view = false;
                             }
-                            if resp.clicked() {
+                            if resp.clicked() && !renaming {
                                 let (shift, ctrl) = ui.ctx().input(|i| {
                                     (i.modifiers.shift, i.modifiers.command)
                                 });
@@ -3167,6 +3290,15 @@ impl GigaMuxApp {
                                     if let Err(e) = open_path_in_os(path) {
                                         self.push_session(format!("open failed: {e}"));
                                     }
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(!self.busy, egui::Button::new("Rename"))
+                                    .on_hover_text("F2")
+                                    .clicked()
+                                {
+                                    self.select_file(side, name.clone());
+                                    self.begin_rename_active();
                                     ui.close();
                                 }
                                 let del_label = if self.is_selected(side, &name)
