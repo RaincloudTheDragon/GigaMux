@@ -118,18 +118,34 @@ fn parse_pts_lines(text: &str) -> Option<f64> {
 }
 
 /// Probe last video `pts_time` (and whether ffprobe said the file ended early).
-fn probe_last_video_pts(path: &Path, read_intervals: Option<&str>) -> (Option<f64>, bool) {
+///
+/// `decoder` forces an input codec (e.g. `av1`) so NVENC AV1 isn't walked through ancient libaom.
+fn probe_last_video_pts(
+    path: &Path,
+    read_intervals: Option<&str>,
+    decoder: Option<&str>,
+) -> (Option<f64>, bool) {
     let path_s = path.to_string_lossy();
-    let mut args: Vec<&str> = vec!["-v", "error", "-i", path_s.as_ref(), "-select_streams", "v:0"];
+    let mut args: Vec<&str> = vec!["-v", "error"];
+    if let Some(d) = decoder {
+        args.extend(["-c:v", d]);
+    }
+    args.extend(["-i", path_s.as_ref(), "-select_streams", "v:0"]);
     if let Some(iv) = read_intervals {
         args.extend(["-read_intervals", iv]);
     }
     args.extend(["-show_entries", "packet=pts_time", "-of", "csv=p=0"]);
     match Command::new("ffprobe").args(&args).output() {
         Ok(out) => {
-            let premature = String::from_utf8_lossy(&out.stderr)
-                .to_lowercase()
-                .contains("ended prematurely");
+            let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+            // libaom choking on NVENC level indices floods stderr and stalls — treat as unreadable.
+            if err.contains("bitstream not supported")
+                || err.contains("seq_level_idx")
+                || err.contains("decode error rate")
+            {
+                return (None, true);
+            }
+            let premature = err.contains("ended prematurely");
             (
                 parse_pts_lines(&String::from_utf8_lossy(&out.stdout)),
                 premature,
@@ -139,20 +155,35 @@ fn probe_last_video_pts(path: &Path, read_intervals: Option<&str>) -> (Option<f6
     }
 }
 
+fn packet_probe_decoder(codec_name: &str) -> Option<&'static str> {
+    match codec_name.to_ascii_lowercase().as_str() {
+        // Prefer generic `av1` over libaom (handles NVENC seq_level values libaom rejects).
+        "av1" => Some("av1"),
+        _ => None,
+    }
+}
+
 /// True end of the video bitstream (last packet pts), not container/tag duration.
 ///
 /// Fast path seeks near the end, but HEVC/NVENC long GOPs make `-read_intervals` land on a prior keyframe — a tiny packet window then looks "truncated". If that sample is short of the declared duration, fall back to a full packet walk.
-fn written_media_seconds(path: &Path, declared_duration: Option<f64>) -> (Option<f64>, bool) {
+fn written_media_seconds(
+    path: &Path,
+    declared_duration: Option<f64>,
+    codec_name: &str,
+) -> (Option<f64>, bool) {
     let slack = |dur: f64| STREAM_END_SLACK_S.max(dur * STREAM_END_SLACK_FRAC);
+    let decoder = packet_probe_decoder(codec_name);
 
     if let Some(dur) = declared_duration {
         if dur > 1.0 {
             // Seek well before the end so a long GOP still leaves enough packets to walk past the declared duration (60fps × 30s ≈ 1800).
             let seek = (dur - 30.0).max(0.0);
             let (last, premature) =
-                probe_last_video_pts(path, Some(&format!("{seek}%+#2400")));
+                probe_last_video_pts(path, Some(&format!("{seek}%+#2400")), decoder);
             match last {
                 Some(w) if premature || w + slack(dur) >= dur => return (Some(w), premature),
+                // Hard decode rejection — don't grind a full-file libaom walk.
+                None if premature => return (None, true),
                 Some(_) | None => {
                     // Sample inconclusive (keyframe seek still short) — full scan.
                 }
@@ -160,7 +191,7 @@ fn written_media_seconds(path: &Path, declared_duration: Option<f64>) -> (Option
         }
     }
 
-    probe_last_video_pts(path, None)
+    probe_last_video_pts(path, None, decoder)
 }
 
 fn check_pair_inner(
@@ -180,9 +211,25 @@ fn check_pair_inner(
 
     // WebM often copies full source duration into tags while clusters stop early.
     if output_duration > 5.0 {
-        let (written, premature) = written_media_seconds(output_path, Some(output_duration));
+        let out_codec_early = output_info
+            .get("streams")
+            .and_then(|s| s.as_array())
+            .and_then(|a| {
+                a.iter()
+                    .find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("video"))
+            })
+            .and_then(|v| v.get("codec_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let (written, premature) =
+            written_media_seconds(output_path, Some(output_duration), out_codec_early);
         let slack = STREAM_END_SLACK_S.max(output_duration * STREAM_END_SLACK_FRAC);
         match written {
+            None if premature && out_codec_early.eq_ignore_ascii_case("av1") => {
+                return Some(format!(
+                    "AV1 output unreadable by probe decoder (declared {output_duration:.2}s) — often NVENC seq_level vs libaom; file may still play in NVDEC/dav1d players"
+                ));
+            }
             None => {
                 return Some(format!(
                     "Incomplete output: declared {output_duration:.2}s but no video packets readable"

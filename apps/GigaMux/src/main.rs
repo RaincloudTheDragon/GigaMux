@@ -29,7 +29,8 @@ use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewE
 use gigamux_core::probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
     media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag, rate_mode_heat,
-    size_delta, thumbnail_rgba, FrameTiming, MediaSummary, RgbaThumb, SizeDelta, THUMB_W,
+    size_delta, thumbnail_rgba, truncate_cli_err, FrameTiming, MediaSummary, RgbaThumb, SizeDelta,
+    THUMB_W,
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
@@ -996,9 +997,10 @@ impl GigaMuxApp {
             let (thumb_file, thumb_width, thumb_height, thumb_err) = match &e.thumb {
                 Some(Ok(thumb)) => match preview_cache::write_thumb(key, thumb) {
                     Ok(name) => (Some(name), thumb.width, thumb.height, None),
-                    Err(err) => (None, 0, 0, Some(err)),
+                    Err(err) => (None, 0, 0, Some(truncate_cli_err(&err, 800))),
                 },
-                Some(Err(err)) => (None, 0, 0, Some(err.clone())),
+                // Don't persist multi-k-line ffmpeg dumps into preview_cache.json.
+                Some(Err(err)) => (None, 0, 0, Some(truncate_cli_err(err, 800))),
                 None => (None, 0, 0, None),
             };
             entries.insert(
@@ -4086,7 +4088,23 @@ impl GigaMuxApp {
             ui.add(egui::Image::new((tex.id(), size)).maintain_aspect_ratio(true));
         }
         if let Some(Err(e)) = &entry.thumb {
-            ui.colored_label(egui::Color32::from_rgb(200, 100, 80), format!("thumb: {e}"));
+            // Never paint raw multi-k-line ffmpeg dumps into egui (freezes the window).
+            let shown = truncate_cli_err(e, 400);
+            let truncated = shown.contains("… (stderr truncated)") || e.len() > 400;
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 100, 80),
+                    format!("thumb: {shown}"),
+                );
+                if truncated
+                    && ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy full ffmpeg stderr")
+                        .clicked()
+                {
+                    ui.ctx().copy_text(e.clone());
+                }
+            });
         }
         let bitrates_ready = entry.bitrates_ready;
         // Hide score unless the live pair still exists with a matching score on both sides.

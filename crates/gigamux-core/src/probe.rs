@@ -872,6 +872,30 @@ pub fn media_summary(path: &Path) -> Result<MediaSummary, String> {
     Ok(s)
 }
 
+/// Keep ffmpeg/ffprobe stderr short for UI — full dumps (e.g. per-packet AV1 decode spam) freeze egui.
+pub fn truncate_cli_err(stderr: &str, max_chars: usize) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.len() <= max_chars {
+        return trimmed.to_string();
+    }
+    // Prefer the first meaningful lines (root cause) over the tail of packet spam.
+    let mut out = String::new();
+    for line in trimmed.lines().take(12) {
+        if out.len() + line.len() + 1 > max_chars {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    if out.is_empty() {
+        out.push_str(&trimmed[..max_chars]);
+    }
+    out.push_str("\n… (stderr truncated)");
+    out
+}
+
 /// Grab one letterboxed RGBA frame near 1s (or 10% of duration) via ffmpeg.
 pub fn thumbnail_rgba(path: &Path, duration_s: f64) -> Result<RgbaThumb, String> {
     let seek = if duration_s > 2.0 {
@@ -885,34 +909,75 @@ pub fn thumbnail_rgba(path: &Path, duration_s: f64) -> Result<RgbaThumb, String>
 /// Grab one letterboxed RGBA frame at `seek_s` (input seek before decode).
 pub fn thumbnail_rgba_at(path: &Path, seek_s: f64) -> Result<RgbaThumb, String> {
     let seek = seek_s.max(0.0);
+    // Default decoder first; on AV1/libaom level failures retry NVDEC then generic `av1`.
+    match thumbnail_rgba_at_with(path, seek, None, None) {
+        Ok(t) => Ok(t),
+        Err(e) if thumb_err_suggests_av1_decoder_gap(&e) => {
+            // Keep full stderr in the Err so the UI can offer Copy while only painting a truncate.
+            thumbnail_rgba_at_with(path, seek, Some("cuda"), Some("av1_cuvid"))
+                .or_else(|_| thumbnail_rgba_at_with(path, seek, None, Some("av1")))
+                .map_err(|e2| format!("{e}\n--- fallback ---\n{e2}"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn thumb_err_suggests_av1_decoder_gap(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("libaom-av1")
+        || e.contains("seq_level_idx")
+        || e.contains("bitstream not supported")
+        || e.contains("no sequence header")
+}
+
+fn thumbnail_rgba_at_with(
+    path: &Path,
+    seek: f64,
+    hwaccel: Option<&str>,
+    decoder: Option<&str>,
+) -> Result<RgbaThumb, String> {
     let vf = format!(
         "scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:black"
     );
+    let path_s = path.to_str().ok_or("non-utf8 path")?;
+    let seek_s = format!("{seek:.3}");
+    let mut args: Vec<&str> = vec![
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        // Bail on first decode failure — avoids multi‑thousand‑line libaom spam.
+        "-xerror",
+    ];
+    if let Some(h) = hwaccel {
+        args.extend(["-hwaccel", h]);
+    }
+    if let Some(d) = decoder {
+        args.extend(["-c:v", d]);
+    }
+    args.extend([
+        "-ss",
+        &seek_s,
+        "-i",
+        path_s,
+        "-frames:v",
+        "1",
+        "-vf",
+        &vf,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-",
+    ]);
     let out = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            &format!("{seek:.3}"),
-            "-i",
-            path.to_str().ok_or("non-utf8 path")?,
-            "-frames:v",
-            "1",
-            "-vf",
-            &vf,
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "-",
-        ])
+        .args(&args)
         .output()
         .map_err(|e| format!("ffmpeg thumb: {e}"))?;
     if !out.status.success() {
+        // Full stderr kept for Copy; UI truncates for display. `-xerror` keeps this short in practice.
         return Err(format!(
             "ffmpeg thumb failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     let expect = (THUMB_W * THUMB_H * 4) as usize;
