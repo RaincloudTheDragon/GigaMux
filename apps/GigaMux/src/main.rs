@@ -249,6 +249,8 @@ struct GigaMuxApp {
     prefs: Prefs,
     /// Draft text for the maxrate override field (keeps typing stable across frames).
     maxrate_override_edit: String,
+    /// Draft text for the CQ/CRF override field (empty = default 0).
+    cq_override_edit: String,
     devices: Vec<NvencDevice>,
     /// GPUs that can open `av1_nvenc` (empty on pre-Ada / no AV1 NVENC).
     av1_devices: Vec<NvencDevice>,
@@ -593,9 +595,14 @@ impl GigaMuxApp {
             .maxrate_override_k
             .map(|k| k.to_string())
             .unwrap_or_default();
+        let cq_override_edit = prefs
+            .cq_override
+            .map(|q| q.to_string())
+            .unwrap_or_default();
         let mut app = Self {
             prefs,
             maxrate_override_edit,
+            cq_override_edit,
             devices,
             av1_devices,
             qsv_available,
@@ -999,7 +1006,7 @@ impl GigaMuxApp {
                     Ok(name) => (Some(name), thumb.width, thumb.height, None),
                     Err(err) => (None, 0, 0, Some(truncate_cli_err(&err, 800))),
                 },
-                // Don't persist multi-k-line ffmpeg dumps into preview_cache.json.
+                // Don't persist multi‑k‑line ffmpeg dumps into preview_cache.json.
                 Some(Err(err)) => (None, 0, 0, Some(truncate_cli_err(err, 800))),
                 None => (None, 0, 0, None),
             };
@@ -1560,6 +1567,11 @@ impl GigaMuxApp {
                         .maxrate_override_k
                         .map(|k| k.to_string())
                         .unwrap_or_default();
+                    self.cq_override_edit = self
+                        .prefs
+                        .cq_override
+                        .map(|q| q.to_string())
+                        .unwrap_or_default();
                     self.gpu_warn = warn;
                     let _ = prefs::save(&self.prefs);
                     self.refresh_lists();
@@ -1600,7 +1612,9 @@ impl GigaMuxApp {
         if p.bitrate {
             self.prefs.use_peak_bitrate = d.use_peak_bitrate;
             self.prefs.maxrate_override_k = d.maxrate_override_k;
+            self.prefs.cq_override = d.cq_override;
             self.maxrate_override_edit.clear();
+            self.cq_override_edit.clear();
             touched_prefs = true;
             parts.push("bitrate".into());
         }
@@ -1662,6 +1676,7 @@ impl GigaMuxApp {
             return;
         }
         self.commit_maxrate_override_edit();
+        self.commit_cq_override_edit();
         // Block encode until the user fixes AV1-without-nvAV1 (popup).
         if self.av1_nvenc_warning().is_some() {
             self.pending_av1_nvenc = Some(only_name);
@@ -1688,6 +1703,7 @@ impl GigaMuxApp {
             use_peak_bitrate: self.prefs.use_peak_bitrate,
             use_hardware: self.prefs.use_hardware,
             maxrate_override_k: self.prefs.maxrate_override_k,
+            cq_override: self.prefs.cq_override,
             opaque_video: self.prefs.opaque_video,
             opaque_container: self.prefs.opaque_container,
             alpha_video: self.prefs.alpha_video,
@@ -2760,6 +2776,8 @@ impl GigaMuxApp {
             } else if self.history_nav.is_some() {
                 self.cancel_history_nav();
             } else if self.show_settings {
+                self.commit_maxrate_override_edit();
+                self.commit_cq_override_edit();
                 let _ = prefs::save(&self.prefs);
                 self.show_settings = false;
             } else {
@@ -3411,6 +3429,51 @@ impl GigaMuxApp {
             self.commit_maxrate_override_edit();
         }
         ui.label(egui::RichText::new("kbps").weak().small());
+    }
+
+    /// Apply the CQ draft into prefs (empty → default 0; invalid → keep previous).
+    fn commit_cq_override_edit(&mut self) {
+        let trimmed = self.cq_override_edit.trim();
+        let next = if trimmed.is_empty() {
+            None
+        } else {
+            // 0–63 covers NVENC CQ and libvpx CRF; empty means default CQ0.
+            trimmed.parse::<u32>().ok().filter(|&q| q <= 63)
+        };
+        if next.is_none() && !trimmed.is_empty() {
+            self.cq_override_edit = self
+                .prefs
+                .cq_override
+                .map(|q| q.to_string())
+                .unwrap_or_default();
+            return;
+        }
+        // Persist Some(0) as None so the file stays clean for the default.
+        let next = next.filter(|&q| q > 0);
+        if next != self.prefs.cq_override {
+            self.prefs.cq_override = next;
+            self.cq_override_edit = next.map(|q| q.to_string()).unwrap_or_default();
+            self.save_targets();
+        }
+    }
+
+    /// Optional CQ/CRF; empty = default 0. Scales are not cross-codec calibrated.
+    fn ui_cq_override(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("CQ").weak().small());
+        let edit = ui
+            .add(
+                egui::TextEdit::singleline(&mut self.cq_override_edit)
+                    .desired_width(40.0)
+                    .hint_text("0")
+                    .font(egui::TextStyle::Monospace),
+            )
+            .on_hover_text(
+                "Override default CQ0/CRF0 (NVENC -cq / software -crf). Empty = 0. Scales differ by codec — the same number is not the same quality on AV1 vs HEVC. Ignored on opaque QSV VP9 (VBR-only).",
+            );
+        if edit.lost_focus() || (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+        {
+            self.commit_cq_override_edit();
+        }
     }
 
     fn ui_output_targets(&mut self, ui: &mut egui::Ui) {
@@ -4088,7 +4151,7 @@ impl GigaMuxApp {
             ui.add(egui::Image::new((tex.id(), size)).maintain_aspect_ratio(true));
         }
         if let Some(Err(e)) = &entry.thumb {
-            // Never paint raw multi-k-line ffmpeg dumps into egui (freezes the window).
+            // Never paint raw multi‑k‑line ffmpeg dumps into egui (freezes the window).
             let shown = truncate_cli_err(e, 400);
             let truncated = shown.contains("… (stderr truncated)") || e.len() > 400;
             ui.horizontal(|ui| {
@@ -4384,12 +4447,14 @@ impl GigaMuxApp {
             },
         );
         if close {
+            self.commit_maxrate_override_edit();
+            self.commit_cq_override_edit();
             let _ = prefs::save(&self.prefs);
             self.show_settings = false;
         }
     }
 
-    /// Encode tab: hardware, GPU, maxrate, peak ceiling (CQ override lands here later).
+    /// Encode tab: hardware, GPU, maxrate, CQ, peak ceiling.
     fn ui_settings_encode(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let hw_ok = !self.prefs.opaque_video.hardware_encode_unavailable();
@@ -4408,6 +4473,9 @@ impl GigaMuxApp {
                 }
             });
             self.ui_maxrate_override(ui);
+        });
+        ui.horizontal(|ui| {
+            self.ui_cq_override(ui);
         });
         if let Some(warn) = self.av1_nvenc_warning() {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);

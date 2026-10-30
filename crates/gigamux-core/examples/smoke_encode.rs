@@ -21,6 +21,7 @@ fn main() {
         use_peak_bitrate: false,
         use_hardware: true,
         maxrate_override_k: None,
+        cq_override: None,
         opaque_video: OpaqueVideo::Av1,
         opaque_container: OutContainer::Mp4,
         alpha_video: AlphaVideo::Vp9,

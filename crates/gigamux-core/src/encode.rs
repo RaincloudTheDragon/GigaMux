@@ -65,6 +65,8 @@ pub struct EncodeOptions {
     pub use_hardware: bool,
     /// When set, replaces automatic video ceiling (maxrate) in kbps.
     pub maxrate_override_k: Option<u32>,
+    /// When set, replaces default CQ0/CRF0 (`-cq` NVENC / `-crf` software). Ignored on QSV VBR.
+    pub cq_override: Option<u32>,
     pub opaque_video: OpaqueVideo,
     pub opaque_container: OutContainer,
     pub alpha_video: AlphaVideo,
@@ -132,8 +134,14 @@ fn append_audio_args(cmd: &mut Vec<String>, input: &Path, info: &serde_json::Val
     }
 }
 
-fn append_libvpx_opaque_args(cmd: &mut Vec<String>, encoder: &str, ceiling: &str, bufsize: &str) {
-    // Constrained CRF0; libvpx ≥1.17 needs -b:v with -maxrate. VP8/VP9 path is 4:2:0-only here.
+fn append_libvpx_opaque_args(
+    cmd: &mut Vec<String>,
+    encoder: &str,
+    ceiling: &str,
+    bufsize: &str,
+    cq: u32,
+) {
+    // Constrained CRF; libvpx ≥1.17 needs -b:v with -maxrate. VP8/VP9 path is 4:2:0-only here.
     cmd.extend([
         "-c:v".into(),
         encoder.into(),
@@ -156,7 +164,7 @@ fn append_libvpx_opaque_args(cmd: &mut Vec<String>, encoder: &str, ceiling: &str
         "-row-mt".into(),
         "1".into(),
         "-crf".into(),
-        "0".into(),
+        cq.to_string(),
         "-b:v".into(),
         ceiling.into(),
         "-maxrate".into(),
@@ -238,6 +246,7 @@ fn build_qsv_alpha_dual_argv(
     color_ivf: &Path,
     alpha_ivf: &Path,
     bitrate_k: u32,
+    cq: u32,
     color_meta: &VideoColorMeta,
 ) -> Vec<String> {
     let ceiling = format!("{bitrate_k}k");
@@ -309,7 +318,7 @@ fn build_qsv_alpha_dual_argv(
         "-keyint_min".into(),
         "60".into(),
         "-crf".into(),
-        "0".into(),
+        cq.to_string(),
         "-b:v".into(),
         ceiling.clone(),
         "-maxrate".into(),
@@ -384,6 +393,7 @@ fn run_qsv_alpha_hybrid(
     output: &Path,
     info: &serde_json::Value,
     bitrate_k: u32,
+    cq: u32,
     preserve_obs: bool,
     cancel: &AtomicBool,
     mut on_line: impl FnMut(String, Option<f64>),
@@ -406,6 +416,7 @@ fn run_qsv_alpha_hybrid(
         &color_ivf,
         &alpha_ivf,
         bitrate_k,
+        cq,
         &color_meta,
     );
     on_line("hybrid: dual encode (vp9_qsv color + libvpx alpha)".into(), None);
@@ -469,6 +480,7 @@ fn build_cmd(
     has_alpha: bool,
     gpu: GpuChoice,
     bitrate_k: u32,
+    cq: u32,
     preserve_obs: bool,
     use_hardware: bool,
     opaque_video: OpaqueVideo,
@@ -478,6 +490,7 @@ fn build_cmd(
 ) -> Vec<String> {
     let ceiling = format!("{bitrate_k}k");
     let bufsize = format!("{}k", bitrate_k * 2);
+    let cq_s = cq.to_string();
     let out_container = if has_alpha {
         alpha_container
     } else {
@@ -540,7 +553,7 @@ fn build_cmd(
             "-row-mt".into(),
             "1".into(),
             "-crf".into(),
-            "0".into(),
+            cq_s.clone(),
             "-b:v".into(),
             ceiling.clone(),
             "-maxrate".into(),
@@ -550,6 +563,7 @@ fn build_cmd(
         ]);
         append_audio_args(&mut cmd, input, info, out_container);
     } else if use_qsv {
+        // QSV VP9 is VBR-only — no CQ/CRF knob; cq_override is ignored here.
         append_vp9_qsv_args(&mut cmd, out_pix, &ceiling, &bufsize);
         append_color_meta_args(&mut cmd, &video_color_meta(info));
         append_audio_args(&mut cmd, input, info, out_container);
@@ -559,10 +573,11 @@ fn build_cmd(
             opaque_video.ffmpeg_encoder(false),
             &ceiling,
             &bufsize,
+            cq,
         );
         append_audio_args(&mut cmd, input, info, out_container);
     } else if !use_nvenc {
-        // CPU HEVC/H.264/AV1 — keep source chroma/bit-depth; CRF0 capped at source ceiling.
+        // CPU HEVC/H.264/AV1 — keep source chroma/bit-depth; CRF capped at source ceiling.
         let enc = opaque_video.ffmpeg_encoder(false);
         cmd.extend([
             "-c:v".into(),
@@ -570,7 +585,7 @@ fn build_cmd(
             "-pix_fmt".into(),
             out_pix.into(),
             "-crf".into(),
-            "0".into(),
+            cq_s,
             "-b:v".into(),
             ceiling.clone(),
             "-maxrate".into(),
@@ -609,7 +624,7 @@ fn build_cmd(
             "-aq-strength".into(),
             "15".into(),
             "-cq".into(),
-            "0".into(),
+            cq_s,
             "-b:v".into(),
             "0".into(),
             "-maxrate".into(),
@@ -982,6 +997,8 @@ pub fn run_batch(
             Some(k) => (k, format!("override {k}k (auto {auto_k}k / {auto_label})")),
             None => (auto_k, auto_label),
         };
+        // None → CQ0/CRF0 (default near-lossless); Some(n) → opt-in quality trade.
+        let cq = opts.cq_override.unwrap_or(0);
         let use_nvenc = opts.use_hardware && opts.opaque_video.is_nvenc() && !has_alpha;
         let use_qsv = opts.use_hardware && opts.opaque_video.is_qsv() && !has_alpha;
         let use_hybrid = wants_qsv_alpha_hybrid(
@@ -1016,7 +1033,7 @@ pub fn run_batch(
             )
         };
         on_event(EncodeEvent::Log(format!(
-            "{name}: {path_label} → {}, {bitrate_k}k ({src_label}), {device}",
+            "{name}: {path_label} → {}, {bitrate_k}k ({src_label}), cq={cq}, {device}",
             output
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -1070,6 +1087,7 @@ pub fn run_batch(
                 &output,
                 &info,
                 bitrate_k,
+                cq,
                 opts.preserve_obs_metadata,
                 &cancel,
                 &mut on_ffmpeg_line,
@@ -1088,6 +1106,7 @@ pub fn run_batch(
                         has_alpha,
                         opts.gpu,
                         bitrate_k,
+                        cq,
                         opts.preserve_obs_metadata,
                         false, // force CPU α path
                         opts.opaque_video,
@@ -1106,6 +1125,7 @@ pub fn run_batch(
                 has_alpha,
                 opts.gpu,
                 bitrate_k,
+                cq,
                 opts.preserve_obs_metadata,
                 opts.use_hardware,
                 opts.opaque_video,

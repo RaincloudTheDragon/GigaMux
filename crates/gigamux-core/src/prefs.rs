@@ -27,6 +27,9 @@ pub struct Prefs {
     /// When set, replaces the automatic video ceiling (maxrate / bufsize) in kbps.
     #[serde(default)]
     pub maxrate_override_k: Option<u32>,
+    /// When set, replaces default CQ0/CRF0 (`-cq` / `-crf`). Scales differ by codec — not cross-calibrated.
+    #[serde(default)]
+    pub cq_override: Option<u32>,
     #[serde(default)]
     pub opaque_video: OpaqueVideo,
     #[serde(default)]
@@ -57,6 +60,7 @@ impl Default for Prefs {
             use_peak_bitrate: false,
             use_hardware: true,
             maxrate_override_k: None,
+            cq_override: None,
             opaque_video: OpaqueVideo::Av1,
             opaque_container: OutContainer::Mp4,
             alpha_video: AlphaVideo::Vp9,
