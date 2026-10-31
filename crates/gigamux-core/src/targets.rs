@@ -48,7 +48,7 @@ impl OpaqueVideo {
         matches!(self, Self::Vp9)
     }
 
-    /// Opaque VP8 has no NVENC/QSV encode path — Use hardware should stay off/disabled.
+    /// Opaque VP8 never has a HW encode path (UI also greys AV1/VP9 when the machine lacks NVENC/QSV).
     pub fn hardware_encode_unavailable(self) -> bool {
         matches!(self, Self::Vp8)
     }

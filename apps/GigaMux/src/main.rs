@@ -289,10 +289,6 @@ struct GigaMuxApp {
     pending_recycle_delete: Option<RecycleDeletePrompt>,
     /// Recycle Bin failed — confirm permanent delete (or proceed if warnings disabled).
     pending_permanent_delete: Option<PermanentDeletePrompt>,
-    /// AV1 + hardware but no `av1_nvenc` — holds queued encode selection until dismissed/fixed.
-    pending_av1_nvenc: Option<Option<String>>,
-    /// VP9 + hardware but no `vp9_qsv` — holds queued encode selection until dismissed/fixed.
-    pending_qsv_vp9: Option<Option<String>>,
     /// Alt held at launch — choose which prefs / logs to purge.
     pending_purge: Option<PurgePrompt>,
     /// One-by-one delete cascade (list shrinks between each file).
@@ -587,10 +583,7 @@ impl GigaMuxApp {
         let qsv_available = qsv_vp9_available();
         let (gpu, warn) = prefs.gpu.sanitize(&devices);
         prefs.gpu = gpu;
-        // Opaque VP8 never has a HW encoder — don't leave a stale toggle on.
-        if prefs.opaque_video.hardware_encode_unavailable() {
-            prefs.use_hardware = false;
-        }
+        // Opaque VP8 has no HW path: UI greys the checkbox but keeps the prefs flag.
         let maxrate_override_edit = prefs
             .maxrate_override_k
             .map(|k| k.to_string())
@@ -628,8 +621,6 @@ impl GigaMuxApp {
             pending_check: None,
             pending_recycle_delete: None,
             pending_permanent_delete: None,
-            pending_av1_nvenc: None,
-            pending_qsv_vp9: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
             delete_queue: None,
             undo_history: UndoHistory::new(),
@@ -1667,9 +1658,6 @@ impl GigaMuxApp {
         if self.busy || self.delete_queue.is_some() || self.history_nav.is_some() {
             return;
         }
-        if self.pending_av1_nvenc.is_some() || self.pending_qsv_vp9.is_some() {
-            return;
-        }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
             self.push_session("set both input and output folders before Encode");
             self.log_open = true;
@@ -1677,20 +1665,11 @@ impl GigaMuxApp {
         }
         self.commit_maxrate_override_edit();
         self.commit_cq_override_edit();
-        // Block encode until the user fixes AV1-without-nvAV1 (popup).
-        if self.av1_nvenc_warning().is_some() {
-            self.pending_av1_nvenc = Some(only_name);
-            return;
-        }
-        // Same gate for opaque VP9 without Intel QSV.
-        if self.qsv_vp9_warning().is_some() {
-            self.pending_qsv_vp9 = Some(only_name);
-            return;
-        }
+        // Missing AV1 NVENC / QSV: checkbox is greyed; encode falls back to CPU without clearing prefs.
         self.start_encode_now(only_name);
     }
 
-    /// Spawn the encode worker (caller already cleared AV1/QSV / folder guards).
+    /// Spawn the encode worker (caller already cleared folder guards).
     fn start_encode_now(&mut self, only_name: Option<String>) {
         let _ = prefs::save(&self.prefs);
         self.cancel.store(false, Ordering::Relaxed);
@@ -1701,7 +1680,8 @@ impl GigaMuxApp {
             gpu: self.prefs.gpu,
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
-            use_hardware: self.prefs.use_hardware,
+            // Prefer prefs, but only when the current opaque target has a HW path on this machine.
+            use_hardware: self.effective_use_hardware(),
             maxrate_override_k: self.prefs.maxrate_override_k,
             cq_override: self.prefs.cq_override,
             opaque_video: self.prefs.opaque_video,
@@ -2759,10 +2739,6 @@ impl GigaMuxApp {
         if esc {
             if self.pending_purge.is_some() {
                 self.pending_purge = None;
-            } else if self.pending_av1_nvenc.is_some() {
-                self.pending_av1_nvenc = None;
-            } else if self.pending_qsv_vp9.is_some() {
-                self.pending_qsv_vp9 = None;
             } else if self.pending_permanent_delete.is_some() {
                 self.pending_permanent_delete = None;
                 if let Some(q) = self.delete_queue.as_mut() {
@@ -3323,43 +3299,79 @@ impl GigaMuxApp {
         None
     }
 
-    /// Amber when opaque AV1 + hardware but no GPU can run `av1_nvenc` (pre-Ada, etc.).
-    fn av1_nvenc_warning(&self) -> Option<String> {
-        if !self.prefs.use_hardware || self.prefs.opaque_video != OpaqueVideo::Av1 {
-            return None;
-        }
-        let ok = match self.prefs.gpu {
+    /// True when the selected GPU can run `av1_nvenc`.
+    fn av1_nvenc_ok_for_gpu(&self) -> bool {
+        match self.prefs.gpu {
             GpuChoice::Any => !self.av1_devices.is_empty(),
             GpuChoice::Index(i) => self.av1_devices.iter().any(|d| d.index == i),
-        };
-        if ok {
-            return None;
-        }
-        if self.av1_devices.is_empty() {
-            Some(
-                "AV1 NVENC not available on this GPU — turn off Use hardware (libaom) or pick HEVC/H.264"
-                    .into(),
-            )
-        } else {
-            Some(
-                "Selected GPU has no AV1 NVENC — pick Any/another GPU, HEVC/H.264, or turn off Use hardware"
-                    .into(),
-            )
         }
     }
 
-    /// Amber when opaque VP9 + hardware but `vp9_qsv` smoke failed (no capable Intel iGPU).
-    fn qsv_vp9_warning(&self) -> Option<String> {
-        if !self.prefs.use_hardware || self.prefs.opaque_video != OpaqueVideo::Vp9 {
-            return None;
+    /// Whether opaque Use hardware can apply on this machine for the current codec (else grey the checkbox).
+    fn opaque_hardware_path_available(&self) -> bool {
+        match self.prefs.opaque_video {
+            OpaqueVideo::Vp8 => false,
+            OpaqueVideo::Av1 => self.av1_nvenc_ok_for_gpu(),
+            OpaqueVideo::Vp9 => self.qsv_available,
+            OpaqueVideo::Hevc | OpaqueVideo::H264 => true,
         }
-        if self.qsv_available {
-            return None;
+    }
+
+    /// Prefs flag and a usable opaque HW path (AV1/VP9 fall back to CPU when greying without clearing prefs).
+    fn effective_use_hardware(&self) -> bool {
+        self.prefs.use_hardware && self.opaque_hardware_path_available()
+    }
+
+    /// Hover for Use hardware: default help, or why the box is greyed (preference kept).
+    fn hardware_checkbox_hover(&self) -> String {
+        if self.opaque_hardware_path_available() {
+            return "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm (falls back to full libvpx). Off: CPU.".into();
         }
-        Some(
-            "Intel QSV VP9 not available — turn off Use hardware (libvpx) or pick HEVC/H.264/AV1"
-                .into(),
-        )
+        match self.prefs.opaque_video {
+            OpaqueVideo::Av1 if self.av1_devices.is_empty() => {
+                "AV1 NVENC not available on this GPU. Checkbox greyed (preference kept). Encode uses libaom (CPU) for AV1, or pick HEVC/H.264."
+                    .into()
+            }
+            OpaqueVideo::Av1 => {
+                "Selected GPU has no AV1 NVENC. Checkbox greyed (preference kept). Pick Any/another GPU or HEVC/H.264; AV1 encode uses libaom while greyed."
+                    .into()
+            }
+            OpaqueVideo::Vp9 => {
+                "Intel QSV VP9 not available. Checkbox greyed (preference kept). Encode uses libvpx (CPU) for VP9, or pick HEVC/H.264/AV1."
+                    .into()
+            }
+            OpaqueVideo::Vp8 => {
+                "Opaque VP8 has no HW path. Checkbox greyed (preference kept)."
+                    .into()
+            }
+            OpaqueVideo::Hevc | OpaqueVideo::H264 => {
+                "Use hardware unavailable for this target.".into()
+            }
+        }
+    }
+
+    /// Use hardware checkbox: visually muted when the opaque path has no HW on this machine.
+    /// Still fully interactive (prefs kept for other codecs); encode falls back to CPU while muted.
+    /// Explanation is hover/click only (no always-on amber line).
+    fn ui_use_hardware_checkbox(&mut self, ui: &mut egui::Ui, persist: impl FnOnce(&mut Self)) {
+        let hw_ok = self.opaque_hardware_path_available();
+        let hover = self.hardware_checkbox_hover();
+        let resp = ui
+            .scope(|ui| {
+                if !hw_ok {
+                    ui.multiply_opacity(0.45);
+                }
+                ui.checkbox(&mut self.prefs.use_hardware, "Use hardware")
+            })
+            .inner;
+        let changed = resp.changed();
+        if !hw_ok && (resp.clicked() || resp.secondary_clicked()) {
+            resp.show_tooltip_text(&hover);
+        }
+        resp.on_hover_text(hover);
+        if changed {
+            persist(self);
+        }
     }
 
     /// Amber line when any input’s chroma/bit-depth can’t be matched for the current target.
@@ -3487,10 +3499,6 @@ impl GigaMuxApp {
                 self.prefs.opaque_video = next;
                 self.prefs.opaque_container =
                     gigamux_core::targets::clamp_opaque_container(next, self.prefs.opaque_container);
-                // VP8 has no HW encode path — force software.
-                if next.hardware_encode_unavailable() {
-                    self.prefs.use_hardware = false;
-                }
                 self.save_targets();
             }
             let c = self.prefs.opaque_container;
@@ -3518,29 +3526,9 @@ impl GigaMuxApp {
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let hw_ok = !self.prefs.opaque_video.hardware_encode_unavailable();
-            if !hw_ok {
-                self.prefs.use_hardware = false;
-            }
-            ui.add_enabled_ui(hw_ok, |ui| {
-                if ui
-                    .checkbox(&mut self.prefs.use_hardware, "Use hardware")
-                    .on_hover_text(
-                        "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm (falls back to full libvpx). Off: CPU. Opaque VP8 has no HW path.",
-                    )
-                    .changed()
-                {
-                    self.save_targets();
-                }
-            });
+            self.ui_use_hardware_checkbox(ui, |s| s.save_targets());
             self.ui_maxrate_override(ui);
         });
-        if let Some(warn) = self.av1_nvenc_warning() {
-            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
-        }
-        if let Some(warn) = self.qsv_vp9_warning() {
-            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
-        }
         if let Some(warn) = self.chroma_convert_warning() {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
         }
@@ -4457,32 +4445,14 @@ impl GigaMuxApp {
     /// Encode tab: hardware, GPU, maxrate, CQ, peak ceiling.
     fn ui_settings_encode(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let hw_ok = !self.prefs.opaque_video.hardware_encode_unavailable();
-            if !hw_ok {
-                self.prefs.use_hardware = false;
-            }
-            ui.add_enabled_ui(hw_ok, |ui| {
-                if ui
-                    .checkbox(&mut self.prefs.use_hardware, "Use hardware")
-                    .on_hover_text(
-                        "On: NVENC for HEVC/H.264/AV1; QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm. Off: CPU. Opaque VP8 has no HW path.",
-                    )
-                    .changed()
-                {
-                    let _ = prefs::save(&self.prefs);
-                }
+            self.ui_use_hardware_checkbox(ui, |s| {
+                let _ = prefs::save(&s.prefs);
             });
             self.ui_maxrate_override(ui);
         });
         ui.horizontal(|ui| {
             self.ui_cq_override(ui);
         });
-        if let Some(warn) = self.av1_nvenc_warning() {
-            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
-        }
-        if let Some(warn) = self.qsv_vp9_warning() {
-            ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
-        }
         ui.add_enabled_ui(self.prefs.use_hardware, |ui| {
             ui.horizontal(|ui| {
                 ui.label("GPU");
@@ -4753,106 +4723,6 @@ impl GigaMuxApp {
                             );
                         }
                     });
-            });
-    }
-
-    /// Block encode when AV1 + hardware but `av1_nvenc` is missing; offer fix-and-continue.
-    fn ui_av1_nvenc_prompt(&mut self, ctx: &egui::Context) {
-        let Some(only_name) = self.pending_av1_nvenc.clone() else {
-            return;
-        };
-        let msg = self.av1_nvenc_warning().unwrap_or_else(|| {
-            "AV1 NVENC is not available for the current GPU / hardware setting.".into()
-        });
-        egui::Window::new("AV1 NVENC unavailable")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), &msg);
-                ui.add_space(4.0);
-                ui.label("Encode would fail with the current targets. Fix the setting, then continue:");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        self.pending_av1_nvenc = None;
-                    }
-                    if ui
-                        .button("Turn off hardware")
-                        .on_hover_text("Use libaom-av1 (CPU) for this encode")
-                        .clicked()
-                    {
-                        self.prefs.use_hardware = false;
-                        self.save_targets();
-                        self.pending_av1_nvenc = None;
-                        self.start_encode_now(only_name.clone());
-                    }
-                    if ui
-                        .button("Use HEVC")
-                        .on_hover_text("Switch opaque target to HEVC (NVENC on this GPU)")
-                        .clicked()
-                    {
-                        self.prefs.opaque_video = OpaqueVideo::Hevc;
-                        self.prefs.opaque_container =
-                            gigamux_core::targets::clamp_opaque_container(
-                                OpaqueVideo::Hevc,
-                                self.prefs.opaque_container,
-                            );
-                        self.save_targets();
-                        self.pending_av1_nvenc = None;
-                        self.start_encode_now(only_name);
-                    }
-                });
-            });
-    }
-
-    /// Block encode when VP9 + hardware but `vp9_qsv` is missing; offer fix-and-continue.
-    fn ui_qsv_vp9_prompt(&mut self, ctx: &egui::Context) {
-        let Some(only_name) = self.pending_qsv_vp9.clone() else {
-            return;
-        };
-        let msg = self.qsv_vp9_warning().unwrap_or_else(|| {
-            "Intel QSV VP9 is not available on this system.".into()
-        });
-        egui::Window::new("Intel QSV VP9 unavailable")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), &msg);
-                ui.add_space(4.0);
-                ui.label("Encode would fail with the current targets. Fix the setting, then continue:");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        self.pending_qsv_vp9 = None;
-                    }
-                    if ui
-                        .button("Turn off hardware")
-                        .on_hover_text("Use libvpx-vp9 (CPU) for this encode")
-                        .clicked()
-                    {
-                        self.prefs.use_hardware = false;
-                        self.save_targets();
-                        self.pending_qsv_vp9 = None;
-                        self.start_encode_now(only_name.clone());
-                    }
-                    if ui
-                        .button("Use HEVC")
-                        .on_hover_text("Switch opaque target to HEVC (NVENC when available)")
-                        .clicked()
-                    {
-                        self.prefs.opaque_video = OpaqueVideo::Hevc;
-                        self.prefs.opaque_container =
-                            gigamux_core::targets::clamp_opaque_container(
-                                OpaqueVideo::Hevc,
-                                self.prefs.opaque_container,
-                            );
-                        self.save_targets();
-                        self.pending_qsv_vp9 = None;
-                        self.start_encode_now(only_name);
-                    }
-                });
             });
     }
 
@@ -5445,8 +5315,6 @@ impl eframe::App for GigaMuxApp {
 
         self.ui_settings(&ctx);
         self.ui_purge_prefs_prompt(&ctx);
-        self.ui_av1_nvenc_prompt(&ctx);
-        self.ui_qsv_vp9_prompt(&ctx);
         self.ui_check_prompt(&ctx);
         self.ui_recycle_delete_prompt(&ctx);
         self.ui_permanent_delete_prompt(&ctx);
