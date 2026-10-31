@@ -44,6 +44,9 @@ pub struct Prefs {
     /// Confirm before a permanent (non–Recycle Bin) delete. Default on.
     #[serde(default = "default_true")]
     pub warn_permanent_delete: bool,
+    /// Play a short system chime when an encode / VMAF / check batch finishes. Default on.
+    #[serde(default = "default_true")]
+    pub job_done_chime: bool,
 }
 
 fn default_true() -> bool {
@@ -67,6 +70,7 @@ impl Default for Prefs {
             alpha_container: OutContainer::Webm,
             warn_recycle_delete: true,
             warn_permanent_delete: true,
+            job_done_chime: true,
         }
     }
 }

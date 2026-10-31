@@ -1613,6 +1613,7 @@ impl GigaMuxApp {
             self.prefs.preserve_obs_metadata = d.preserve_obs_metadata;
             self.prefs.warn_recycle_delete = d.warn_recycle_delete;
             self.prefs.warn_permanent_delete = d.warn_permanent_delete;
+            self.prefs.job_done_chime = d.job_done_chime;
             touched_prefs = true;
             parts.push("misc".into());
         }
@@ -3084,6 +3085,9 @@ impl GigaMuxApp {
             self.job = None;
             self.encode_progress = None;
             self.event_rx = None;
+            if self.prefs.job_done_chime {
+                play_job_done_chime();
+            }
         } else {
             self.event_rx = Some(rx);
             // Snappy refresh while ffmpeg progress lines stream in.
@@ -4555,6 +4559,15 @@ impl GigaMuxApp {
         {
             let _ = prefs::save(&self.prefs);
         }
+        if ui
+            .checkbox(&mut self.prefs.job_done_chime, "Chime when jobs finish")
+            .on_hover_text(
+                "Play a short system sound when an encode, VMAF, or check batch completes.",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
     }
 
     /// Alt-at-launch: pick which prefs slices / logs to purge.
@@ -5157,6 +5170,28 @@ fn trim_log(lines: &mut Vec<String>) {
     if lines.len() > 500 {
         let drain = lines.len() - 500;
         lines.drain(0..drain);
+    }
+}
+
+/// Short system sound when a batch job finishes (encode / VMAF / check).
+fn play_job_done_chime() {
+    #[cfg(windows)]
+    {
+        use windows::core::w;
+        use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
+        // SystemAsterisk alias, async so the UI thread is not blocked.
+        let _ = unsafe {
+            PlaySoundW(
+                w!("SystemAsterisk"),
+                None,
+                SND_ALIAS | SND_ASYNC | SND_NODEFAULT,
+            )
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        // Terminal bell as a light fallback elsewhere.
+        eprint!("\x07");
     }
 }
 
