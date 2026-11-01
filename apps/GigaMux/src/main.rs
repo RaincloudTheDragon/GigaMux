@@ -15,8 +15,8 @@ use eframe::egui;
 mod taskbar_progress;
 
 use gigamux_core::check::{
-    deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, restore_trashed_file,
-    run_check, trash_file, CheckIssue, CheckReport,
+    deletable_issues, delete_issue_outputs, is_orphan_output_issue, list_media,
+    permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue, CheckReport,
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::vmaf::{run_vmaf, VmafEvent, VmafReport};
@@ -499,7 +499,10 @@ impl UndoStep {
 #[derive(Clone)]
 struct CheckPrompt {
     issue_count: usize,
+    /// All on-disk outputs Check would offer to delete (before orphan filter).
     deletable: Vec<CheckIssue>,
+    /// Skip outputs with no matching input stem (from prefs; editable in the dialog).
+    ignore_orphans: bool,
 }
 
 /// Shared fields for delete confirmation dialogs (one or many basenames).
@@ -1614,6 +1617,7 @@ impl GigaMuxApp {
             self.prefs.warn_recycle_delete = d.warn_recycle_delete;
             self.prefs.warn_permanent_delete = d.warn_permanent_delete;
             self.prefs.job_done_chime = d.job_done_chime;
+            self.prefs.check_ignore_orphan_outputs = d.check_ignore_orphan_outputs;
             touched_prefs = true;
             parts.push("misc".into());
         }
@@ -3151,14 +3155,17 @@ impl GigaMuxApp {
             report.ok_pairs,
             report.issues.len()
         ));
-        let deletable: Vec<CheckIssue> = deletable_issues(&self.prefs.output_dir, &report.issues)
-            .into_iter()
-            .cloned()
-            .collect();
+        // Full deletable set; orphan filter applied in the prompt via `ignore_orphans`.
+        let deletable: Vec<CheckIssue> =
+            deletable_issues(&self.prefs.output_dir, &report.issues, false)
+                .into_iter()
+                .cloned()
+                .collect();
         // Always warn that files are not intact; delete only offered when outputs exist.
         self.pending_check = Some(CheckPrompt {
             issue_count: report.issues.len(),
             deletable,
+            ignore_orphans: self.prefs.check_ignore_orphan_outputs,
         });
     }
 
@@ -4568,6 +4575,18 @@ impl GigaMuxApp {
         {
             let _ = prefs::save(&self.prefs);
         }
+        if ui
+            .checkbox(
+                &mut self.prefs.check_ignore_orphan_outputs,
+                "Check: ignore outputs without inputs",
+            )
+            .on_hover_text(
+                "When Check offers to delete bad outputs, leave alone files with no matching input stem. Also available on the Check dialog.",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
     }
 
     /// Alt-at-launch: pick which prefs slices / logs to purge.
@@ -4848,6 +4867,17 @@ impl GigaMuxApp {
         let Some(prompt) = self.pending_check.clone() else {
             return;
         };
+        let orphan_n = prompt
+            .deletable
+            .iter()
+            .filter(|i| is_orphan_output_issue(i))
+            .count();
+        let to_delete: Vec<CheckIssue> = prompt
+            .deletable
+            .iter()
+            .filter(|i| !(prompt.ignore_orphans && is_orphan_output_issue(i)))
+            .cloned()
+            .collect();
         egui::Window::new("Check found issues")
             .collapsible(false)
             .resizable(false)
@@ -4857,8 +4887,39 @@ impl GigaMuxApp {
                     "{} file(s) are not intact (missing, mismatched, or incomplete).",
                     prompt.issue_count
                 ));
+                if orphan_n > 0 {
+                    let mut ignore = prompt.ignore_orphans;
+                    if ui
+                        .checkbox(
+                            &mut ignore,
+                            format!("Ignore outputs without inputs ({orphan_n})"),
+                        )
+                        .on_hover_text(
+                            "Leave alone outputs whose stem has no matching input. Still logged as issues; excluded from Delete outputs.",
+                        )
+                        .changed()
+                    {
+                        if let Some(p) = self.pending_check.as_mut() {
+                            p.ignore_orphans = ignore;
+                        }
+                        self.prefs.check_ignore_orphan_outputs = ignore;
+                        let _ = prefs::save(&self.prefs);
+                    }
+                }
                 if prompt.deletable.is_empty() {
                     ui.label("No problematic output files to delete.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Open session log").clicked() {
+                            self.log_open = true;
+                            self.log_show_session = true;
+                            self.pending_check = None;
+                        }
+                        if ui.button("OK").clicked() {
+                            self.pending_check = None;
+                        }
+                    });
+                } else if to_delete.is_empty() {
+                    ui.label("No problematic output files to delete (orphans ignored).");
                     ui.horizontal(|ui| {
                         if ui.button("Open session log").clicked() {
                             self.log_open = true;
@@ -4872,12 +4933,12 @@ impl GigaMuxApp {
                 } else {
                     ui.label(format!(
                         "Delete {} problematic output file(s)?",
-                        prompt.deletable.len()
+                        to_delete.len()
                     ));
                     ui.horizontal(|ui| {
                         if ui.button("Delete outputs").clicked() {
                             let (deleted, failed, trashed) =
-                                delete_issue_outputs(&self.prefs.output_dir, &prompt.deletable);
+                                delete_issue_outputs(&self.prefs.output_dir, &to_delete);
                             self.push_undo_step(UndoStep::Delete(DeleteUndoBatch {
                                 side: FileSide::Output,
                                 paths: trashed,

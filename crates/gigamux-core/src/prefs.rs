@@ -47,6 +47,9 @@ pub struct Prefs {
     /// Play a short system chime when an encode / VMAF / check batch finishes. Default on.
     #[serde(default = "default_true")]
     pub job_done_chime: bool,
+    /// When deleting after Check, skip outputs with no matching input stem. Default off.
+    #[serde(default)]
+    pub check_ignore_orphan_outputs: bool,
 }
 
 fn default_true() -> bool {
@@ -71,6 +74,7 @@ impl Default for Prefs {
             warn_recycle_delete: true,
             warn_permanent_delete: true,
             job_done_chime: true,
+            check_ignore_orphan_outputs: false,
         }
     }
 }

@@ -12,8 +12,8 @@ pub mod vmaf;
 pub mod webm_alpha;
 
 pub use check::{
-    deletable_issues, delete_issue_outputs, list_media, permanent_delete_file, restore_trashed_file,
-    run_check, trash_file, CheckIssue, CheckReport,
+    deletable_issues, delete_issue_outputs, is_orphan_output_issue, list_media,
+    permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue, CheckReport,
 };
 pub use encode::{run_batch, EncodeEvent, EncodeOptions};
 pub use job_log::{

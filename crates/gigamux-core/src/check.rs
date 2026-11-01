@@ -459,6 +459,11 @@ pub fn run_check(
     Ok(report)
 }
 
+/// Output exists on disk with no matching input stem (`Missing from input`).
+pub fn is_orphan_output_issue(issue: &CheckIssue) -> bool {
+    issue.input.is_none() && issue.output.is_some()
+}
+
 /// True when this issue points at an on-disk output that delete would remove.
 /// Skips “Missing from output” (no file exists) and input-only probe failures.
 pub fn issue_has_deletable_output(output_dir: &Path, issue: &CheckIssue) -> bool {
@@ -472,10 +477,16 @@ pub fn issue_has_deletable_output(output_dir: &Path, issue: &CheckIssue) -> bool
 }
 
 /// Issues whose outputs would actually be deleted (for prompting).
-pub fn deletable_issues<'a>(output_dir: &Path, issues: &'a [CheckIssue]) -> Vec<&'a CheckIssue> {
+/// When `ignore_orphans`, skips outputs that have no matching input stem.
+pub fn deletable_issues<'a>(
+    output_dir: &Path,
+    issues: &'a [CheckIssue],
+    ignore_orphans: bool,
+) -> Vec<&'a CheckIssue> {
     issues
         .iter()
         .filter(|i| issue_has_deletable_output(output_dir, i))
+        .filter(|i| !(ignore_orphans && is_orphan_output_issue(i)))
         .collect()
 }
 
