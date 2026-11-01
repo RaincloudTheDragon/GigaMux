@@ -15,8 +15,9 @@ use eframe::egui;
 mod taskbar_progress;
 
 use gigamux_core::check::{
-    deletable_issues, delete_issue_outputs, is_orphan_output_issue, list_media,
-    permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue, CheckReport,
+    deletable_issues, delete_issue_outputs, is_codec_mismatch_issue, is_orphan_output_issue,
+    list_media, permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue,
+    CheckReport,
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::vmaf::{run_vmaf, VmafEvent, VmafReport};
@@ -3144,7 +3145,12 @@ impl GigaMuxApp {
                 (None, Some(o)) => o.clone(),
                 (None, None) => "?".into(),
             };
-            let line = format!("ISSUE {label}: {}", issue.message);
+            // Codec mismatch / orphan output: warn (yellow), not a broken pair.
+            let line = if is_codec_mismatch_issue(issue) || is_orphan_output_issue(issue) {
+                format!("WARN {label}: {}", issue.message)
+            } else {
+                format!("ISSUE {label}: {}", issue.message)
+            };
             if let Some(inp) = &issue.input {
                 self.push_file_log(inp, &line);
             }
@@ -5202,6 +5208,12 @@ fn log_line_color(line: &str) -> egui::Color32 {
         egui::Color32::from_rgb(180, 120, 220)
     } else if lower.starts_with("ffmpeg:") {
         egui::Color32::from_rgb(90, 200, 120)
+    } else if lower.starts_with("warn")
+        || lower.contains("skip")
+        || lower.contains("cancel")
+    {
+        // WARN (codec mismatch / orphan output) before the generic "missing" → red path.
+        egui::Color32::from_rgb(220, 180, 60)
     } else if lower.contains("issue")
         || lower.contains("error")
         || lower.contains("fail")
@@ -5209,8 +5221,6 @@ fn log_line_color(line: &str) -> egui::Color32 {
         || lower.contains("missing")
     {
         egui::Color32::from_rgb(230, 90, 90)
-    } else if lower.contains("skip") || lower.contains("cancel") || lower.contains("warn") {
-        egui::Color32::from_rgb(220, 180, 60)
     } else if lower.contains("done")
         || lower.contains("check ok")
         || lower.starts_with("finished")

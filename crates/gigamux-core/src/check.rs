@@ -464,10 +464,15 @@ pub fn is_orphan_output_issue(issue: &CheckIssue) -> bool {
     issue.input.is_none() && issue.output.is_some()
 }
 
+/// Target codec differs from current prefs (file is intact; not a delete candidate).
+pub fn is_codec_mismatch_issue(issue: &CheckIssue) -> bool {
+    issue.message.starts_with("Codec mismatch:")
+}
+
 /// True when this issue points at an on-disk output that delete would remove.
-/// Skips “Missing from output” (no file exists) and input-only probe failures.
+/// Skips “Missing from output”, codec mismatches (warn-only), and input-only probe failures.
 pub fn issue_has_deletable_output(output_dir: &Path, issue: &CheckIssue) -> bool {
-    if issue.message.starts_with("Missing from output") {
+    if issue.message.starts_with("Missing from output") || is_codec_mismatch_issue(issue) {
         return false;
     }
     let Some(name) = &issue.output else {
