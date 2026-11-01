@@ -1810,6 +1810,8 @@ impl GigaMuxApp {
         }
         if let Some(other) = self.counterpart_name(side, &name) {
             self.select_file(target, other);
+            // Keep the landed row on-screen (same path as ↑/↓ / Home/End).
+            self.scroll_sel_into_view = true;
         }
     }
 
@@ -3725,13 +3727,22 @@ impl GigaMuxApp {
                             let resp = row.inner;
                             // Full row (name + chips) for marquee hit-testing.
                             row_rects.push((name.clone(), row.response.rect));
-                            // Keyboard nav asks once; keep the primary row on-screen.
+                            // Keyboard nav asks once; snap only if the row is off-screen.
                             if self.scroll_sel_into_view
                                 && self.active.as_ref().is_some_and(|(s, n)| {
                                     *s == side && n == &name
                                 })
                             {
-                                resp.scroll_to_me(Some(egui::Align::Center));
+                                let clip = ui.clip_rect();
+                                let row = resp.rect;
+                                let on_screen = clip.y_range().contains(row.top())
+                                    && clip.y_range().contains(row.bottom());
+                                if !on_screen {
+                                    resp.scroll_to_me_animation(
+                                        Some(egui::Align::Center),
+                                        egui::style::ScrollAnimation::none(),
+                                    );
+                                }
                                 self.scroll_sel_into_view = false;
                             }
                             if resp.clicked() && !renaming {
