@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::check::list_media;
 use crate::job_log::{JobLog, JobLogKind};
 use crate::probe::{file_info, video_has_alpha};
-use crate::targets::OutputTargets;
+use crate::targets::{OutputTargets, TestBatch};
 
 /// One file pair’s VMAF outcome.
 #[derive(Debug, Clone)]
@@ -282,6 +282,7 @@ fn resolve_pairs(
     input_dir: &Path,
     output_dir: &Path,
     targets: OutputTargets,
+    test_slot2: Option<OutputTargets>,
     only_basename: Option<&str>,
 ) -> Result<Vec<(String, String, PathBuf, PathBuf, f64)>, String> {
     let inputs = list_media(input_dir, true);
@@ -290,6 +291,14 @@ fn resolve_pairs(
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
+
+    let slots: Vec<(Option<TestBatch>, OutputTargets)> = match test_slot2 {
+        Some(slot2) => vec![
+            (Some(TestBatch::One), targets),
+            (Some(TestBatch::Two), slot2),
+        ],
+        None => vec![(None, targets)],
+    };
 
     let mut pairs = Vec::new();
     for inp in &inputs {
@@ -305,7 +314,9 @@ fn resolve_pairs(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(only);
-            if in_name != only && in_stem != only_stem {
+            // Allow selecting either the input or a testN_ output basename.
+            let only_pair = crate::targets::pair_stem(only);
+            if in_name != only && in_stem != only_stem && in_stem != only_pair.as_str() {
                 continue;
             }
         }
@@ -314,23 +325,32 @@ fn resolve_pairs(
             Err(e) => return Err(format!("{in_name}: probe failed: {e}")),
         };
         let has_alpha = video_has_alpha(&info);
-        let out_name = targets.expected_name(&in_name, has_alpha);
-        if !output_set.contains(&out_name) {
-            if only_basename.is_some() {
-                return Err(format!(
-                    "no output for {in_name} (expected {out_name})"
-                ));
-            }
-            continue;
-        }
         let duration_s = format_duration_s(&info);
-        pairs.push((
-            in_name,
-            out_name.clone(),
-            inp.clone(),
-            output_dir.join(&out_name),
-            duration_s,
-        ));
+        let mut any_for_input = false;
+        for &(batch, slot) in &slots {
+            let out_name = slot.expected_name_for(&in_name, has_alpha, batch);
+            if !output_set.contains(&out_name) {
+                continue;
+            }
+            any_for_input = true;
+            pairs.push((
+                in_name.clone(),
+                out_name.clone(),
+                inp.clone(),
+                output_dir.join(&out_name),
+                duration_s,
+            ));
+        }
+        if only_basename.is_some() && !any_for_input {
+            let expected: Vec<String> = slots
+                .iter()
+                .map(|&(batch, slot)| slot.expected_name_for(&in_name, has_alpha, batch))
+                .collect();
+            return Err(format!(
+                "no output for {in_name} (expected {})",
+                expected.join(" / ")
+            ));
+        }
     }
     if pairs.is_empty() {
         return Err(if only_basename.is_some() {
@@ -344,10 +364,12 @@ fn resolve_pairs(
 
 /// Score one pair (`only_basename`) or every matched pair under the folders.
 /// Also writes a gzipped per-job log under `%APPDATA%\GigaMux\config\logs\`.
+/// When `test_slot2` is set, scores input→test1 and input→test2 for each input.
 pub fn run_vmaf(
     input_dir: &Path,
     output_dir: &Path,
     targets: OutputTargets,
+    test_slot2: Option<OutputTargets>,
     only_basename: Option<String>,
     cancel: &AtomicBool,
     mut on_event: impl FnMut(VmafEvent),
@@ -386,6 +408,7 @@ pub fn run_vmaf(
         input_dir,
         output_dir,
         targets,
+        test_slot2,
         only_basename.as_deref(),
     ) {
         Ok(p) => p,

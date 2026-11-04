@@ -9,18 +9,16 @@ use serde::{Deserialize, Serialize};
 use crate::gpu::GpuChoice;
 use crate::targets::{
     clamp_alpha_container, clamp_opaque_container, AlphaVideo, OpaqueVideo, OutContainer,
+    OutputTargets, TestBatch,
 };
 
-/// Persisted UI / encode settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Prefs {
-    pub input_dir: PathBuf,
-    pub output_dir: PathBuf,
-    pub gpu: GpuChoice,
-    pub preserve_obs_metadata: bool,
-    /// When true, encode ceiling uses 1s video peak; default is average rate (CBR-oriented).
-    #[serde(default)]
-    pub use_peak_bitrate: bool,
+fn default_true() -> bool {
+    true
+}
+
+/// One encode target slot (codec/container + HW/maxrate/CQ).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncodeSlot {
     /// NVENC for HEVC/H.264/AV1 when true; CPU encoders when false. Default on.
     #[serde(default = "default_true")]
     pub use_hardware: bool,
@@ -38,6 +36,74 @@ pub struct Prefs {
     pub alpha_video: AlphaVideo,
     #[serde(default)]
     pub alpha_container: OutContainer,
+}
+
+impl Default for EncodeSlot {
+    fn default() -> Self {
+        Self {
+            use_hardware: true,
+            maxrate_override_k: None,
+            cq_override: None,
+            opaque_video: OpaqueVideo::Av1,
+            opaque_container: OutContainer::Mp4,
+            alpha_video: AlphaVideo::Vp9,
+            alpha_container: OutContainer::Webm,
+        }
+    }
+}
+
+impl EncodeSlot {
+    /// Sensible A/B partner for slot1’s AV1 default (HEVC at the same HW/CQ posture).
+    pub fn default_slot2() -> Self {
+        Self {
+            opaque_video: OpaqueVideo::Hevc,
+            opaque_container: OutContainer::Mp4,
+            ..Self::default()
+        }
+    }
+
+    pub fn sanitize(&mut self) {
+        self.opaque_container = clamp_opaque_container(self.opaque_video, self.opaque_container);
+        self.alpha_container = clamp_alpha_container(self.alpha_video, self.alpha_container);
+    }
+
+    pub fn container_for(&self, has_alpha: bool) -> OutContainer {
+        if has_alpha {
+            self.alpha_container
+        } else {
+            self.opaque_container
+        }
+    }
+
+    pub fn output_targets(&self) -> OutputTargets {
+        OutputTargets {
+            opaque_video: self.opaque_video,
+            opaque_container: self.opaque_container,
+            alpha_video: self.alpha_video,
+            alpha_container: self.alpha_container,
+        }
+    }
+}
+
+/// Persisted UI / encode settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Prefs {
+    pub input_dir: PathBuf,
+    pub output_dir: PathBuf,
+    pub gpu: GpuChoice,
+    pub preserve_obs_metadata: bool,
+    /// When true, encode ceiling uses 1s video peak; default is average rate (CBR-oriented).
+    #[serde(default)]
+    pub use_peak_bitrate: bool,
+    /// Dual full-frame A/B encodes (`test1_*` / `test2_*`).
+    #[serde(default)]
+    pub test_mode: bool,
+    /// Primary encode slot — flattened so older prefs.json keeps working.
+    #[serde(flatten)]
+    pub slot1: EncodeSlot,
+    /// Secondary encode slot (used when `test_mode` is on).
+    #[serde(default = "EncodeSlot::default_slot2")]
+    pub slot2: EncodeSlot,
     /// Confirm before moving a file to the Recycle Bin. Default on.
     #[serde(default = "default_true")]
     pub warn_recycle_delete: bool,
@@ -52,10 +118,6 @@ pub struct Prefs {
     pub check_ignore_orphan_outputs: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -64,13 +126,9 @@ impl Default for Prefs {
             gpu: GpuChoice::Any,
             preserve_obs_metadata: false,
             use_peak_bitrate: false,
-            use_hardware: true,
-            maxrate_override_k: None,
-            cq_override: None,
-            opaque_video: OpaqueVideo::Av1,
-            opaque_container: OutContainer::Mp4,
-            alpha_video: AlphaVideo::Vp9,
-            alpha_container: OutContainer::Webm,
+            test_mode: false,
+            slot1: EncodeSlot::default(),
+            slot2: EncodeSlot::default_slot2(),
             warn_recycle_delete: true,
             warn_permanent_delete: true,
             job_done_chime: true,
@@ -82,17 +140,28 @@ impl Default for Prefs {
 impl Prefs {
     /// Clamp illegal codec×container pairs (load / import / toggle).
     pub fn sanitize_targets(&mut self) {
-        self.opaque_container = clamp_opaque_container(self.opaque_video, self.opaque_container);
-        self.alpha_container = clamp_alpha_container(self.alpha_video, self.alpha_container);
+        self.slot1.sanitize();
+        self.slot2.sanitize();
     }
 
-    /// Container for a given alpha flag.
-    pub fn container_for(&self, has_alpha: bool) -> OutContainer {
-        if has_alpha {
-            self.alpha_container
-        } else {
-            self.opaque_container
+    /// Mutable slot by test batch (Test1 = slot1, Test2 = slot2).
+    pub fn slot_mut(&mut self, batch: TestBatch) -> &mut EncodeSlot {
+        match batch {
+            TestBatch::One => &mut self.slot1,
+            TestBatch::Two => &mut self.slot2,
         }
+    }
+
+    pub fn slot(&self, batch: TestBatch) -> &EncodeSlot {
+        match batch {
+            TestBatch::One => &self.slot1,
+            TestBatch::Two => &self.slot2,
+        }
+    }
+
+    /// Container for a given alpha flag (primary slot).
+    pub fn container_for(&self, has_alpha: bool) -> OutContainer {
+        self.slot1.container_for(has_alpha)
     }
 }
 

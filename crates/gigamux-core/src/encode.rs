@@ -16,8 +16,10 @@ use crate::probe::{
     video_ceiling_k, video_codec_name, video_color_meta, video_has_alpha, video_pix_fmt,
     RgbaThumb, VideoColorMeta,
 };
+use crate::prefs::EncodeSlot;
 use crate::targets::{
     audio_encode_for, delivery_pix_fmt, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
+    TestBatch,
 };
 use crate::webm_alpha::{mux_vp9_alpha_webm, wants_qsv_alpha_hybrid};
 
@@ -61,16 +63,12 @@ pub struct EncodeOptions {
     pub preserve_obs_metadata: bool,
     /// Ceiling from 1s video peak when true; otherwise average rate.
     pub use_peak_bitrate: bool,
-    /// NVENC for HEVC/H.264/AV1; `vp9_qsv` for opaque VP9; hybrid QSV+libvpx for α VP9/.webm.
-    pub use_hardware: bool,
-    /// When set, replaces automatic video ceiling (maxrate) in kbps.
-    pub maxrate_override_k: Option<u32>,
-    /// When set, replaces default CQ0/CRF0 (`-cq` NVENC / `-crf` software). Ignored on QSV VBR.
-    pub cq_override: Option<u32>,
-    pub opaque_video: OpaqueVideo,
-    pub opaque_container: OutContainer,
-    pub alpha_video: AlphaVideo,
-    pub alpha_container: OutContainer,
+    /// Dual full-frame A/B: write `test1_*` then `test2_*` with `slot1` / `slot2`.
+    pub test_mode: bool,
+    /// Primary encode settings (also used when `test_mode` is off).
+    pub slot1: EncodeSlot,
+    /// Secondary encode settings (test mode only).
+    pub slot2: EncodeSlot,
     /// When set, only encode these basenames (right-click selection). `None` = all inputs.
     pub only_names: Option<Vec<String>>,
 }
@@ -98,9 +96,21 @@ pub fn list_inputs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn deliver_path(input: &Path, output_dir: &Path, container: OutContainer) -> PathBuf {
-    let stem = input.file_stem().unwrap_or_default();
-    output_dir.join(stem).with_extension(container.ext())
+fn deliver_path(
+    input: &Path,
+    output_dir: &Path,
+    container: OutContainer,
+    batch: Option<TestBatch>,
+) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+    let file_stem = match batch {
+        Some(b) => format!("{}{stem}", b.prefix()),
+        None => stem.to_string(),
+    };
+    output_dir.join(file_stem).with_extension(container.ext())
 }
 
 fn append_audio_args(cmd: &mut Vec<String>, input: &Path, info: &serde_json::Value, out: OutContainer) {
@@ -908,12 +918,27 @@ pub fn run_batch(
     // Probe first so BatchStarted knows duration-weighted totals (skip-if-exists counted separately).
     struct WorkItem {
         input: PathBuf,
+        /// Input basename (for logs / live thumb key).
         name: String,
         info: serde_json::Value,
         has_alpha: bool,
         output: PathBuf,
         duration_s: f64,
+        slot: EncodeSlot,
+        /// Display label when test mode (`Test1` / `Test2`); empty otherwise.
+        pass_label: String,
     }
+
+    // One or two passes per input depending on test_mode.
+    let passes: Vec<(Option<TestBatch>, EncodeSlot)> = if opts.test_mode {
+        vec![
+            (Some(TestBatch::One), opts.slot1.clone()),
+            (Some(TestBatch::Two), opts.slot2.clone()),
+        ]
+    } else {
+        vec![(None, opts.slot1.clone())]
+    };
+
     let mut work = Vec::new();
     for input in inputs {
         if cancel.load(Ordering::Relaxed) {
@@ -941,26 +966,33 @@ pub fn run_batch(
             }
         };
         let has_alpha = video_has_alpha(&info);
-        let container = if has_alpha {
-            opts.alpha_container
-        } else {
-            opts.opaque_container
-        };
-        let output = deliver_path(&input, &opts.output_dir, container);
-        if output.is_file() {
-            skipped += 1;
-            on_event(EncodeEvent::FileSkipped { name });
-            continue;
-        }
         let duration_s = format_duration_s(&info);
-        work.push(WorkItem {
-            input,
-            name,
-            info,
-            has_alpha,
-            output,
-            duration_s,
-        });
+        for (batch, slot) in &passes {
+            let container = slot.container_for(has_alpha);
+            let output = deliver_path(&input, &opts.output_dir, container, *batch);
+            let out_name = output
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| output.display().to_string());
+            if output.is_file() {
+                skipped += 1;
+                on_event(EncodeEvent::FileSkipped {
+                    name: out_name,
+                });
+                continue;
+            }
+            let pass_label = batch.map(|b| b.label().to_string()).unwrap_or_default();
+            work.push(WorkItem {
+                input: input.clone(),
+                name: name.clone(),
+                info: info.clone(),
+                has_alpha,
+                output,
+                duration_s,
+                slot: slot.clone(),
+                pass_label,
+            });
+        }
     }
 
     let total_files = work.len();
@@ -982,9 +1014,17 @@ pub fn run_batch(
             has_alpha,
             output,
             duration_s,
+            slot,
+            pass_label,
         } = item;
 
+        let out_name = output
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| output.display().to_string());
+
         on_event(EncodeEvent::FileStarted {
+            // Keep input basename so UI live thumbs / per-file logs still match.
             name: name.clone(),
             index: i + 1,
             total: total_files,
@@ -993,27 +1033,27 @@ pub fn run_batch(
         let (auto_k, auto_label) =
             video_ceiling_k(&input, &info, opts.use_peak_bitrate);
         // Manual override replaces auto ceiling so users can raise (or lower) maxrate.
-        let (bitrate_k, src_label) = match opts.maxrate_override_k.filter(|&k| k > 0) {
+        let (bitrate_k, src_label) = match slot.maxrate_override_k.filter(|&k| k > 0) {
             Some(k) => (k, format!("override {k}k (auto {auto_k}k / {auto_label})")),
             None => (auto_k, auto_label),
         };
         // None → CQ0/CRF0 (default near-lossless); Some(n) → opt-in quality trade.
-        let cq = opts.cq_override.unwrap_or(0);
-        let use_nvenc = opts.use_hardware && opts.opaque_video.is_nvenc() && !has_alpha;
-        let use_qsv = opts.use_hardware && opts.opaque_video.is_qsv() && !has_alpha;
+        let cq = slot.cq_override.unwrap_or(0);
+        let use_nvenc = slot.use_hardware && slot.opaque_video.is_nvenc() && !has_alpha;
+        let use_qsv = slot.use_hardware && slot.opaque_video.is_qsv() && !has_alpha;
         let use_hybrid = wants_qsv_alpha_hybrid(
-            opts.use_hardware,
+            slot.use_hardware,
             has_alpha,
-            opts.alpha_video == AlphaVideo::Vp9,
-            opts.alpha_container == OutContainer::Webm,
+            slot.alpha_video == AlphaVideo::Vp9,
+            slot.alpha_container == OutContainer::Webm,
         );
         let path_label = if has_alpha {
-            format!("α {} {}", opts.alpha_video.label(), opts.alpha_container.label())
+            format!("α {} {}", slot.alpha_video.label(), slot.alpha_container.label())
         } else {
             format!(
                 "opaque {} {}",
-                opts.opaque_video.label(),
-                opts.opaque_container.label()
+                slot.opaque_video.label(),
+                slot.opaque_container.label()
             )
         };
         let device = if use_hybrid {
@@ -1021,23 +1061,24 @@ pub fn run_batch(
         } else if use_nvenc {
             format!("gpu={}", opts.gpu.ffmpeg_arg())
         } else if use_qsv {
-            format!("qsv={}", opts.opaque_video.ffmpeg_encoder(true))
+            format!("qsv={}", slot.opaque_video.ffmpeg_encoder(true))
         } else {
             format!(
                 "cpu={}",
                 if has_alpha {
-                    opts.alpha_video.ffmpeg_encoder()
+                    slot.alpha_video.ffmpeg_encoder()
                 } else {
-                    opts.opaque_video.ffmpeg_encoder(false)
+                    slot.opaque_video.ffmpeg_encoder(false)
                 }
             )
         };
+        let pass_tag = if pass_label.is_empty() {
+            String::new()
+        } else {
+            format!("[{pass_label}] ")
+        };
         on_event(EncodeEvent::Log(format!(
-            "{name}: {path_label} → {}, {bitrate_k}k ({src_label}), cq={cq}, {device}",
-            output
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            "{pass_tag}{name}: {path_label} → {out_name}, {bitrate_k}k ({src_label}), cq={cq}, {device}",
         )));
 
         // Live preview: grab source frames at out-time on a side thread (throttled).
@@ -1109,10 +1150,10 @@ pub fn run_batch(
                         cq,
                         opts.preserve_obs_metadata,
                         false, // force CPU α path
-                        opts.opaque_video,
-                        opts.opaque_container,
-                        opts.alpha_video,
-                        opts.alpha_container,
+                        slot.opaque_video,
+                        slot.opaque_container,
+                        slot.alpha_video,
+                        slot.alpha_container,
                     );
                     run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
                 }
@@ -1127,11 +1168,11 @@ pub fn run_batch(
                 bitrate_k,
                 cq,
                 opts.preserve_obs_metadata,
-                opts.use_hardware,
-                opts.opaque_video,
-                opts.opaque_container,
-                opts.alpha_video,
-                opts.alpha_container,
+                slot.use_hardware,
+                slot.opaque_video,
+                slot.opaque_container,
+                slot.alpha_video,
+                slot.alpha_container,
             );
             run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
         };
@@ -1140,7 +1181,7 @@ pub fn run_batch(
             Ok(()) => {
                 flush_thumbs(&mut on_event);
                 ok += 1;
-                on_event(EncodeEvent::FileDone { name });
+                on_event(EncodeEvent::FileDone { name: name.clone() });
             }
             Err(e) => {
                 flush_thumbs(&mut on_event);

@@ -26,7 +26,7 @@ pub use gpu::{
     av1_nvenc_available, list_av1_nvenc_devices, list_nvenc_devices, list_nvenc_devices_for,
     nvenc_encoder_works, qsv_vp9_available, GpuChoice, NvencDevice,
 };
-pub use prefs::{logs_dir, Prefs};
+pub use prefs::{logs_dir, EncodeSlot, Prefs};
 pub use probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
     media_summary, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,
@@ -35,9 +35,9 @@ pub use probe::{
 };
 pub use targets::{
     alpha_pair_ok, audio_encode_for, audio_must_recode, cycle_alpha_container,
-    cycle_opaque_container, delivery_pix_fmt, nvenc_pix_fmt, opaque_pair_ok, qsv_vp9_pix_fmt,
-    pix_fmt_convert_warning, pix_fmt_label, pix_fmt_will_convert, software_pix_fmt, AlphaVideo,
-    AudioEncode, OpaqueVideo, OutContainer,
-    OutputTargets,
+    cycle_opaque_container, delivery_pix_fmt, nvenc_pix_fmt, opaque_pair_ok, pair_stem,
+    qsv_vp9_pix_fmt, pix_fmt_convert_warning, pix_fmt_label, pix_fmt_will_convert, software_pix_fmt,
+    strip_test_prefix, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer, OutputTargets,
+    TestBatch,
 };
 pub use vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport, VmafResult};

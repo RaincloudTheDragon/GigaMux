@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::gpu::GpuChoice;
-use gigamux_core::targets::{AlphaVideo, OpaqueVideo, OutContainer};
+use gigamux_core::prefs::EncodeSlot;
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -19,13 +19,9 @@ fn main() {
         gpu: GpuChoice::Any,
         preserve_obs_metadata: false,
         use_peak_bitrate: false,
-        use_hardware: true,
-        maxrate_override_k: None,
-        cq_override: None,
-        opaque_video: OpaqueVideo::Av1,
-        opaque_container: OutContainer::Mp4,
-        alpha_video: AlphaVideo::Vp9,
-        alpha_container: OutContainer::Webm,
+        test_mode: false,
+        slot1: EncodeSlot::default(),
+        slot2: EncodeSlot::default_slot2(),
         only_names: None,
     };
     run_batch(opts, Arc::new(AtomicBool::new(false)), |ev| match ev {

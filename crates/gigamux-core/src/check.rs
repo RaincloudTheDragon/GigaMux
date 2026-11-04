@@ -8,7 +8,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::probe::{file_info, video_has_alpha};
-use crate::targets::OutputTargets;
+use crate::targets::{pair_stem, OutputTargets, TestBatch};
 
 /// Containers accepted as encode *inputs* (probe + list). Keep broad — disk wins over allowlist nostalgia.
 const INPUT_EXTS: &[&str] = &[
@@ -353,10 +353,12 @@ fn check_pair_inner(
 }
 
 /// Check all input/output pairs under the two folders against `targets`.
+/// When `test_slot2` is `Some`, expects `test1_*` / `test2_*` for both slots.
 pub fn run_check(
     input_dir: &Path,
     output_dir: &Path,
     targets: OutputTargets,
+    test_slot2: Option<OutputTargets>,
 ) -> Result<CheckReport, String> {
     if !input_dir.is_dir() || !output_dir.is_dir() {
         return Err("input and output directories must both exist".into());
@@ -388,47 +390,56 @@ pub fn run_check(
         }
     }
 
-    let mut pairs: Vec<(String, String, Value)> = Vec::new();
+    // (input, output, input_info, targets for this pair)
+    let mut pairs: Vec<(String, String, Value, OutputTargets)> = Vec::new();
+    let slots: Vec<(Option<TestBatch>, OutputTargets)> = match test_slot2 {
+        Some(slot2) => vec![
+            (Some(TestBatch::One), targets),
+            (Some(TestBatch::Two), slot2),
+        ],
+        None => vec![(None, targets)],
+    };
+
     for inf in &input_files {
         let Some(info) = input_meta.get(inf) else {
             continue;
         };
         let has_alpha = video_has_alpha(info);
-        let outp = targets.expected_name(inf, has_alpha);
-        let sibling = targets.expected_name(inf, !has_alpha);
-        if output_set.contains(&outp) {
-            if sibling != outp && output_set.contains(&sibling) {
+        for &(batch, slot) in &slots {
+            let outp = slot.expected_name_for(inf, has_alpha, batch);
+            let sibling = slot.expected_name_for(inf, !has_alpha, batch);
+            if output_set.contains(&outp) {
+                if sibling != outp && output_set.contains(&sibling) {
+                    report.issues.push(CheckIssue {
+                        input: Some(inf.clone()),
+                        output: Some(sibling.clone()),
+                        message: format!(
+                            "Container mismatch: unexpected leftover {sibling} (expected {outp})"
+                        ),
+                    });
+                }
+                pairs.push((inf.clone(), outp, info.clone(), slot));
+            } else if sibling != outp && output_set.contains(&sibling) {
                 report.issues.push(CheckIssue {
                     input: Some(inf.clone()),
                     output: Some(sibling.clone()),
-                    message: format!(
-                        "Container mismatch: unexpected leftover {sibling} (expected {outp})"
-                    ),
+                    message: format!("Container mismatch: found {sibling}, expected {outp}"),
+                });
+            } else {
+                let kind = slot.kind_label(has_alpha);
+                report.issues.push(CheckIssue {
+                    input: Some(inf.clone()),
+                    output: Some(outp.clone()),
+                    message: format!("Missing from output (expected {outp}, {kind})"),
                 });
             }
-            pairs.push((inf.clone(), outp, info.clone()));
-        } else if sibling != outp && output_set.contains(&sibling) {
-            report.issues.push(CheckIssue {
-                input: Some(inf.clone()),
-                output: Some(sibling.clone()),
-                message: format!("Container mismatch: found {sibling}, expected {outp}"),
-            });
-        } else {
-            let kind = targets.kind_label(has_alpha);
-            report.issues.push(CheckIssue {
-                input: Some(inf.clone()),
-                output: Some(outp.clone()),
-                message: format!("Missing from output (expected {outp}, {kind})"),
-            });
         }
     }
 
     for outf in &output_files {
-        let stem = Path::new(outf)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if !input_stems.contains(stem) && !is_chunk_filename(outf) {
+        // Strip test1_/test2_ so dual-mode outputs still pair to input stems.
+        let stem = pair_stem(outf);
+        if !input_stems.contains(&stem) && !is_chunk_filename(outf) {
             report.issues.push(CheckIssue {
                 input: None,
                 output: Some(outf.clone()),
@@ -437,10 +448,10 @@ pub fn run_check(
         }
     }
 
-    for (inf, outp, info) in pairs {
+    for (inf, outp, info, slot) in pairs {
         let out_path = output_dir.join(&outp);
         match file_info(&out_path) {
-            Ok(out_info) => match check_pair_inner(&out_path, &info, &out_info, targets) {
+            Ok(out_info) => match check_pair_inner(&out_path, &info, &out_info, slot) {
                 None => report.ok_pairs += 1,
                 Some(msg) => report.issues.push(CheckIssue {
                     input: Some(inf),

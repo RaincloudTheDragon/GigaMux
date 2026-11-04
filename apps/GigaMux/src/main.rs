@@ -25,7 +25,7 @@ use gigamux_core::gpu::{
     list_av1_nvenc_devices, list_nvenc_devices, qsv_vp9_available, GpuChoice, NvencDevice,
 };
 use gigamux_core::job_log;
-use gigamux_core::prefs::{self, Prefs};
+use gigamux_core::prefs::{self, EncodeSlot, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
@@ -34,8 +34,9 @@ use gigamux_core::probe::{
     THUMB_W,
 };
 use gigamux_core::targets::{
-    audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container,
-    pix_fmt_convert_warning, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer, OutputTargets,
+    audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container, pair_stem,
+    pix_fmt_convert_warning, strip_test_prefix, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer,
+    TestBatch,
 };
 
 /// Live dual-bar encode progress (current file + whole batch).
@@ -261,10 +262,10 @@ enum FileSide {
 
 struct GigaMuxApp {
     prefs: Prefs,
-    /// Draft text for the maxrate override field (keeps typing stable across frames).
-    maxrate_override_edit: String,
-    /// Draft text for the CQ/CRF override field (empty = default 0).
-    cq_override_edit: String,
+    /// Draft maxrate text per slot (index 0 = Test1/slot1, 1 = Test2/slot2).
+    maxrate_override_edit: [String; 2],
+    /// Draft CQ/CRF text per slot (empty = default 0).
+    cq_override_edit: [String; 2],
     devices: Vec<NvencDevice>,
     /// GPUs that can open `av1_nvenc` (empty on pre-Ada / no AV1 NVENC).
     av1_devices: Vec<NvencDevice>,
@@ -374,6 +375,8 @@ const BOX_SELECT_SLOP: f32 = 5.0;
 /// In-progress drag rectangle for multi-select in a folder list.
 struct BoxSelect {
     side: FileSide,
+    /// Which scroll list owns this drag (`id_salt`) — Test1/Test2 both use Output.
+    list_id: String,
     origin: egui::Pos2,
     current: egui::Pos2,
     /// Ctrl/Cmd held at press — union with selection at press time.
@@ -598,14 +601,30 @@ impl GigaMuxApp {
         let (gpu, warn) = prefs.gpu.sanitize(&devices);
         prefs.gpu = gpu;
         // Opaque VP8 has no HW path: UI greys the checkbox but keeps the prefs flag.
-        let maxrate_override_edit = prefs
-            .maxrate_override_k
-            .map(|k| k.to_string())
-            .unwrap_or_default();
-        let cq_override_edit = prefs
-            .cq_override
-            .map(|q| q.to_string())
-            .unwrap_or_default();
+        let maxrate_override_edit = [
+            prefs
+                .slot1
+                .maxrate_override_k
+                .map(|k| k.to_string())
+                .unwrap_or_default(),
+            prefs
+                .slot2
+                .maxrate_override_k
+                .map(|k| k.to_string())
+                .unwrap_or_default(),
+        ];
+        let cq_override_edit = [
+            prefs
+                .slot1
+                .cq_override
+                .map(|q| q.to_string())
+                .unwrap_or_default(),
+            prefs
+                .slot2
+                .cq_override
+                .map(|q| q.to_string())
+                .unwrap_or_default(),
+        ];
         let mut app = Self {
             prefs,
             maxrate_override_edit,
@@ -711,16 +730,95 @@ impl GigaMuxApp {
             .collect()
     }
 
-    /// Same-stem counterpart on the other side (first match in that list).
-    fn counterpart_name(&self, side: FileSide, name: &str) -> Option<String> {
-        let stem = Self::file_stem_of(name);
-        let other = match side {
-            FileSide::Input => FileSide::Output,
-            FileSide::Output => FileSide::Input,
+    /// ↑/↓ / range nav list: in test mode on Output, stay inside the active test batch.
+    fn names_for_nav(&self, side: FileSide) -> Vec<String> {
+        let names = self.names_for(side);
+        if side != FileSide::Output || !self.prefs.test_mode {
+            return names;
+        }
+        let Some((_, cur)) = self.active.as_ref() else {
+            return names;
         };
-        self.names_for(other)
+        let (Some(batch), _) = strip_test_prefix(cur) else {
+            return names;
+        };
+        names
             .into_iter()
-            .find(|n| Self::file_stem_of(n) == stem)
+            .filter(|n| strip_test_prefix(n).0 == Some(batch))
+            .collect()
+    }
+
+    /// Output files belonging to one test batch (`test1_*` / `test2_*`).
+    fn output_files_for_batch(files: &[PathBuf], batch: TestBatch) -> Vec<PathBuf> {
+        files
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| strip_test_prefix(n).0 == Some(batch))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Pair stem for input↔output jumps (strips `test1_` / `test2_` on outputs).
+    fn pair_stem_of(name: &str) -> String {
+        pair_stem(name)
+    }
+
+    /// Same-stem counterpart on the other side.
+    /// In test mode, `prefer` picks Test1 vs Test2 when jumping toward Output.
+    fn counterpart_name(&self, side: FileSide, name: &str) -> Option<String> {
+        self.counterpart_name_prefer(side, name, TestBatch::One)
+    }
+
+    fn counterpart_name_prefer(
+        &self,
+        side: FileSide,
+        name: &str,
+        prefer: TestBatch,
+    ) -> Option<String> {
+        let stem = Self::pair_stem_of(name);
+        let other = Self::other_side(side);
+        let names = self.names_for(other);
+        match (side, other) {
+            // Input → Output: prefer the requested test batch (or plain stem when not in test mode).
+            (FileSide::Input, FileSide::Output) => {
+                if self.prefs.test_mode {
+                    names
+                        .iter()
+                        .find(|n| {
+                            let (batch, rest) = strip_test_prefix(n);
+                            batch == Some(prefer) && rest == stem
+                        })
+                        .cloned()
+                        .or_else(|| {
+                            // Fallback: any prefixed or plain match for this stem.
+                            names.into_iter().find(|n| Self::pair_stem_of(n) == stem)
+                        })
+                } else {
+                    names
+                        .into_iter()
+                        .find(|n| Self::file_stem_of(n) == stem.as_str())
+                }
+            }
+            // Output → Input: strip test prefix then match input stem.
+            (FileSide::Output, FileSide::Input) => names
+                .into_iter()
+                .find(|n| Self::file_stem_of(n) == stem.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Sibling test output for the same source stem (`test1_*` ↔ `test2_*`).
+    fn sibling_test_name(&self, name: &str) -> Option<String> {
+        let (batch, stem) = strip_test_prefix(name);
+        let batch = batch?;
+        let want = batch.sibling();
+        self.names_for(FileSide::Output).into_iter().find(|n| {
+            let (b, rest) = strip_test_prefix(n);
+            b == Some(want) && rest == stem
+        })
     }
 
     fn other_side(side: FileSide) -> FileSide {
@@ -737,10 +835,15 @@ impl GigaMuxApp {
             .or_else(|| key.strip_prefix("o:").map(|n| (FileSide::Output, n)))
     }
 
-    /// VMAF only while the paired file is still listed and still carries the same score.
+    /// VMAF only while the paired file is still listed.
+    /// Test-mode outputs keep their own score (input is not overwritten per-pass).
     fn live_vmaf_score(&self, side: FileSide, name: &str) -> Option<f64> {
         let score = self.preview_cache.get(&Self::preview_key(side, name))?.vmaf_score?;
         let other_name = self.counterpart_name(side, name)?;
+        // Prefixed test outputs: show score whenever the input counterpart still exists.
+        if side == FileSide::Output && strip_test_prefix(name).0.is_some() {
+            return Some(score);
+        }
         let other = self
             .preview_cache
             .get(&Self::preview_key(Self::other_side(side), &other_name))?;
@@ -777,10 +880,15 @@ impl GigaMuxApp {
             let stale = match self.counterpart_name(side, name) {
                 None => true,
                 Some(other_name) => {
-                    let other_key = Self::preview_key(Self::other_side(side), &other_name);
-                    match self.preview_cache.get(&other_key).and_then(|e| e.vmaf_score) {
-                        Some(s) if (s - score).abs() < 1e-6 => false,
-                        _ => true,
+                    // Test-prefixed outputs keep their own score without mirroring onto input.
+                    if side == FileSide::Output && strip_test_prefix(name).0.is_some() {
+                        false
+                    } else {
+                        let other_key = Self::preview_key(Self::other_side(side), &other_name);
+                        match self.preview_cache.get(&other_key).and_then(|e| e.vmaf_score) {
+                            Some(s) if (s - score).abs() < 1e-6 => false,
+                            _ => true,
+                        }
                     }
                 }
             };
@@ -844,7 +952,7 @@ impl GigaMuxApp {
 
     /// Shift-click: select inclusive range from anchor → `name` on the same side.
     fn select_range(&mut self, side: FileSide, name: String) {
-        let names = self.names_for(side);
+        let names = self.names_for_nav(side);
         let Some(anchor) = self
             .selection_anchor
             .clone()
@@ -1083,15 +1191,15 @@ impl GigaMuxApp {
             return false;
         }
         // Opaque VP9 + hardware uses QSV — don't throttle previews as a CPU encode.
-        if self.prefs.opaque_video.is_libvpx()
-            && !(self.prefs.use_hardware && self.prefs.opaque_video.is_qsv())
+        if self.prefs.slot1.opaque_video.is_libvpx()
+            && !(self.prefs.slot1.use_hardware && self.prefs.slot1.opaque_video.is_qsv())
         {
             return true;
         }
         // α VP9/.webm + hardware uses QSV+libvpx hybrid — keep previews responsive.
-        let hybrid_alpha = self.prefs.use_hardware
-            && self.prefs.alpha_video == AlphaVideo::Vp9
-            && self.prefs.alpha_container == OutContainer::Webm;
+        let hybrid_alpha = self.prefs.slot1.use_hardware
+            && self.prefs.slot1.alpha_video == AlphaVideo::Vp9
+            && self.prefs.slot1.alpha_container == OutContainer::Webm;
         if hybrid_alpha {
             return false;
         }
@@ -1567,16 +1675,30 @@ impl GigaMuxApp {
                     p.sanitize_targets();
                     let (gpu, warn) = p.gpu.sanitize(&self.devices);
                     self.prefs = Prefs { gpu, ..p };
-                    self.maxrate_override_edit = self
-                        .prefs
-                        .maxrate_override_k
-                        .map(|k| k.to_string())
-                        .unwrap_or_default();
-                    self.cq_override_edit = self
-                        .prefs
-                        .cq_override
-                        .map(|q| q.to_string())
-                        .unwrap_or_default();
+                    self.maxrate_override_edit = [
+                        self.prefs
+                            .slot1
+                            .maxrate_override_k
+                            .map(|k| k.to_string())
+                            .unwrap_or_default(),
+                        self.prefs
+                            .slot2
+                            .maxrate_override_k
+                            .map(|k| k.to_string())
+                            .unwrap_or_default(),
+                    ];
+                    self.cq_override_edit = [
+                        self.prefs
+                            .slot1
+                            .cq_override
+                            .map(|q| q.to_string())
+                            .unwrap_or_default(),
+                        self.prefs
+                            .slot2
+                            .cq_override
+                            .map(|q| q.to_string())
+                            .unwrap_or_default(),
+                    ];
                     self.gpu_warn = warn;
                     let _ = prefs::save(&self.prefs);
                     self.refresh_lists();
@@ -1601,25 +1723,30 @@ impl GigaMuxApp {
             parts.push("folders".into());
         }
         if p.targets {
-            self.prefs.opaque_video = d.opaque_video;
-            self.prefs.opaque_container = d.opaque_container;
-            self.prefs.alpha_video = d.alpha_video;
-            self.prefs.alpha_container = d.alpha_container;
+            self.prefs.slot1.opaque_video = d.slot1.opaque_video;
+            self.prefs.slot1.opaque_container = d.slot1.opaque_container;
+            self.prefs.slot1.alpha_video = d.slot1.alpha_video;
+            self.prefs.slot1.alpha_container = d.slot1.alpha_container;
+            self.prefs.slot2 = EncodeSlot::default_slot2();
+            self.prefs.test_mode = false;
             touched_prefs = true;
             parts.push("targets".into());
         }
         if p.hardware {
-            self.prefs.use_hardware = d.use_hardware;
+            self.prefs.slot1.use_hardware = d.slot1.use_hardware;
+            self.prefs.slot2.use_hardware = d.slot2.use_hardware;
             self.prefs.gpu = d.gpu;
             touched_prefs = true;
             parts.push("hardware".into());
         }
         if p.bitrate {
             self.prefs.use_peak_bitrate = d.use_peak_bitrate;
-            self.prefs.maxrate_override_k = d.maxrate_override_k;
-            self.prefs.cq_override = d.cq_override;
-            self.maxrate_override_edit.clear();
-            self.cq_override_edit.clear();
+            self.prefs.slot1.maxrate_override_k = d.slot1.maxrate_override_k;
+            self.prefs.slot1.cq_override = d.slot1.cq_override;
+            self.prefs.slot2.maxrate_override_k = d.slot2.maxrate_override_k;
+            self.prefs.slot2.cq_override = d.slot2.cq_override;
+            self.maxrate_override_edit = [String::new(), String::new()];
+            self.cq_override_edit = [String::new(), String::new()];
             touched_prefs = true;
             parts.push("bitrate".into());
         }
@@ -1679,8 +1806,10 @@ impl GigaMuxApp {
             self.log_open = true;
             return;
         }
-        self.commit_maxrate_override_edit();
-        self.commit_cq_override_edit();
+        self.commit_maxrate_override_edit(TestBatch::One);
+        self.commit_maxrate_override_edit(TestBatch::Two);
+        self.commit_cq_override_edit(TestBatch::One);
+        self.commit_cq_override_edit(TestBatch::Two);
         // Missing AV1 NVENC / QSV: checkbox is greyed; encode falls back to CPU without clearing prefs.
         self.start_encode_now(only_name);
     }
@@ -1690,20 +1819,20 @@ impl GigaMuxApp {
         let _ = prefs::save(&self.prefs);
         self.cancel.store(false, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
+        // Prefer prefs HW flags, but only when each slot’s opaque target has a HW path here.
+        let mut slot1 = self.prefs.slot1.clone();
+        slot1.use_hardware = self.effective_use_hardware_for(&slot1);
+        let mut slot2 = self.prefs.slot2.clone();
+        slot2.use_hardware = self.effective_use_hardware_for(&slot2);
         let opts = EncodeOptions {
             input_dir: self.prefs.input_dir.clone(),
             output_dir: self.prefs.output_dir.clone(),
             gpu: self.prefs.gpu,
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
-            // Prefer prefs, but only when the current opaque target has a HW path on this machine.
-            use_hardware: self.effective_use_hardware(),
-            maxrate_override_k: self.prefs.maxrate_override_k,
-            cq_override: self.prefs.cq_override,
-            opaque_video: self.prefs.opaque_video,
-            opaque_container: self.prefs.opaque_container,
-            alpha_video: self.prefs.alpha_video,
-            alpha_container: self.prefs.alpha_container,
+            test_mode: self.prefs.test_mode,
+            slot1,
+            slot2,
             only_names: only_name.clone().map(|n| vec![n]),
         };
         let cancel = Arc::clone(&self.cancel);
@@ -1739,7 +1868,7 @@ impl GigaMuxApp {
         let Some((side, cur)) = self.active.clone() else {
             return;
         };
-        let names = self.names_for(side);
+        let names = self.names_for_nav(side);
         if names.is_empty() {
             return;
         }
@@ -1758,7 +1887,7 @@ impl GigaMuxApp {
         let Some((side, cur)) = self.active.clone() else {
             return;
         };
-        let names = self.names_for(side);
+        let names = self.names_for_nav(side);
         if names.is_empty() {
             return;
         }
@@ -1775,7 +1904,7 @@ impl GigaMuxApp {
         let Some((side, _)) = self.active else {
             return;
         };
-        let names = self.names_for(side);
+        let names = self.names_for_nav(side);
         let Some(name) = (if to_start {
             names.first()
         } else {
@@ -1797,7 +1926,7 @@ impl GigaMuxApp {
         let Some((side, _)) = self.active.clone() else {
             return;
         };
-        let names = self.names_for(side);
+        let names = self.names_for_nav(side);
         let Some(name) = (if to_start {
             names.first()
         } else {
@@ -1811,16 +1940,31 @@ impl GigaMuxApp {
     }
 
     /// ← input / → output: jump to the same-stem file on that side.
-    fn jump_to_side(&mut self, target: FileSide) {
+    /// `prefer` selects Test1 vs Test2 when landing on Output in test mode.
+    fn jump_to_side_prefer(&mut self, target: FileSide, prefer: TestBatch) {
         let Some((side, name)) = self.active.clone() else {
             return;
         };
         if side == target {
             return;
         }
-        if let Some(other) = self.counterpart_name(side, &name) {
+        if let Some(other) = self.counterpart_name_prefer(side, &name, prefer) {
             self.select_file(target, other);
             // Keep the landed row on-screen (same path as ↑/↓ / Home/End).
+            self.scroll_sel_into_view = true;
+        }
+    }
+
+    /// Shift+↑/↓ on Output in test mode: jump to the sibling test encode.
+    fn jump_sibling_test(&mut self) {
+        let Some((side, name)) = self.active.clone() else {
+            return;
+        };
+        if side != FileSide::Output || !self.prefs.test_mode {
+            return;
+        }
+        if let Some(sib) = self.sibling_test_name(&name) {
+            self.select_file(FileSide::Output, sib);
             self.scroll_sel_into_view = true;
         }
     }
@@ -2772,8 +2916,10 @@ impl GigaMuxApp {
             } else if self.pending_check.is_some() {
                 self.pending_check = None;
             } else if self.show_settings {
-                self.commit_maxrate_override_edit();
-                self.commit_cq_override_edit();
+                self.commit_maxrate_override_edit(TestBatch::One);
+                self.commit_maxrate_override_edit(TestBatch::Two);
+                self.commit_cq_override_edit(TestBatch::One);
+                self.commit_cq_override_edit(TestBatch::Two);
                 let _ = prefs::save(&self.prefs);
                 self.show_settings = false;
             } else {
@@ -2812,15 +2958,46 @@ impl GigaMuxApp {
                 self.navigate_list(page);
             }
         } else if arrow_up {
-            self.navigate_list(-1);
+            // Test mode + Output: Shift+↑/↓ jumps to the sibling test file; else normal step.
+            if shift
+                && self.prefs.test_mode
+                && self
+                    .active
+                    .as_ref()
+                    .is_some_and(|(s, _)| *s == FileSide::Output)
+            {
+                self.jump_sibling_test();
+            } else {
+                self.navigate_list(-1);
+            }
         } else if arrow_down {
-            self.navigate_list(1);
+            if shift
+                && self.prefs.test_mode
+                && self
+                    .active
+                    .as_ref()
+                    .is_some_and(|(s, _)| *s == FileSide::Output)
+            {
+                self.jump_sibling_test();
+            } else {
+                self.navigate_list(1);
+            }
         }
         if arrow_left {
-            self.jump_to_side(FileSide::Input);
+            let prefer = if shift && self.prefs.test_mode {
+                TestBatch::Two
+            } else {
+                TestBatch::One
+            };
+            self.jump_to_side_prefer(FileSide::Input, prefer);
         }
         if arrow_right {
-            self.jump_to_side(FileSide::Output);
+            let prefer = if shift && self.prefs.test_mode {
+                TestBatch::Two
+            } else {
+                TestBatch::One
+            };
+            self.jump_to_side_prefer(FileSide::Output, prefer);
         }
         if delete {
             self.delete_active();
@@ -2838,12 +3015,11 @@ impl GigaMuxApp {
         }
         let input = self.prefs.input_dir.clone();
         let output = self.prefs.output_dir.clone();
-        let targets = OutputTargets {
-            opaque_video: self.prefs.opaque_video,
-            opaque_container: self.prefs.opaque_container,
-            alpha_video: self.prefs.alpha_video,
-            alpha_container: self.prefs.alpha_container,
-        };
+        let targets = self.prefs.slot1.output_targets();
+        let test_slot2 = self
+            .prefs
+            .test_mode
+            .then(|| self.prefs.slot2.output_targets());
         let (tx, rx) = mpsc::channel();
         self.busy = true;
         self.job = Some(JobKind::Check);
@@ -2851,7 +3027,7 @@ impl GigaMuxApp {
         self.push_session("Check started…");
         self.log_open = true;
         thread::spawn(move || {
-            let result = run_check(&input, &output, targets);
+            let result = run_check(&input, &output, targets, test_slot2);
             let _ = tx.send(AppEvent::CheckDone(result));
         });
     }
@@ -2868,12 +3044,11 @@ impl GigaMuxApp {
         }
         let input = self.prefs.input_dir.clone();
         let output = self.prefs.output_dir.clone();
-        let targets = OutputTargets {
-            opaque_video: self.prefs.opaque_video,
-            opaque_container: self.prefs.opaque_container,
-            alpha_video: self.prefs.alpha_video,
-            alpha_container: self.prefs.alpha_container,
-        };
+        let targets = self.prefs.slot1.output_targets();
+        let test_slot2 = self
+            .prefs
+            .test_mode
+            .then(|| self.prefs.slot2.output_targets());
         self.cancel.store(false, Ordering::Relaxed);
         let cancel = Arc::clone(&self.cancel);
         let (tx, rx) = mpsc::channel();
@@ -2893,6 +3068,7 @@ impl GigaMuxApp {
                 &input,
                 &output,
                 targets,
+                test_slot2,
                 only_name,
                 &cancel,
                 |ev| {
@@ -3124,13 +3300,14 @@ impl GigaMuxApp {
                 ok += 1;
                 let line = format!("VMAF {} → {}: {s:.4}", r.input, r.output);
                 self.push_file_log(&r.input, &line);
-                // Stick score on both sides of the pair so either meta table shows it.
-                for (side, name) in [
-                    (FileSide::Input, r.input.as_str()),
-                    (FileSide::Output, r.output.as_str()),
-                ] {
-                    let key = Self::preview_key(side, name);
-                    if let Some(e) = self.preview_cache.get_mut(&key) {
+                // Always store on the output. Mirror onto input only for non-test pairs so dual test1_/test2_ scores do not clobber each other on the input row.
+                let out_key = Self::preview_key(FileSide::Output, &r.output);
+                if let Some(e) = self.preview_cache.get_mut(&out_key) {
+                    e.vmaf_score = Some(s);
+                }
+                if strip_test_prefix(&r.output).0.is_none() {
+                    let in_key = Self::preview_key(FileSide::Input, &r.input);
+                    if let Some(e) = self.preview_cache.get_mut(&in_key) {
                         e.vmaf_score = Some(s);
                     }
                 }
@@ -3284,9 +3461,94 @@ impl GigaMuxApp {
         let _ = prefs::save(&self.prefs);
     }
 
-    /// Amber line when any input would need audio re-encode for current targets.
-    /// Opaque WebM (typically Opus) → MP4 always warns once the file is listed.
-    fn audio_recode_warning(&self) -> Option<String> {
+    /// True when the selected GPU can run `av1_nvenc`.
+    fn av1_nvenc_ok_for_gpu(&self) -> bool {
+        match self.prefs.gpu {
+            GpuChoice::Any => !self.av1_devices.is_empty(),
+            GpuChoice::Index(i) => self.av1_devices.iter().any(|d| d.index == i),
+        }
+    }
+
+    fn batch_edit_idx(batch: TestBatch) -> usize {
+        match batch {
+            TestBatch::One => 0,
+            TestBatch::Two => 1,
+        }
+    }
+
+    /// Whether opaque Use hardware can apply on this machine for `slot`'s codec.
+    fn opaque_hardware_path_available_for(&self, slot: &EncodeSlot) -> bool {
+        match slot.opaque_video {
+            OpaqueVideo::Vp8 => false,
+            OpaqueVideo::Av1 => self.av1_nvenc_ok_for_gpu(),
+            OpaqueVideo::Vp9 => self.qsv_available,
+            OpaqueVideo::Hevc | OpaqueVideo::H264 => true,
+        }
+    }
+
+    /// Prefs HW flag and a usable opaque HW path for this slot.
+    fn effective_use_hardware_for(&self, slot: &EncodeSlot) -> bool {
+        slot.use_hardware && self.opaque_hardware_path_available_for(slot)
+    }
+
+    /// Hover for Use hardware: default help, or why the box is greyed (preference kept).
+    fn hardware_checkbox_hover_for(&self, slot: &EncodeSlot) -> String {
+        if self.opaque_hardware_path_available_for(slot) {
+            return "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm (falls back to full libvpx). Off: CPU.".into();
+        }
+        match slot.opaque_video {
+            OpaqueVideo::Av1 if self.av1_devices.is_empty() => {
+                "AV1 NVENC not available on this GPU. Checkbox greyed (preference kept). Encode uses libaom (CPU) for AV1, or pick HEVC/H.264."
+                    .into()
+            }
+            OpaqueVideo::Av1 => {
+                "Selected GPU has no AV1 NVENC. Checkbox greyed (preference kept). Pick Any/another GPU or HEVC/H.264; AV1 encode uses libaom while greyed."
+                    .into()
+            }
+            OpaqueVideo::Vp9 => {
+                "Intel QSV VP9 not available. Checkbox greyed (preference kept). Encode uses libvpx (CPU) for VP9, or pick HEVC/H.264/AV1."
+                    .into()
+            }
+            OpaqueVideo::Vp8 => {
+                "Opaque VP8 has no HW path. Checkbox greyed (preference kept)."
+                    .into()
+            }
+            OpaqueVideo::Hevc | OpaqueVideo::H264 => {
+                "Use hardware unavailable for this target.".into()
+            }
+        }
+    }
+
+    /// Use hardware checkbox for one slot; muted when that slot has no HW path here.
+    fn ui_use_hardware_checkbox(
+        &mut self,
+        ui: &mut egui::Ui,
+        batch: TestBatch,
+        persist: impl FnOnce(&mut Self),
+    ) {
+        let hw_ok = self.opaque_hardware_path_available_for(self.prefs.slot(batch));
+        let hover = self.hardware_checkbox_hover_for(self.prefs.slot(batch));
+        let resp = ui
+            .scope(|ui| {
+                if !hw_ok {
+                    ui.multiply_opacity(0.45);
+                }
+                ui.checkbox(&mut self.prefs.slot_mut(batch).use_hardware, "Use hardware")
+            })
+            .inner;
+        let changed = resp.changed();
+        if !hw_ok && (resp.clicked() || resp.secondary_clicked()) {
+            resp.show_tooltip_text(&hover);
+        }
+        resp.on_hover_text(hover);
+        if changed {
+            persist(self);
+        }
+    }
+
+    /// Amber line when any input’s chroma/bit-depth can’t be matched for a slot.
+    fn chroma_convert_warning_for(&self, batch: TestBatch) -> Option<String> {
+        let slot = self.prefs.slot(batch);
         for path in &self.input_files {
             let name = path
                 .file_name()
@@ -3298,7 +3560,33 @@ impl GigaMuxApp {
             else {
                 continue;
             };
-            let cont = self.prefs.container_for(summary.has_alpha);
+            if let Some(msg) = pix_fmt_convert_warning(
+                &summary.pix_fmt,
+                summary.has_alpha,
+                slot.use_hardware,
+                slot.opaque_video,
+            ) {
+                return Some(msg);
+            }
+        }
+        None
+    }
+
+    /// Amber line when any input would need audio re-encode for a slot’s containers.
+    fn audio_recode_warning_for(&self, batch: TestBatch) -> Option<String> {
+        let slot = self.prefs.slot(batch);
+        for path in &self.input_files {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let key = Self::preview_key(FileSide::Input, &name);
+            let entry = self.preview_cache.get(&key);
+            let Some(summary) = entry.and_then(|e| e.summary.as_ref()).and_then(|r| r.as_ref().ok())
+            else {
+                continue;
+            };
+            let cont = slot.container_for(summary.has_alpha);
             let src_webm = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -3307,7 +3595,6 @@ impl GigaMuxApp {
             let raw = summary.audio_codec.to_ascii_lowercase();
             let raw = if raw == "—" { String::new() } else { raw };
 
-            // Opaque WebM → MP4: Opus (usual WebM audio) must become AAC.
             if !summary.has_alpha && src_webm && matches!(cont, OutContainer::Mp4) {
                 return Some(format!("Opus will be recoded to AAC for {}", cont.label()));
             }
@@ -3333,162 +3620,66 @@ impl GigaMuxApp {
         None
     }
 
-    /// True when the selected GPU can run `av1_nvenc`.
-    fn av1_nvenc_ok_for_gpu(&self) -> bool {
-        match self.prefs.gpu {
-            GpuChoice::Any => !self.av1_devices.is_empty(),
-            GpuChoice::Index(i) => self.av1_devices.iter().any(|d| d.index == i),
-        }
-    }
-
-    /// Whether opaque Use hardware can apply on this machine for the current codec (else grey the checkbox).
-    fn opaque_hardware_path_available(&self) -> bool {
-        match self.prefs.opaque_video {
-            OpaqueVideo::Vp8 => false,
-            OpaqueVideo::Av1 => self.av1_nvenc_ok_for_gpu(),
-            OpaqueVideo::Vp9 => self.qsv_available,
-            OpaqueVideo::Hevc | OpaqueVideo::H264 => true,
-        }
-    }
-
-    /// Prefs flag and a usable opaque HW path (AV1/VP9 fall back to CPU when greying without clearing prefs).
-    fn effective_use_hardware(&self) -> bool {
-        self.prefs.use_hardware && self.opaque_hardware_path_available()
-    }
-
-    /// Hover for Use hardware: default help, or why the box is greyed (preference kept).
-    fn hardware_checkbox_hover(&self) -> String {
-        if self.opaque_hardware_path_available() {
-            return "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm (falls back to full libvpx). Off: CPU.".into();
-        }
-        match self.prefs.opaque_video {
-            OpaqueVideo::Av1 if self.av1_devices.is_empty() => {
-                "AV1 NVENC not available on this GPU. Checkbox greyed (preference kept). Encode uses libaom (CPU) for AV1, or pick HEVC/H.264."
-                    .into()
-            }
-            OpaqueVideo::Av1 => {
-                "Selected GPU has no AV1 NVENC. Checkbox greyed (preference kept). Pick Any/another GPU or HEVC/H.264; AV1 encode uses libaom while greyed."
-                    .into()
-            }
-            OpaqueVideo::Vp9 => {
-                "Intel QSV VP9 not available. Checkbox greyed (preference kept). Encode uses libvpx (CPU) for VP9, or pick HEVC/H.264/AV1."
-                    .into()
-            }
-            OpaqueVideo::Vp8 => {
-                "Opaque VP8 has no HW path. Checkbox greyed (preference kept)."
-                    .into()
-            }
-            OpaqueVideo::Hevc | OpaqueVideo::H264 => {
-                "Use hardware unavailable for this target.".into()
-            }
-        }
-    }
-
-    /// Use hardware checkbox: visually muted when the opaque path has no HW on this machine.
-    /// Still fully interactive (prefs kept for other codecs); encode falls back to CPU while muted.
-    /// Explanation is hover/click only (no always-on amber line).
-    fn ui_use_hardware_checkbox(&mut self, ui: &mut egui::Ui, persist: impl FnOnce(&mut Self)) {
-        let hw_ok = self.opaque_hardware_path_available();
-        let hover = self.hardware_checkbox_hover();
-        let resp = ui
-            .scope(|ui| {
-                if !hw_ok {
-                    ui.multiply_opacity(0.45);
-                }
-                ui.checkbox(&mut self.prefs.use_hardware, "Use hardware")
-            })
-            .inner;
-        let changed = resp.changed();
-        if !hw_ok && (resp.clicked() || resp.secondary_clicked()) {
-            resp.show_tooltip_text(&hover);
-        }
-        resp.on_hover_text(hover);
-        if changed {
-            persist(self);
-        }
-    }
-
-    /// Amber line when any input’s chroma/bit-depth can’t be matched for the current target.
-    fn chroma_convert_warning(&self) -> Option<String> {
-        for path in &self.input_files {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let key = Self::preview_key(FileSide::Input, &name);
-            let entry = self.preview_cache.get(&key);
-            let Some(summary) = entry.and_then(|e| e.summary.as_ref()).and_then(|r| r.as_ref().ok())
-            else {
-                continue;
-            };
-            if let Some(msg) = pix_fmt_convert_warning(
-                &summary.pix_fmt,
-                summary.has_alpha,
-                self.prefs.use_hardware,
-                self.prefs.opaque_video,
-            ) {
-                return Some(msg);
-            }
-        }
-        None
-    }
-
-    /// Apply the maxrate draft into prefs (empty → auto; invalid → keep previous).
-    fn commit_maxrate_override_edit(&mut self) {
-        let trimmed = self.maxrate_override_edit.trim();
+    /// Apply the maxrate draft for `batch` into prefs (empty → auto; invalid → keep previous).
+    fn commit_maxrate_override_edit(&mut self, batch: TestBatch) {
+        let idx = Self::batch_edit_idx(batch);
+        let trimmed = self.maxrate_override_edit[idx].trim().to_string();
         let next = if trimmed.is_empty() {
             None
         } else {
             trimmed.parse::<u32>().ok().filter(|&k| k > 0)
         };
         if next.is_none() && !trimmed.is_empty() {
-            self.maxrate_override_edit = self
+            self.maxrate_override_edit[idx] = self
                 .prefs
+                .slot(batch)
                 .maxrate_override_k
                 .map(|k| k.to_string())
                 .unwrap_or_default();
             return;
         }
-        if next != self.prefs.maxrate_override_k {
-            self.prefs.maxrate_override_k = next;
-            self.maxrate_override_edit = next.map(|k| k.to_string()).unwrap_or_default();
+        if next != self.prefs.slot(batch).maxrate_override_k {
+            self.prefs.slot_mut(batch).maxrate_override_k = next;
+            self.maxrate_override_edit[idx] = next.map(|k| k.to_string()).unwrap_or_default();
             self.save_targets();
         }
     }
 
     /// Optional maxrate kbps next to Use hardware; empty = automatic ceiling.
-    fn ui_maxrate_override(&mut self, ui: &mut egui::Ui) {
+    fn ui_maxrate_override(&mut self, ui: &mut egui::Ui, batch: TestBatch) {
+        let idx = Self::batch_edit_idx(batch);
         ui.label(egui::RichText::new("Maxrate").weak().small());
         let edit = ui
             .add(
-                egui::TextEdit::singleline(&mut self.maxrate_override_edit)
+                egui::TextEdit::singleline(&mut self.maxrate_override_edit[idx])
                     .desired_width(64.0)
                     .hint_text("auto")
-                    .font(egui::TextStyle::Monospace),
+                    .font(egui::TextStyle::Monospace)
+                    .id_salt(format!("maxrate_{idx}")),
             )
             .on_hover_text(
                 "Override automatic encode maxrate (kbps). Leave empty for auto from source avg/peak.",
             );
-        // Commit on Enter or focus loss so partial typing (e.g. "12" of "12000") isn't saved early.
         if edit.lost_focus() || (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
         {
-            self.commit_maxrate_override_edit();
+            self.commit_maxrate_override_edit(batch);
         }
         ui.label(egui::RichText::new("kbps").weak().small());
     }
 
-    /// Apply the CQ draft into prefs (empty → default 0; invalid → keep previous).
-    fn commit_cq_override_edit(&mut self) {
-        let trimmed = self.cq_override_edit.trim();
+    /// Apply the CQ draft for `batch` into prefs (empty → default 0; invalid → keep previous).
+    fn commit_cq_override_edit(&mut self, batch: TestBatch) {
+        let idx = Self::batch_edit_idx(batch);
+        let trimmed = self.cq_override_edit[idx].trim().to_string();
         let next = if trimmed.is_empty() {
             None
         } else {
-            // 0–63 covers NVENC CQ and libvpx CRF; empty means default CQ0.
             trimmed.parse::<u32>().ok().filter(|&q| q <= 63)
         };
         if next.is_none() && !trimmed.is_empty() {
-            self.cq_override_edit = self
+            self.cq_override_edit[idx] = self
                 .prefs
+                .slot(batch)
                 .cq_override
                 .map(|q| q.to_string())
                 .unwrap_or_default();
@@ -3496,79 +3687,195 @@ impl GigaMuxApp {
         }
         // Persist Some(0) as None so the file stays clean for the default.
         let next = next.filter(|&q| q > 0);
-        if next != self.prefs.cq_override {
-            self.prefs.cq_override = next;
-            self.cq_override_edit = next.map(|q| q.to_string()).unwrap_or_default();
+        if next != self.prefs.slot(batch).cq_override {
+            self.prefs.slot_mut(batch).cq_override = next;
+            self.cq_override_edit[idx] = next.map(|q| q.to_string()).unwrap_or_default();
             self.save_targets();
         }
     }
 
-    /// Optional CQ/CRF; empty = default 0. Scales are not cross-codec calibrated.
-    fn ui_cq_override(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("CQ").weak().small());
-        let edit = ui
-            .add(
-                egui::TextEdit::singleline(&mut self.cq_override_edit)
-                    .desired_width(40.0)
-                    .hint_text("0")
-                    .font(egui::TextStyle::Monospace),
-            )
-            .on_hover_text(
-                "Override default CQ0/CRF0 (NVENC -cq / software -crf). Empty = 0. Scales differ by codec — the same number is not the same quality on AV1 vs HEVC. Ignored on opaque QSV VP9 (VBR-only).",
-            );
-        if edit.lost_focus() || (edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-        {
-            self.commit_cq_override_edit();
-        }
-    }
-
-    fn ui_output_targets(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Targets").strong().small());
-        // One cycling codec chip + one cycling container chip per path.
+    /// Codec/container chips + HW/maxrate for one encode slot.
+    fn ui_slot_targets(&mut self, ui: &mut egui::Ui, batch: TestBatch, heading: &str) {
+        ui.label(egui::RichText::new(heading).strong().small());
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Opaque").weak().small());
-            let v = self.prefs.opaque_video;
+            let v = self.prefs.slot(batch).opaque_video;
             if select_codec_chip(ui, v.label(), true, true) {
                 let next = v.next();
-                self.prefs.opaque_video = next;
-                self.prefs.opaque_container =
-                    gigamux_core::targets::clamp_opaque_container(next, self.prefs.opaque_container);
+                self.prefs.slot_mut(batch).opaque_video = next;
+                let cur = self.prefs.slot(batch).opaque_container;
+                self.prefs.slot_mut(batch).opaque_container =
+                    gigamux_core::targets::clamp_opaque_container(next, cur);
                 self.save_targets();
             }
-            let c = self.prefs.opaque_container;
+            let c = self.prefs.slot(batch).opaque_container;
+            let ov = self.prefs.slot(batch).opaque_video;
             if select_ext_chip(ui, c.label(), true, true) {
-                self.prefs.opaque_container = cycle_opaque_container(self.prefs.opaque_video, c);
-                self.save_targets();
-            }
-        });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("α").weak().small());
-            let v = self.prefs.alpha_video;
-            if select_codec_chip(ui, v.label(), true, true) {
-                let next = v.next();
-                self.prefs.alpha_video = next;
-                self.prefs.alpha_container =
-                    gigamux_core::targets::clamp_alpha_container(next, self.prefs.alpha_container);
-                self.save_targets();
-            }
-            let c = self.prefs.alpha_container;
-            if select_ext_chip(ui, c.label(), true, true) {
-                self.prefs.alpha_container = cycle_alpha_container(self.prefs.alpha_video, c);
+                self.prefs.slot_mut(batch).opaque_container = cycle_opaque_container(ov, c);
                 self.save_targets();
             }
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            self.ui_use_hardware_checkbox(ui, |s| s.save_targets());
-            self.ui_maxrate_override(ui);
+            ui.label(egui::RichText::new("α").weak().small());
+            let v = self.prefs.slot(batch).alpha_video;
+            if select_codec_chip(ui, v.label(), true, true) {
+                let next = v.next();
+                self.prefs.slot_mut(batch).alpha_video = next;
+                let cur = self.prefs.slot(batch).alpha_container;
+                self.prefs.slot_mut(batch).alpha_container =
+                    gigamux_core::targets::clamp_alpha_container(next, cur);
+                self.save_targets();
+            }
+            let c = self.prefs.slot(batch).alpha_container;
+            let av = self.prefs.slot(batch).alpha_video;
+            if select_ext_chip(ui, c.label(), true, true) {
+                self.prefs.slot_mut(batch).alpha_container = cycle_alpha_container(av, c);
+                self.save_targets();
+            }
         });
-        if let Some(warn) = self.chroma_convert_warning() {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            self.ui_use_hardware_checkbox(ui, batch, |s| s.save_targets());
+            self.ui_maxrate_override(ui, batch);
+            // CQ stays prefs-only (advanced); not exposed in the shell UI.
+        });
+        if let Some(warn) = self.chroma_convert_warning_for(batch) {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
         }
-        if let Some(warn) = self.audio_recode_warning() {
+        if let Some(warn) = self.audio_recode_warning_for(batch) {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
         }
+    }
+
+    fn ui_test_mode_checkbox(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(&mut self.prefs.test_mode, "Test mode")
+            .on_hover_text(
+                "Encode each input twice as test1_* / test2_* with independent targets for size + VMAF comparison. ←/→ = Test1, Shift+←/→ = Test2, Shift+↑/↓ swaps siblings.",
+            )
+            .changed()
+        {
+            self.save_targets();
+        }
+    }
+
+    fn ui_output_targets(&mut self, ui: &mut egui::Ui) {
+        self.ui_slot_targets(ui, TestBatch::One, "Targets");
+    }
+
+    /// Mid-strip size Δ + VMAF between test1/test2 for the active pair stem.
+    /// Layout mirrors the center meta table: weak label + monospace values + color deltas.
+    fn ui_test_compare_strip(&mut self, ui: &mut egui::Ui) {
+        let stem = self.active.as_ref().map(|(_, n)| Self::pair_stem_of(n));
+        let Some(stem) = stem else {
+            ui.label(egui::RichText::new("Select a file to compare Test1 ↔ Test2").weak().small());
+            return;
+        };
+        let t1 = self.names_for(FileSide::Output).into_iter().find(|n| {
+            let (b, rest) = strip_test_prefix(n);
+            b == Some(TestBatch::One) && rest == stem
+        });
+        let t2 = self.names_for(FileSide::Output).into_iter().find(|n| {
+            let (b, rest) = strip_test_prefix(n);
+            b == Some(TestBatch::Two) && rest == stem
+        });
+        let (Some(n1), Some(n2)) = (t1, t2) else {
+            ui.label(
+                egui::RichText::new(format!("Waiting for test1_/test2_ outputs for “{stem}”"))
+                    .weak()
+                    .small(),
+            );
+            return;
+        };
+
+        let bytes = |name: &str| -> Option<u64> {
+            let key = Self::preview_key(FileSide::Output, name);
+            let e = self.preview_cache.get(&key)?;
+            if e.file_size > 0 {
+                return Some(e.file_size);
+            }
+            e.summary
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .map(|s| s.file_size_bytes)
+                .filter(|&b| b > 0)
+        };
+        let b1 = bytes(&n1);
+        let b2 = bytes(&n2);
+        let delta = match (b1, b2) {
+            (Some(a), Some(b)) => size_delta(a, b),
+            _ => None,
+        };
+        let v1 = self.live_vmaf_score(FileSide::Output, &n1);
+        let v2 = self.live_vmaf_score(FileSide::Output, &n2);
+
+        // Same greens/reds as the center Size row.
+        let green = egui::Color32::from_rgb(80, 180, 100);
+        let red = egui::Color32::from_rgb(220, 90, 80);
+
+        egui::Grid::new("test_compare")
+            .num_columns(2)
+            .spacing([10.0, 3.0])
+            .min_col_width(48.0)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Compare").strong().small());
+                ui.label(egui::RichText::new(&stem).weak().small());
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Size").weak().small());
+                ui.horizontal(|ui| {
+                    ui.monospace(match b1 {
+                        Some(b) => format_bytes(b),
+                        None => "—".into(),
+                    });
+                    ui.label(egui::RichText::new("→").weak());
+                    ui.monospace(match b2 {
+                        Some(b) => format_bytes(b),
+                        None => "—".into(),
+                    });
+                    match delta {
+                        Some(SizeDelta::Smaller { pct, bytes }) => {
+                            ui.add_space(6.0);
+                            ui.colored_label(green, format!("↓{pct}%"));
+                            ui.colored_label(green, format!("↓{}", format_bytes(bytes)));
+                        }
+                        Some(SizeDelta::Larger { pct, bytes }) => {
+                            ui.add_space(6.0);
+                            ui.colored_label(red, format!("↑{pct}%"));
+                            ui.colored_label(red, format!("↑{}", format_bytes(bytes)));
+                        }
+                        Some(SizeDelta::Same) | None => {}
+                    }
+                });
+                ui.end_row();
+
+                ui.label(egui::RichText::new("VMAF").weak().small());
+                ui.horizontal(|ui| {
+                    ui.monospace(match v1 {
+                        Some(v) => format!("{v:.2}"),
+                        None => "—".into(),
+                    });
+                    ui.label(egui::RichText::new("→").weak());
+                    ui.monospace(match v2 {
+                        Some(v) => format!("{v:.2}"),
+                        None => "—".into(),
+                    });
+                    // Higher VMAF is better; color the T1→T2 delta like Size.
+                    if let (Some(a), Some(b)) = (v1, v2) {
+                        let d = b - a;
+                        if d.abs() >= 1e-4 {
+                            ui.add_space(6.0);
+                            if d > 0.0 {
+                                ui.colored_label(green, format!("↑{d:.2}"));
+                            } else {
+                                ui.colored_label(red, format!("↓{:.2}", -d));
+                            }
+                        }
+                    }
+                });
+                ui.end_row();
+            });
     }
 
     fn ui_folder_pane(
@@ -3592,14 +3899,17 @@ impl GigaMuxApp {
                         }
                     }
                 }
+                // Test mode sits on the output path row, immediately after Change….
+                if !is_input {
+                    self.ui_test_mode_checkbox(ui);
+                }
             });
-            // Output targets sit above the list (and above the empty-folder CTA).
-            if !is_input {
-                self.ui_output_targets(ui);
-            }
-            ui.separator();
-
             if !prefs::dir_ok(dir) {
+                // Targets above the empty-folder CTA (non-test only; test needs a real dir for lists).
+                if !is_input && !self.prefs.test_mode {
+                    self.ui_output_targets(ui);
+                    ui.separator();
+                }
                 let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
                 let label = if hovering {
                     if is_input {
@@ -3629,355 +3939,431 @@ impl GigaMuxApp {
             } else {
                 FileSide::Output
             };
-            // Wheel scrolls; primary-drag is marquee (ScrollSource drag defaults to touch-only).
-            egui::ScrollArea::vertical()
-                .id_salt(if is_input { "in_list" } else { "out_list" })
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut row_rects: Vec<(String, egui::Rect)> = Vec::new();
-                    // Defer row clicks until after marquee handling (drag wins over click).
-                    let mut pending_click: Option<(String, bool, bool)> = None;
-                    let mut pending_dbl: Option<(String, PathBuf)> = None;
 
-                    if files.is_empty() {
-                        ui.label(egui::RichText::new("(empty)").weak());
-                    } else {
-                        for path in files {
-                            let name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string());
-                            let selected = self.is_selected(side, &name);
-                            let ext = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("")
-                                .to_ascii_lowercase();
-                            // Codec (+ α) + chroma + CBR/VBR from preview cache; muted … while probing.
-                            let cache_key = Self::preview_key(side, &name);
-                            let tags = self.preview_cache.get(&cache_key).and_then(|e| {
-                                if e.pending {
-                                    return Some((None, false, None, None));
-                                }
-                                e.summary.as_ref().and_then(|r| r.as_ref().ok()).map(|s| {
-                                    let rate = if e.bitrates_ready {
-                                        rate_mode_chip_tag(
-                                            s.avg_video_kbps,
-                                            s.peak_video_kbps,
-                                            s.duration_s,
-                                        )
-                                        .map(|t| t.to_string())
-                                    } else {
-                                        None
-                                    };
-                                    (
-                                        Some(codec_tag(s)),
-                                        s.has_alpha,
-                                        pix_fmt_chip_tag(&s.pix_fmt),
-                                        rate,
-                                    )
-                                })
-                            });
-                            let renaming = self.rename_edit.as_ref().is_some_and(|e| {
-                                e.side == side && e.old_name == name
-                            });
-                            let mut commit_rename: Option<RenameCommitMode> = None;
-                            let row = ui.horizontal(|ui| {
-                                let resp = if renaming {
-                                    let edit = self.rename_edit.as_mut().unwrap();
-                                    let te = egui::TextEdit::singleline(&mut edit.draft)
-                                        .desired_width(ui.available_width().min(280.0).max(120.0))
-                                        .font(egui::TextStyle::Monospace)
-                                        .id_salt(("rename", side as u8, &edit.old_name));
-                                    let resp = ui
-                                        .add(te)
-                                        .on_hover_text(
-                                            "Enter: rename (multi → stem (n).ext). Alt+Enter: apply prefix/suffix edit to all selected.",
-                                        );
-                                    if edit.request_focus {
-                                        resp.request_focus();
-                                        edit.request_focus = false;
-                                    }
-                                    // Enter = default (single or numbered multi); Alt+Enter = affix pattern. Skip focus-loss commit while Alt is held — Alt alone can blur the TextEdit before Enter arrives.
-                                    let (enter, alt) = ui.input(|i| {
-                                        (i.key_pressed(egui::Key::Enter), i.modifiers.alt)
-                                    });
-                                    if enter {
-                                        commit_rename = Some(if alt {
-                                            RenameCommitMode::Pattern
-                                        } else {
-                                            RenameCommitMode::Default
-                                        });
-                                    } else if resp.lost_focus() && !alt {
-                                        commit_rename = Some(RenameCommitMode::Default);
-                                    }
-                                    resp
-                                } else {
-                                    ui.selectable_label(selected, &name)
-                                };
-                                match &tags {
-                                    Some((None, _, _, _)) => codec_chip(ui, "…"),
-                                    Some((Some(tag), has_alpha, chroma, rate)) => {
-                                        codec_chip(ui, tag);
-                                        if *has_alpha {
-                                            alpha_chip(ui);
-                                        }
-                                        if let Some(c) = chroma {
-                                            pix_fmt_chip(ui, c);
-                                        }
-                                        if let Some(r) = rate {
-                                            rate_mode_chip(ui, r);
-                                        }
-                                    }
-                                    None => {}
-                                }
-                                if !ext.is_empty() {
-                                    ext_chip(ui, &format!(".{ext}"), true);
-                                }
-                                resp
-                            });
-                            if let Some(mode) = commit_rename {
-                                self.commit_rename(mode);
-                            }
-                            let resp = row.inner;
-                            // Full row (name + chips) for marquee hit-testing.
-                            row_rects.push((name.clone(), row.response.rect));
-                            // Keyboard nav asks once; snap only if the row is off-screen.
-                            if self.scroll_sel_into_view
-                                && self.active.as_ref().is_some_and(|(s, n)| {
-                                    *s == side && n == &name
-                                })
-                            {
-                                let clip = ui.clip_rect();
-                                let row = resp.rect;
-                                let on_screen = clip.y_range().contains(row.top())
-                                    && clip.y_range().contains(row.bottom());
-                                if !on_screen {
-                                    resp.scroll_to_me_animation(
-                                        Some(egui::Align::Center),
-                                        egui::style::ScrollAnimation::none(),
-                                    );
-                                }
-                                self.scroll_sel_into_view = false;
-                            }
-                            if resp.clicked() && !renaming {
-                                let (shift, ctrl) = ui.ctx().input(|i| {
-                                    (i.modifiers.shift, i.modifiers.command)
-                                });
-                                pending_click = Some((name.clone(), shift, ctrl));
-                            }
-                            if resp.double_clicked() {
-                                pending_dbl = Some((name.clone(), path.clone()));
-                            }
-                            resp.context_menu(|ui| {
-                                if is_input
-                                    && ui
-                                        .add_enabled(
-                                            !self.busy,
-                                            egui::Button::new("Encode this file"),
-                                        )
-                                        .clicked()
-                                {
-                                    self.select_file(FileSide::Input, name.clone());
-                                    self.start_encode(Some(name.clone()));
-                                    ui.close();
-                                }
-                                if ui
-                                    .add_enabled(!self.busy, egui::Button::new("VMAF this file"))
-                                    .on_hover_text(
-                                        "libvmaf: this file’s input vs matching output (same stem)",
-                                    )
-                                    .clicked()
-                                {
-                                    self.select_file(side, name.clone());
-                                    self.start_vmaf(Some(name.clone()));
-                                    ui.close();
-                                }
-                                if ui.button("Open in player").clicked() {
-                                    self.select_file(side, name.clone());
-                                    if let Err(e) = open_path_in_os(path) {
-                                        self.push_session(format!("open failed: {e}"));
-                                    }
-                                    ui.close();
-                                }
-                                let rename_label = if self.is_selected(side, &name)
-                                    && self.selected.len() > 1
-                                {
-                                    format!("Rename {} selected", self.selected.len())
-                                } else {
-                                    "Rename".into()
-                                };
-                                if ui
-                                    .add_enabled(!self.busy, egui::Button::new(rename_label))
-                                    .on_hover_text(
-                                        "F2 — Enter renames (multi → stem (n).ext); Alt+Enter applies the edit to all selected",
-                                    )
-                                    .clicked()
-                                {
-                                    if !self.is_selected(side, &name) {
-                                        self.select_file(side, name.clone());
-                                    } else {
-                                        self.set_primary(side, name.clone());
-                                    }
-                                    self.begin_rename_active();
-                                    ui.close();
-                                }
-                                let del_label = if self.is_selected(side, &name)
-                                    && self.selected.len() > 1
-                                {
-                                    format!("Delete {} selected", self.selected.len())
-                                } else {
-                                    "Delete".into()
-                                };
-                                if ui
-                                    .add_enabled(!self.busy, egui::Button::new(del_label))
-                                    .clicked()
-                                {
-                                    if !self.is_selected(side, &name) {
-                                        self.select_file(side, name.clone());
-                                    }
-                                    self.delete_active();
-                                    ui.close();
-                                }
-                            });
-                        }
-                    }
-                    // Trailing blank absorbs presses for marquee / clear.
-                    let fill = ui.available_size().max(egui::vec2(1.0, 24.0));
-                    let blank = ui.allocate_response(fill, egui::Sense::click_and_drag());
+            // Test mode: two virtual output folders (Test1 / Test2) with their own lists.
+            if !is_input && self.prefs.test_mode {
+                let files1 = Self::output_files_for_batch(files, TestBatch::One);
+                let files2 = Self::output_files_for_batch(files, TestBatch::Two);
+                let avail = ui.available_height();
+                let compare_h = 64.0;
+                let half = ((avail - compare_h) * 0.5).max(100.0);
+                let w = ui.available_width();
 
-                    let list_rect = ui.min_rect().union(blank.rect);
-                    let (pressed, down, released, additive, pointer) = ui.ctx().input(|i| {
-                        (
-                            i.pointer.primary_pressed(),
-                            i.pointer.primary_down(),
-                            i.pointer.primary_released(),
-                            i.modifiers.command,
-                            i.pointer.interact_pos(),
-                        )
-                    });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(w, half),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        self.ui_slot_targets(ui, TestBatch::One, "Test1");
+                        ui.separator();
+                        self.ui_file_scroll_list(ui, side, false, &files1, "out_list_t1");
+                    },
+                );
+                ui.separator();
+                self.ui_test_compare_strip(ui);
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(w, ui.available_height().max(half * 0.5)),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        self.ui_slot_targets(ui, TestBatch::Two, "Test2");
+                        ui.separator();
+                        self.ui_file_scroll_list(ui, side, false, &files2, "out_list_t2");
+                    },
+                );
+                return;
+            }
 
-                    // Begin marquee on primary press inside this list.
-                    if pressed {
-                        if let Some(pos) = pointer.filter(|p| list_rect.contains(*p)) {
-                            let on_row = row_rects.iter().any(|(_, r)| r.contains(pos));
-                            let baseline = if additive {
-                                self.selected.clone()
-                            } else {
-                                HashSet::new()
-                            };
-                            self.box_select = Some(BoxSelect {
-                                side,
-                                origin: pos,
-                                current: pos,
-                                additive,
-                                baseline,
-                                active: false,
-                                started_on_row: on_row,
-                            });
-                        }
-                    }
-
-                    let mut marquee_consumed = false;
-                    if self.box_select.as_ref().is_some_and(|b| b.side == side) {
-                        if down {
-                            if let Some(pos) = pointer {
-                                if let Some(box_sel) = self.box_select.as_mut() {
-                                    box_sel.current = pos;
-                                    if !box_sel.active
-                                        && (box_sel.current - box_sel.origin).length()
-                                            >= BOX_SELECT_SLOP
-                                    {
-                                        box_sel.active = true;
-                                    }
-                                }
-                            }
-                        }
-                        let active = self.box_select.as_ref().is_some_and(|b| b.active);
-                        if active {
-                            marquee_consumed = true;
-                            let (origin, current, additive, baseline) = {
-                                let b = self.box_select.as_ref().unwrap();
-                                (b.origin, b.current, b.additive, b.baseline.clone())
-                            };
-                            let rect =
-                                egui::Rect::from_two_pos(origin, current).intersect(list_rect);
-                            let fill_c = egui::Color32::from_rgba_unmultiplied(90, 160, 230, 45);
-                            let stroke =
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 160, 230));
-                            ui.painter().rect_filled(rect, 0.0, fill_c);
-                            ui.painter().rect_stroke(
-                                rect,
-                                0.0,
-                                stroke,
-                                egui::StrokeKind::Outside,
-                            );
-
-                            let mut hits: HashSet<String> = if additive {
-                                baseline.clone()
-                            } else {
-                                HashSet::new()
-                            };
-                            for (name, row) in &row_rects {
-                                if rect.intersects(*row) {
-                                    hits.insert(name.clone());
-                                }
-                            }
-                            let anchor = baseline.iter().next().cloned().or_else(|| {
-                                row_rects
-                                    .iter()
-                                    .find(|(_, r)| rect.intersects(*r))
-                                    .map(|(n, _)| n.clone())
-                            });
-                            self.select_set(side, hits, anchor);
-                        }
-
-                        if released {
-                            if let Some(box_sel) = self.box_select.take() {
-                                if box_sel.active {
-                                    marquee_consumed = true;
-                                } else if !box_sel.started_on_row {
-                                    // Click empty space without dragging — clear (unless Ctrl).
-                                    if !box_sel.additive {
-                                        self.clear_active();
-                                    }
-                                    marquee_consumed = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if !marquee_consumed {
-                        if let Some((name, path)) = pending_dbl {
-                            self.select_file(side, name);
-                            if let Err(e) = open_path_in_os(&path) {
-                                self.push_session(format!("open failed: {e}"));
-                            }
-                        } else if let Some((name, shift, ctrl)) = pending_click {
-                            if shift {
-                                self.select_range(side, name);
-                            } else if ctrl {
-                                self.select_toggle(side, name);
-                            } else {
-                                self.select_file(side, name);
-                            }
-                        }
-                    }
-
-                    // PgUp/PgDn step ≈ one viewport of rows (overlap by one).
-                    if self.active.as_ref().is_some_and(|(s, _)| *s == side) {
-                        let clip_h = ui.clip_rect().height();
-                        let row_h = row_rects
-                            .first()
-                            .map(|(_, r)| r.height())
-                            .unwrap_or(22.0)
-                            .max(1.0);
-                        let visible = (clip_h / row_h).floor() as usize;
-                        self.folder_page_rows = visible.saturating_sub(1).max(1);
-                    }
-                });
+            if !is_input {
+                self.ui_output_targets(ui);
+            }
+            ui.separator();
+            let salt = if is_input { "in_list" } else { "out_list" };
+            self.ui_file_scroll_list(ui, side, is_input, files, salt);
         });
     }
+
+    /// Scrollable file rows for one folder list (or one test-batch half).
+    fn ui_file_scroll_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        side: FileSide,
+        is_input: bool,
+        files: &[PathBuf],
+        id_salt: &str,
+    ) {
+        // Wheel scrolls; primary-drag is marquee (ScrollSource drag defaults to touch-only).
+        egui::ScrollArea::vertical()
+            .id_salt(id_salt)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut row_rects: Vec<(String, egui::Rect)> = Vec::new();
+                // Defer row clicks until after marquee handling (drag wins over click).
+                let mut pending_click: Option<(String, bool, bool)> = None;
+                let mut pending_dbl: Option<(String, PathBuf)> = None;
+
+                if files.is_empty() {
+                    ui.label(egui::RichText::new("(empty)").weak());
+                } else {
+                    for path in files {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        let selected = self.is_selected(side, &name);
+                        let ext = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        // Test-mode half-lists already name the batch — hide test1_/test2_ there only.
+                        // Non-test mode always shows the real basename (prefixes included).
+                        let row_label = if self.prefs.test_mode {
+                            let (batch, stem) = strip_test_prefix(&name);
+                            if batch.is_some() {
+                                if ext.is_empty() {
+                                    stem
+                                } else {
+                                    format!("{stem}.{ext}")
+                                }
+                            } else {
+                                name.clone()
+                            }
+                        } else {
+                            name.clone()
+                        };
+                        // Codec (+ α) + chroma + CBR/VBR from preview cache; muted … while probing.
+                        let cache_key = Self::preview_key(side, &name);
+                        let tags = self.preview_cache.get(&cache_key).and_then(|e| {
+                            if e.pending {
+                                return Some((None, false, None, None));
+                            }
+                            e.summary.as_ref().and_then(|r| r.as_ref().ok()).map(|s| {
+                                let rate = if e.bitrates_ready {
+                                    rate_mode_chip_tag(
+                                        s.avg_video_kbps,
+                                        s.peak_video_kbps,
+                                        s.duration_s,
+                                    )
+                                    .map(|t| t.to_string())
+                                } else {
+                                    None
+                                };
+                                (
+                                    Some(codec_tag(s)),
+                                    s.has_alpha,
+                                    pix_fmt_chip_tag(&s.pix_fmt),
+                                    rate,
+                                )
+                            })
+                        });
+                        let renaming = self.rename_edit.as_ref().is_some_and(|e| {
+                            e.side == side && e.old_name == name
+                        });
+                        let mut commit_rename: Option<RenameCommitMode> = None;
+                        let row = ui.horizontal(|ui| {
+                            let resp = if renaming {
+                                let edit = self.rename_edit.as_mut().unwrap();
+                                let te = egui::TextEdit::singleline(&mut edit.draft)
+                                    .desired_width(ui.available_width().min(280.0).max(120.0))
+                                    .font(egui::TextStyle::Monospace)
+                                    .id_salt(("rename", side as u8, &edit.old_name));
+                                let resp = ui
+                                    .add(te)
+                                    .on_hover_text(
+                                        "Enter: rename (multi → stem (n).ext). Alt+Enter: apply prefix/suffix edit to all selected.",
+                                    );
+                                if edit.request_focus {
+                                    resp.request_focus();
+                                    edit.request_focus = false;
+                                }
+                                // Enter = default (single or numbered multi); Alt+Enter = affix pattern. Skip focus-loss commit while Alt is held — Alt alone can blur the TextEdit before Enter arrives.
+                                let (enter, alt) = ui.input(|i| {
+                                    (i.key_pressed(egui::Key::Enter), i.modifiers.alt)
+                                });
+                                if enter {
+                                    commit_rename = Some(if alt {
+                                        RenameCommitMode::Pattern
+                                    } else {
+                                        RenameCommitMode::Default
+                                    });
+                                } else if resp.lost_focus() && !alt {
+                                    commit_rename = Some(RenameCommitMode::Default);
+                                }
+                                resp
+                            } else {
+                                ui.selectable_label(selected, &row_label)
+                                    .on_hover_text(&name)
+                            };
+                            match &tags {
+                                Some((None, _, _, _)) => codec_chip(ui, "…"),
+                                Some((Some(tag), has_alpha, chroma, rate)) => {
+                                    codec_chip(ui, tag);
+                                    if *has_alpha {
+                                        alpha_chip(ui);
+                                    }
+                                    if let Some(c) = chroma {
+                                        pix_fmt_chip(ui, c);
+                                    }
+                                    if let Some(r) = rate {
+                                        rate_mode_chip(ui, r);
+                                    }
+                                }
+                                None => {}
+                            }
+                            if !ext.is_empty() {
+                                ext_chip(ui, &format!(".{ext}"), true);
+                            }
+                            resp
+                        });
+                        if let Some(mode) = commit_rename {
+                            self.commit_rename(mode);
+                        }
+                        let resp = row.inner;
+                        // Full row (name + chips) for marquee hit-testing.
+                        row_rects.push((name.clone(), row.response.rect));
+                        // Keyboard nav asks once; snap only if the row is off-screen.
+                        if self.scroll_sel_into_view
+                            && self.active.as_ref().is_some_and(|(s, n)| {
+                                *s == side && n == &name
+                            })
+                        {
+                            let clip = ui.clip_rect();
+                            let row = resp.rect;
+                            let on_screen = clip.y_range().contains(row.top())
+                                && clip.y_range().contains(row.bottom());
+                            if !on_screen {
+                                resp.scroll_to_me_animation(
+                                    Some(egui::Align::Center),
+                                    egui::style::ScrollAnimation::none(),
+                                );
+                            }
+                            self.scroll_sel_into_view = false;
+                        }
+                        if resp.clicked() && !renaming {
+                            let (shift, ctrl) = ui.ctx().input(|i| {
+                                (i.modifiers.shift, i.modifiers.command)
+                            });
+                            pending_click = Some((name.clone(), shift, ctrl));
+                        }
+                        if resp.double_clicked() {
+                            pending_dbl = Some((name.clone(), path.clone()));
+                        }
+                        resp.context_menu(|ui| {
+                            if is_input
+                                && ui
+                                    .add_enabled(
+                                        !self.busy,
+                                        egui::Button::new("Encode this file"),
+                                    )
+                                    .clicked()
+                            {
+                                self.select_file(FileSide::Input, name.clone());
+                                self.start_encode(Some(name.clone()));
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(!self.busy, egui::Button::new("VMAF this file"))
+                                .on_hover_text(
+                                    "libvmaf: this file’s input vs matching output (same stem)",
+                                )
+                                .clicked()
+                            {
+                                self.select_file(side, name.clone());
+                                self.start_vmaf(Some(name.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Open in player").clicked() {
+                                self.select_file(side, name.clone());
+                                if let Err(e) = open_path_in_os(path) {
+                                    self.push_session(format!("open failed: {e}"));
+                                }
+                                ui.close();
+                            }
+                            let rename_label = if self.is_selected(side, &name)
+                                && self.selected.len() > 1
+                            {
+                                format!("Rename {} selected", self.selected.len())
+                            } else {
+                                "Rename".into()
+                            };
+                            if ui
+                                .add_enabled(!self.busy, egui::Button::new(rename_label))
+                                .on_hover_text(
+                                    "F2 — Enter renames (multi → stem (n).ext); Alt+Enter applies the edit to all selected",
+                                )
+                                .clicked()
+                            {
+                                if !self.is_selected(side, &name) {
+                                    self.select_file(side, name.clone());
+                                } else {
+                                    self.set_primary(side, name.clone());
+                                }
+                                self.begin_rename_active();
+                                ui.close();
+                            }
+                            let del_label = if self.is_selected(side, &name)
+                                && self.selected.len() > 1
+                            {
+                                format!("Delete {} selected", self.selected.len())
+                            } else {
+                                "Delete".into()
+                            };
+                            if ui
+                                .add_enabled(!self.busy, egui::Button::new(del_label))
+                                .clicked()
+                            {
+                                if !self.is_selected(side, &name) {
+                                    self.select_file(side, name.clone());
+                                }
+                                self.delete_active();
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+                // Trailing blank absorbs presses for marquee / clear.
+                let fill = ui.available_size().max(egui::vec2(1.0, 24.0));
+                let blank = ui.allocate_response(fill, egui::Sense::click_and_drag());
+
+                let list_rect = ui.min_rect().union(blank.rect);
+                let (pressed, down, released, additive, pointer) = ui.ctx().input(|i| {
+                    (
+                        i.pointer.primary_pressed(),
+                        i.pointer.primary_down(),
+                        i.pointer.primary_released(),
+                        i.modifiers.command,
+                        i.pointer.interact_pos(),
+                    )
+                });
+
+                // Begin marquee on primary press inside this list only.
+                if pressed {
+                    if let Some(pos) = pointer.filter(|p| list_rect.contains(*p)) {
+                        let on_row = row_rects.iter().any(|(_, r)| r.contains(pos));
+                        let baseline = if additive {
+                            self.selected.clone()
+                        } else {
+                            HashSet::new()
+                        };
+                        self.box_select = Some(BoxSelect {
+                            side,
+                            list_id: id_salt.to_string(),
+                            origin: pos,
+                            current: pos,
+                            additive,
+                            baseline,
+                            active: false,
+                            started_on_row: on_row,
+                        });
+                    }
+                }
+
+                // Only the list that started the drag may update/finish it (Test1/Test2 share Output).
+                let owns_marquee = self
+                    .box_select
+                    .as_ref()
+                    .is_some_and(|b| b.side == side && b.list_id == id_salt);
+
+                let mut marquee_consumed = false;
+                if owns_marquee {
+                    if down {
+                        if let Some(pos) = pointer {
+                            if let Some(box_sel) = self.box_select.as_mut() {
+                                box_sel.current = pos;
+                                if !box_sel.active
+                                    && (box_sel.current - box_sel.origin).length()
+                                        >= BOX_SELECT_SLOP
+                                {
+                                    box_sel.active = true;
+                                }
+                            }
+                        }
+                    }
+                    let active = self.box_select.as_ref().is_some_and(|b| b.active);
+                    if active {
+                        marquee_consumed = true;
+                        let (origin, current, additive, baseline) = {
+                            let b = self.box_select.as_ref().unwrap();
+                            (b.origin, b.current, b.additive, b.baseline.clone())
+                        };
+                        let rect =
+                            egui::Rect::from_two_pos(origin, current).intersect(list_rect);
+                        let fill_c = egui::Color32::from_rgba_unmultiplied(90, 160, 230, 45);
+                        let stroke =
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 160, 230));
+                        ui.painter().rect_filled(rect, 0.0, fill_c);
+                        ui.painter().rect_stroke(
+                            rect,
+                            0.0,
+                            stroke,
+                            egui::StrokeKind::Outside,
+                        );
+
+                        let mut hits: HashSet<String> = if additive {
+                            baseline.clone()
+                        } else {
+                            HashSet::new()
+                        };
+                        for (name, row) in &row_rects {
+                            if rect.intersects(*row) {
+                                hits.insert(name.clone());
+                            }
+                        }
+                        let anchor = baseline.iter().next().cloned().or_else(|| {
+                            row_rects
+                                .iter()
+                                .find(|(_, r)| rect.intersects(*r))
+                                .map(|(n, _)| n.clone())
+                        });
+                        self.select_set(side, hits, anchor);
+                    }
+
+                    if released {
+                        if let Some(box_sel) = self.box_select.take() {
+                            if box_sel.active {
+                                marquee_consumed = true;
+                            } else if !box_sel.started_on_row {
+                                // Click empty space without dragging — clear (unless Ctrl).
+                                if !box_sel.additive {
+                                    self.clear_active();
+                                }
+                                marquee_consumed = true;
+                            }
+                        }
+                    }
+                }
+
+                if !marquee_consumed {
+                    if let Some((name, path)) = pending_dbl {
+                        self.select_file(side, name);
+                        if let Err(e) = open_path_in_os(&path) {
+                            self.push_session(format!("open failed: {e}"));
+                        }
+                    } else if let Some((name, shift, ctrl)) = pending_click {
+                        if shift {
+                            self.select_range(side, name);
+                        } else if ctrl {
+                            self.select_toggle(side, name);
+                        } else {
+                            self.select_file(side, name);
+                        }
+                    }
+                }
+
+                // PgUp/PgDn step ≈ one viewport of rows (overlap by one).
+                if self.active.as_ref().is_some_and(|(s, _)| *s == side) {
+                    let clip_h = ui.clip_rect().height();
+                    let row_h = row_rects
+                        .first()
+                        .map(|(_, r)| r.height())
+                        .unwrap_or(22.0)
+                        .max(1.0);
+                    let visible = (clip_h / row_h).floor() as usize;
+                    self.folder_page_rows = visible.saturating_sub(1).max(1);
+                }
+            });
+    }
+
 
     fn ui_center(&mut self, ui: &mut egui::Ui) {
         // Split preview vs actions into separate bands so log expand/collapse never lets Settings / Encode / Check overlap the preview (or each other).
@@ -4478,25 +4864,27 @@ impl GigaMuxApp {
             },
         );
         if close {
-            self.commit_maxrate_override_edit();
-            self.commit_cq_override_edit();
+            self.commit_maxrate_override_edit(TestBatch::One);
+            self.commit_maxrate_override_edit(TestBatch::Two);
+            self.commit_cq_override_edit(TestBatch::One);
+            self.commit_cq_override_edit(TestBatch::Two);
             let _ = prefs::save(&self.prefs);
             self.show_settings = false;
         }
     }
 
-    /// Encode tab: hardware, GPU, maxrate, CQ, peak ceiling.
+    /// Encode tab: hardware, GPU, maxrate, peak ceiling (slot1 + optional slot2 in test mode).
+    /// CQ is prefs-only (advanced); not shown here.
     fn ui_settings_encode(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            self.ui_use_hardware_checkbox(ui, |s| {
-                let _ = prefs::save(&s.prefs);
-            });
-            self.ui_maxrate_override(ui);
-        });
-        ui.horizontal(|ui| {
-            self.ui_cq_override(ui);
-        });
-        ui.add_enabled_ui(self.prefs.use_hardware, |ui| {
+        self.ui_slot_targets(ui, TestBatch::One, if self.prefs.test_mode { "Test1" } else { "Targets" });
+        if self.prefs.test_mode {
+            ui.add_space(8.0);
+            self.ui_slot_targets(ui, TestBatch::Two, "Test2");
+        }
+        ui.add_space(8.0);
+        let hw_any = self.prefs.slot1.use_hardware
+            || (self.prefs.test_mode && self.prefs.slot2.use_hardware);
+        ui.add_enabled_ui(hw_any, |ui| {
             ui.horizontal(|ui| {
                 ui.label("GPU");
                 let mut selected = match self.prefs.gpu {

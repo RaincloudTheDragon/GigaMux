@@ -466,6 +466,56 @@ impl Default for OutputTargets {
     }
 }
 
+/// Test-mode batch index (maps to `test1_` / `test2_` output prefixes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestBatch {
+    One,
+    Two,
+}
+
+impl TestBatch {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::One => "test1_",
+            Self::Two => "test2_",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::One => "Test1",
+            Self::Two => "Test2",
+        }
+    }
+
+    pub fn sibling(self) -> Self {
+        match self {
+            Self::One => Self::Two,
+            Self::Two => Self::One,
+        }
+    }
+}
+
+/// Strip a `test1_` / `test2_` basename prefix; returns batch + remainder stem (no extension).
+pub fn strip_test_prefix(name: &str) -> (Option<TestBatch>, String) {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    if let Some(rest) = stem.strip_prefix(TestBatch::One.prefix()) {
+        (Some(TestBatch::One), rest.to_string())
+    } else if let Some(rest) = stem.strip_prefix(TestBatch::Two.prefix()) {
+        (Some(TestBatch::Two), rest.to_string())
+    } else {
+        (None, stem.to_string())
+    }
+}
+
+/// Source stem used for input↔output pairing (strips test prefixes when present).
+pub fn pair_stem(name: &str) -> String {
+    strip_test_prefix(name).1
+}
+
 impl OutputTargets {
     pub fn container_for(self, has_alpha: bool) -> OutContainer {
         if has_alpha {
@@ -475,12 +525,27 @@ impl OutputTargets {
         }
     }
 
+    /// Basename for a normal (non-test) encode: `{stem}.{ext}`.
     pub fn expected_name(self, input_name: &str, has_alpha: bool) -> String {
+        self.expected_name_for(input_name, has_alpha, None)
+    }
+
+    /// Basename with optional test prefix: `test1_{stem}.{ext}` / `test2_{stem}.{ext}`.
+    pub fn expected_name_for(
+        self,
+        input_name: &str,
+        has_alpha: bool,
+        batch: Option<TestBatch>,
+    ) -> String {
         let stem = std::path::Path::new(input_name)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(input_name);
-        format!("{stem}.{}", self.container_for(has_alpha).ext())
+        let ext = self.container_for(has_alpha).ext();
+        match batch {
+            Some(b) => format!("{}{stem}.{ext}", b.prefix()),
+            None => format!("{stem}.{ext}"),
+        }
     }
 
     pub fn kind_label(self, has_alpha: bool) -> String {
