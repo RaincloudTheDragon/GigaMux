@@ -469,10 +469,79 @@ pub fn is_codec_mismatch_issue(issue: &CheckIssue) -> bool {
     issue.message.starts_with("Codec mismatch:")
 }
 
+/// How serious a Check finding is (drives result-window order / color / purge defaults).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckSeverity {
+    /// Broken / incomplete encode — purge candidates when an output exists.
+    High = 0,
+    /// Expected output missing (nothing on disk to purge).
+    Medium = 1,
+    /// Informational (wrong target codec, orphan output, AV1 probe quirk).
+    Low = 2,
+}
+
+impl CheckSeverity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::High => "High",
+            Self::Medium => "Medium",
+            Self::Low => "Low",
+        }
+    }
+}
+
+/// Classify a Check issue for the results UI.
+pub fn check_issue_severity(issue: &CheckIssue) -> CheckSeverity {
+    if is_codec_mismatch_issue(issue)
+        || is_orphan_output_issue(issue)
+        || issue.message.starts_with("AV1 output unreadable")
+    {
+        CheckSeverity::Low
+    } else if issue.message.starts_with("Missing from output") {
+        CheckSeverity::Medium
+    } else {
+        CheckSeverity::High
+    }
+}
+
+/// Short group title for the Check results tree.
+pub fn check_issue_category(issue: &CheckIssue) -> &'static str {
+    let m = issue.message.as_str();
+    if m.starts_with("Codec mismatch") {
+        "Codec mismatch"
+    } else if m.starts_with("Missing from input") {
+        "Outputs without inputs"
+    } else if m.starts_with("Missing from output") {
+        "Missing from output"
+    } else if m.starts_with("Container mismatch") {
+        "Container mismatch"
+    } else if m.starts_with("Alpha mismatch") {
+        "Alpha mismatch"
+    } else if m.starts_with("Audio") {
+        "Audio mismatch"
+    } else if m.starts_with("Input probe") {
+        "Input probe failed"
+    } else if m.starts_with("Output file error") {
+        "Output file error"
+    } else if m.starts_with("Incomplete") || m.starts_with("AV1 output unreadable") {
+        "Incomplete / unreadable"
+    } else if m.starts_with("Duration mismatch") {
+        "Duration mismatch"
+    } else if m.starts_with("Resolution mismatch") {
+        "Resolution mismatch"
+    } else if m.starts_with("Missing video") {
+        "Missing video stream"
+    } else if m.contains("duration") || m.contains("Duration") {
+        "Duration"
+    } else {
+        "Other"
+    }
+}
+
 /// True when this issue points at an on-disk output that delete would remove.
-/// Skips “Missing from output”, codec mismatches (warn-only), and input-only probe failures.
+/// Skips “Missing from output” and input-only probe failures; codec mismatch / orphans are deletable when selected.
 pub fn issue_has_deletable_output(output_dir: &Path, issue: &CheckIssue) -> bool {
-    if issue.message.starts_with("Missing from output") || is_codec_mismatch_issue(issue) {
+    if issue.message.starts_with("Missing from output") {
         return false;
     }
     let Some(name) = &issue.output else {

@@ -15,9 +15,9 @@ use eframe::egui;
 mod taskbar_progress;
 
 use gigamux_core::check::{
-    deletable_issues, delete_issue_outputs, is_codec_mismatch_issue, is_orphan_output_issue,
+    check_issue_category, check_issue_severity, delete_issue_outputs, issue_has_deletable_output,
     list_media, permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue,
-    CheckReport,
+    CheckReport, CheckSeverity,
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
 use gigamux_core::vmaf::{run_vmaf, VmafEvent, VmafReport};
@@ -143,6 +143,19 @@ enum SettingsTab {
 
 fn settings_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("gigamux_settings")
+}
+
+fn check_results_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("gigamux_check_results")
+}
+
+/// Color for a Check severity row / header.
+fn check_severity_color(sev: CheckSeverity) -> egui::Color32 {
+    match sev {
+        CheckSeverity::High => egui::Color32::from_rgb(220, 90, 90),
+        CheckSeverity::Medium => egui::Color32::from_rgb(220, 160, 70),
+        CheckSeverity::Low => egui::Color32::from_rgb(200, 180, 70),
+    }
 }
 
 enum AppEvent {
@@ -284,8 +297,8 @@ struct GigaMuxApp {
     job: Option<JobKind>,
     cancel: Arc<AtomicBool>,
     event_rx: Option<Receiver<AppEvent>>,
-    /// Check result dialog (always shown on issues; delete only if outputs exist).
-    pending_check: Option<CheckPrompt>,
+    /// Check results viewport (severity tree + selective purge).
+    pending_check: Option<CheckResultsWindow>,
     /// Confirm before Recycle Bin (unless the user opted out).
     pending_recycle_delete: Option<RecycleDeletePrompt>,
     /// Recycle Bin failed — confirm permanent delete (or proceed if warnings disabled).
@@ -496,14 +509,11 @@ impl UndoStep {
     }
 }
 
-/// Post-check dialog: warn about non-intact files; optional delete of bad outputs.
-#[derive(Clone)]
-struct CheckPrompt {
-    issue_count: usize,
-    /// All on-disk outputs Check would offer to delete (before orphan filter).
-    deletable: Vec<CheckIssue>,
-    /// Skip outputs with no matching input stem (from prefs; editable in the dialog).
-    ignore_orphans: bool,
+/// Dedicated Check results window: severity-ordered tree + selective purge.
+struct CheckResultsWindow {
+    issues: Vec<CheckIssue>,
+    /// Indices into `issues` checked for Recycle Bin purge (must have on-disk output).
+    selected: HashSet<usize>,
 }
 
 /// Shared fields for delete confirmation dialogs (one or many basenames).
@@ -2759,6 +2769,8 @@ impl GigaMuxApp {
                 self.push_session("delete cancelled");
             } else if self.history_nav.is_some() {
                 self.cancel_history_nav();
+            } else if self.pending_check.is_some() {
+                self.pending_check = None;
             } else if self.show_settings {
                 self.commit_maxrate_override_edit();
                 self.commit_cq_override_edit();
@@ -3147,8 +3159,8 @@ impl GigaMuxApp {
                 (None, Some(o)) => o.clone(),
                 (None, None) => "?".into(),
             };
-            // Codec mismatch / orphan output: warn (yellow), not a broken pair.
-            let line = if is_codec_mismatch_issue(issue) || is_orphan_output_issue(issue) {
+            // Low severity → yellow WARN; High/Medium → red ISSUE.
+            let line = if check_issue_severity(issue) == CheckSeverity::Low {
                 format!("WARN {label}: {}", issue.message)
             } else {
                 format!("ISSUE {label}: {}", issue.message)
@@ -3163,17 +3175,20 @@ impl GigaMuxApp {
             report.ok_pairs,
             report.issues.len()
         ));
-        // Full deletable set; orphan filter applied in the prompt via `ignore_orphans`.
-        let deletable: Vec<CheckIssue> =
-            deletable_issues(&self.prefs.output_dir, &report.issues, false)
-                .into_iter()
-                .cloned()
-                .collect();
-        // Always warn that files are not intact; delete only offered when outputs exist.
-        self.pending_check = Some(CheckPrompt {
-            issue_count: report.issues.len(),
-            deletable,
-            ignore_orphans: self.prefs.check_ignore_orphan_outputs,
+        // Default purge selection: High-severity deletable outputs (Low stays unchecked).
+        let out_dir = &self.prefs.output_dir;
+        let mut selected = HashSet::new();
+        for (idx, issue) in report.issues.iter().enumerate() {
+            if !issue_has_deletable_output(out_dir, issue) {
+                continue;
+            }
+            if check_issue_severity(issue) == CheckSeverity::High {
+                selected.insert(idx);
+            }
+        }
+        self.pending_check = Some(CheckResultsWindow {
+            issues: report.issues,
+            selected,
         });
     }
 
@@ -4598,7 +4613,7 @@ impl GigaMuxApp {
                 "Check: ignore outputs without inputs",
             )
             .on_hover_text(
-                "When Check offers to delete bad outputs, leave alone files with no matching input stem. Also available on the Check dialog.",
+                "Legacy pref — orphans are selected in the Check results window via category checkboxes.",
             )
             .changed()
         {
@@ -4880,103 +4895,340 @@ impl GigaMuxApp {
             });
     }
 
+    /// Dedicated Check results viewport: severity tree, selective purge.
     fn ui_check_prompt(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = self.pending_check.clone() else {
+        if self.pending_check.is_none() {
             return;
-        };
-        let orphan_n = prompt
-            .deletable
-            .iter()
-            .filter(|i| is_orphan_output_issue(i))
-            .count();
-        let to_delete: Vec<CheckIssue> = prompt
-            .deletable
-            .iter()
-            .filter(|i| !(prompt.ignore_orphans && is_orphan_output_issue(i)))
-            .cloned()
-            .collect();
-        egui::Window::new("Check found issues")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 40.0])
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "{} file(s) are not intact (missing, mismatched, or incomplete).",
-                    prompt.issue_count
-                ));
-                if orphan_n > 0 {
-                    let mut ignore = prompt.ignore_orphans;
-                    if ui
-                        .checkbox(
-                            &mut ignore,
-                            format!("Ignore outputs without inputs ({orphan_n})"),
-                        )
-                        .on_hover_text(
-                            "Leave alone outputs whose stem has no matching input. Still logged as issues; excluded from Delete outputs.",
-                        )
-                        .changed()
-                    {
-                        if let Some(p) = self.pending_check.as_mut() {
-                            p.ignore_orphans = ignore;
-                        }
-                        self.prefs.check_ignore_orphan_outputs = ignore;
-                        let _ = prefs::save(&self.prefs);
-                    }
+        }
+        let vp_id = check_results_viewport_id();
+        let mut close = false;
+        let mut purge = false;
+        let mut open_log = false;
+        let out_dir = self.prefs.output_dir.clone();
+
+        ctx.show_viewport_immediate(
+            vp_id,
+            egui::ViewportBuilder::default()
+                .with_title("Check results")
+                .with_inner_size([640.0, 480.0])
+                .with_min_inner_size([480.0, 320.0]),
+            |ui, _class| {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested()) {
+                    close = true;
                 }
-                if prompt.deletable.is_empty() {
-                    ui.label("No problematic output files to delete.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Open session log").clicked() {
-                            self.log_open = true;
-                            self.log_show_session = true;
-                            self.pending_check = None;
+
+                let (issue_n, selected_n) = self
+                    .pending_check
+                    .as_ref()
+                    .map(|w| (w.issues.len(), w.selected.len()))
+                    .unwrap_or((0, 0));
+
+                egui::Panel::bottom("check_results_bottom")
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        let delete_label = if selected_n > 0 {
+                            format!("Delete outputs of all selected ({selected_n})")
+                        } else {
+                            "Delete outputs of all selected".into()
+                        };
+                        let delete_btn = egui::Button::new(
+                            egui::RichText::new(delete_label).size(16.0).strong(),
+                        )
+                        .min_size(egui::vec2(ui.available_width(), 36.0));
+                        if ui
+                            .add_enabled(selected_n > 0, delete_btn)
+                            .on_hover_text("Move checked outputs to the Recycle Bin")
+                            .clicked()
+                        {
+                            purge = true;
                         }
-                        if ui.button("OK").clicked() {
-                            self.pending_check = None;
-                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Close").clicked() {
+                                close = true;
+                            }
+                            if ui.button("Open session log").clicked() {
+                                open_log = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(format!("{issue_n} issue(s)"));
+                            });
+                        });
+                        ui.add_space(2.0);
                     });
-                } else if to_delete.is_empty() {
-                    ui.label("No problematic output files to delete (orphans ignored).");
-                    ui.horizontal(|ui| {
-                        if ui.button("Open session log").clicked() {
-                            self.log_open = true;
-                            self.log_show_session = true;
-                            self.pending_check = None;
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Check a severity or category to select its deletable outputs, or toggle rows.",
+                    );
+                    ui.add_space(6.0);
+
+                    // Build (severity → category → indices) without holding a long borrow.
+                    let groups: Vec<(CheckSeverity, Vec<(&'static str, Vec<usize>)>)> = {
+                        let Some(w) = self.pending_check.as_ref() else {
+                            return;
+                        };
+                        let sevs = [
+                            CheckSeverity::High,
+                            CheckSeverity::Medium,
+                            CheckSeverity::Low,
+                        ];
+                        sevs.into_iter()
+                            .filter_map(|sev| {
+                                let mut by_cat: Vec<(&'static str, Vec<usize>)> = Vec::new();
+                                for (idx, issue) in w.issues.iter().enumerate() {
+                                    if check_issue_severity(issue) != sev {
+                                        continue;
+                                    }
+                                    let cat = check_issue_category(issue);
+                                    if let Some((_, idxs)) =
+                                        by_cat.iter_mut().find(|(c, _)| *c == cat)
+                                    {
+                                        idxs.push(idx);
+                                    } else {
+                                        by_cat.push((cat, vec![idx]));
+                                    }
+                                }
+                                if by_cat.is_empty() {
+                                    None
+                                } else {
+                                    Some((sev, by_cat))
+                                }
+                            })
+                            .collect()
+                    };
+
+                    // Apply a group checkbox: select/clear every deletable index in `idxs`.
+                    let apply_group = |app: &mut Self, idxs: &[usize], on: bool| {
+                        let Some(w) = app.pending_check.as_mut() else {
+                            return;
+                        };
+                        for &idx in idxs {
+                            if issue_has_deletable_output(&out_dir, &w.issues[idx]) {
+                                if on {
+                                    w.selected.insert(idx);
+                                } else {
+                                    w.selected.remove(&idx);
+                                }
+                            }
                         }
-                        if ui.button("OK").clicked() {
-                            self.pending_check = None;
-                        }
-                    });
-                } else {
-                    ui.label(format!(
-                        "Delete {} problematic output file(s)?",
-                        to_delete.len()
+                    };
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (sev, cats) in &groups {
+                                let sev_idxs: Vec<usize> = cats
+                                    .iter()
+                                    .flat_map(|(_, idxs)| idxs.iter().copied())
+                                    .collect();
+                                let n = sev_idxs.len();
+                                let color = check_severity_color(*sev);
+                                let header = format!("{} — {n}", sev.label());
+
+                                // Absolute ids so Shift+caret can sync children without Ui nesting.
+                                let mut sev_toggle: Option<bool> = None;
+                                let sev_id = egui::Id::unique(("gigamux_check_sev", *sev as u8));
+                                let cat_ids: Vec<egui::Id> = cats
+                                    .iter()
+                                    .map(|(cat, _)| {
+                                        egui::Id::unique(("gigamux_check_cat", *sev as u8, *cat))
+                                    })
+                                    .collect();
+                                let (sev_caret, _, _) =
+                                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                                        ui.ctx(),
+                                        sev_id,
+                                        *sev != CheckSeverity::Low,
+                                    )
+                                    .show_header(ui, |ui| {
+                                        sev_toggle = check_group_checkbox(
+                                            ui,
+                                            self.pending_check.as_ref(),
+                                            &sev_idxs,
+                                            &out_dir,
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(header).color(color).strong(),
+                                        );
+                                    })
+                                    .body(|ui| {
+                                        for ((cat, idxs), &cat_id) in cats.iter().zip(cat_ids.iter())
+                                        {
+                                            let mut cat_toggle: Option<bool> = None;
+                                            egui::collapsing_header::CollapsingState::load_with_default_open(
+                                                ui.ctx(),
+                                                cat_id,
+                                                true,
+                                            )
+                                            .show_header(ui, |ui| {
+                                                cat_toggle = check_group_checkbox(
+                                                    ui,
+                                                    self.pending_check.as_ref(),
+                                                    idxs,
+                                                    &out_dir,
+                                                );
+                                                ui.label(format!("{cat} ({})", idxs.len()));
+                                            })
+                                            .body(|ui| {
+                                                for &idx in idxs {
+                                                    let (row_label, deletable) = {
+                                                        let Some(w) = self.pending_check.as_ref()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        let issue = &w.issues[idx];
+                                                        let pair = match (
+                                                            &issue.input,
+                                                            &issue.output,
+                                                        ) {
+                                                            (Some(i), Some(o)) => {
+                                                                format!("{i} → {o}")
+                                                            }
+                                                            (Some(i), None) => i.clone(),
+                                                            (None, Some(o)) => o.clone(),
+                                                            (None, None) => "?".into(),
+                                                        };
+                                                        let label = format!(
+                                                            "{pair}: {}",
+                                                            issue.message
+                                                        );
+                                                        let deletable =
+                                                            issue_has_deletable_output(
+                                                                &out_dir, issue,
+                                                            );
+                                                        (label, deletable)
+                                                    };
+                                                    ui.horizontal(|ui| {
+                                                        if deletable {
+                                                            let mut on = self
+                                                                .pending_check
+                                                                .as_ref()
+                                                                .map(|w| {
+                                                                    w.selected.contains(&idx)
+                                                                })
+                                                                .unwrap_or(false);
+                                                            if ui.checkbox(&mut on, "").changed()
+                                                            {
+                                                                if let Some(w) =
+                                                                    self.pending_check.as_mut()
+                                                                {
+                                                                    if on {
+                                                                        w.selected.insert(idx);
+                                                                    } else {
+                                                                        w.selected.remove(&idx);
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            ui.add_space(16.0);
+                                                        }
+                                                        ui.label(
+                                                            egui::RichText::new(row_label)
+                                                                .color(color)
+                                                                .small(),
+                                                        );
+                                                    });
+                                                }
+                                            });
+                                            if let Some(on) = cat_toggle {
+                                                apply_group(self, idxs, on);
+                                            }
+                                        }
+                                    });
+                                // Blender outliner: Shift+caret recursively opens/closes children.
+                                if sev_caret.clicked() && ui.input(|i| i.modifiers.shift) {
+                                    let open =
+                                        egui::collapsing_header::CollapsingState::load(
+                                            ui.ctx(),
+                                            sev_id,
+                                        )
+                                        .map(|s| s.is_open())
+                                        .unwrap_or(true);
+                                    for &cat_id in &cat_ids {
+                                        set_collapsing_open(ui.ctx(), cat_id, open);
+                                    }
+                                    // Children may have drawn with stale open state this frame.
+                                    ui.ctx().request_repaint();
+                                }
+                                if let Some(on) = sev_toggle {
+                                    apply_group(self, &sev_idxs, on);
+                                }
+                            }
+                        });
+                });
+            },
+        );
+
+        if purge {
+            if let Some(w) = self.pending_check.take() {
+                let to_delete: Vec<CheckIssue> = w
+                    .selected
+                    .into_iter()
+                    .filter_map(|idx| w.issues.get(idx).cloned())
+                    .collect();
+                if !to_delete.is_empty() {
+                    let (deleted, failed, trashed) =
+                        delete_issue_outputs(&self.prefs.output_dir, &to_delete);
+                    self.push_undo_step(UndoStep::Delete(DeleteUndoBatch {
+                        side: FileSide::Output,
+                        paths: trashed,
+                    }));
+                    self.push_session(format!(
+                        "Recycle Bin: {deleted} output(s); failed {failed}"
                     ));
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete outputs").clicked() {
-                            let (deleted, failed, trashed) =
-                                delete_issue_outputs(&self.prefs.output_dir, &to_delete);
-                            self.push_undo_step(UndoStep::Delete(DeleteUndoBatch {
-                                side: FileSide::Output,
-                                paths: trashed,
-                            }));
-                            self.push_session(format!(
-                                "Recycle Bin: {deleted} output(s); failed {failed}"
-                            ));
-                            self.pending_check = None;
-                            self.refresh_lists();
-                        }
-                        if ui.button("Keep").clicked() {
-                            self.pending_check = None;
-                        }
-                        if ui.button("Open session log").clicked() {
-                            self.log_open = true;
-                            self.log_show_session = true;
-                            self.pending_check = None;
-                        }
-                    });
+                    self.refresh_lists();
                 }
-            });
+            }
+        } else if open_log {
+            self.log_open = true;
+            self.log_show_session = true;
+            self.pending_check = None;
+        } else if close {
+            self.pending_check = None;
+        }
+    }
+}
+
+/// Persist open/closed for a collapsing header (used by Shift+caret recursive expand).
+fn set_collapsing_open(ctx: &egui::Context, id: egui::Id, open: bool) {
+    let mut st =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ctx, id, open);
+    st.set_open(open);
+    st.store(ctx);
+}
+
+/// Group checkbox for a severity/category: toggles all deletable indices; indeterminate when partial.
+/// Returns `Some(new_on)` when the user clicked; `None` if no deletable rows or unchanged.
+fn check_group_checkbox(
+    ui: &mut egui::Ui,
+    window: Option<&CheckResultsWindow>,
+    idxs: &[usize],
+    out_dir: &Path,
+) -> Option<bool> {
+    let Some(w) = window else {
+        return None;
+    };
+    let deletable: Vec<usize> = idxs
+        .iter()
+        .copied()
+        .filter(|&idx| issue_has_deletable_output(out_dir, &w.issues[idx]))
+        .collect();
+    if deletable.is_empty() {
+        ui.add_space(16.0);
+        return None;
+    }
+    let n_on = deletable.iter().filter(|i| w.selected.contains(i)).count();
+    let mut on = n_on == deletable.len();
+    let indeterminate = n_on > 0 && n_on < deletable.len();
+    let resp = ui.add(egui::Checkbox::without_text(&mut on).indeterminate(indeterminate));
+    if resp.changed() {
+        Some(on)
+    } else {
+        None
     }
 }
 

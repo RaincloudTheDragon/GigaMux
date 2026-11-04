@@ -12,9 +12,10 @@ pub mod vmaf;
 pub mod webm_alpha;
 
 pub use check::{
-    deletable_issues, delete_issue_outputs, is_codec_mismatch_issue, is_orphan_output_issue,
-    list_media, permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue,
-    CheckReport,
+    check_issue_category, check_issue_severity, deletable_issues, delete_issue_outputs,
+    is_codec_mismatch_issue, is_orphan_output_issue, issue_has_deletable_output, list_media,
+    permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue, CheckReport,
+    CheckSeverity,
 };
 pub use encode::{run_batch, EncodeEvent, EncodeOptions};
 pub use job_log::{
