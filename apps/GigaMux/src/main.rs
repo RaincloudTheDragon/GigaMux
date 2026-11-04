@@ -5605,8 +5605,11 @@ fn check_group_checkbox(
         .copied()
         .filter(|&idx| issue_has_deletable_output(out_dir, &w.issues[idx]))
         .collect();
+    // Medium (“Missing from output”) has nothing on disk to purge; still show a disabled checkbox so High/Medium/Low headers stay aligned.
     if deletable.is_empty() {
-        ui.add_space(16.0);
+        let mut on = false;
+        ui.add_enabled(false, egui::Checkbox::without_text(&mut on))
+            .on_hover_text("Nothing to delete in this group");
         return None;
     }
     let n_on = deletable.iter().filter(|i| w.selected.contains(i)).count();
