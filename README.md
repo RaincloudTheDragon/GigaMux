@@ -79,3 +79,7 @@ Navigation while Test mode is on (Output list):
 | `Shift+↑` / `Shift+↓` | Test mode Output: sibling test1 ↔ test2 |
 | `Ctrl+Z` | Undo delete / rename |
 | `Ctrl+J` | Expand/toggle log |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
