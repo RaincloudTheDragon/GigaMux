@@ -549,6 +549,21 @@ pub fn check_issue_category(issue: &CheckIssue) -> &'static str {
     }
 }
 
+/// Output basenames that must not be auto-VMAF’d (High/Medium integrity failures).
+/// Low severity (codec mismatch, orphans, AV1 quirk) does not block scoring.
+pub fn integrity_blocked_outputs(issues: &[CheckIssue]) -> HashSet<String> {
+    let mut blocked = HashSet::new();
+    for issue in issues {
+        if check_issue_severity(issue) == CheckSeverity::Low {
+            continue;
+        }
+        if let Some(name) = &issue.output {
+            blocked.insert(name.clone());
+        }
+    }
+    blocked
+}
+
 /// True when this issue points at an on-disk output that delete would remove.
 /// Skips “Missing from output” and input-only probe failures; codec mismatch / orphans are deletable when selected.
 pub fn issue_has_deletable_output(output_dir: &Path, issue: &CheckIssue) -> bool {

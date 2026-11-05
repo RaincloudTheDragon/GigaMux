@@ -15,12 +15,12 @@ use eframe::egui;
 mod taskbar_progress;
 
 use gigamux_core::check::{
-    check_issue_category, check_issue_severity, delete_issue_outputs, issue_has_deletable_output,
-    list_media, permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue,
-    CheckReport, CheckSeverity,
+    check_issue_category, check_issue_severity, delete_issue_outputs, integrity_blocked_outputs,
+    issue_has_deletable_output, list_media, permanent_delete_file, restore_trashed_file, run_check,
+    trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
-use gigamux_core::vmaf::{run_vmaf, VmafEvent, VmafReport};
+use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
 use gigamux_core::gpu::{
     list_av1_nvenc_devices, list_nvenc_devices, qsv_vp9_available, GpuChoice, NvencDevice,
 };
@@ -300,6 +300,8 @@ struct GigaMuxApp {
     event_rx: Option<Receiver<AppEvent>>,
     /// Check results viewport (severity tree + selective purge).
     pending_check: Option<CheckResultsWindow>,
+    /// Pref-armed: when idle, silent Check then VMAF unscored intact pairs.
+    auto_vmaf_armed: bool,
     /// Confirm before Recycle Bin (unless the user opted out).
     pending_recycle_delete: Option<RecycleDeletePrompt>,
     /// Recycle Bin failed — confirm permanent delete (or proceed if warnings disabled).
@@ -652,6 +654,7 @@ impl GigaMuxApp {
             cancel: Arc::new(AtomicBool::new(false)),
             event_rx: None,
             pending_check: None,
+            auto_vmaf_armed: false,
             pending_recycle_delete: None,
             pending_permanent_delete: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
@@ -1756,6 +1759,7 @@ impl GigaMuxApp {
             self.prefs.warn_permanent_delete = d.warn_permanent_delete;
             self.prefs.job_done_chime = d.job_done_chime;
             self.prefs.check_ignore_orphan_outputs = d.check_ignore_orphan_outputs;
+            self.prefs.auto_vmaf_when_idle = d.auto_vmaf_when_idle;
             touched_prefs = true;
             parts.push("misc".into());
         }
@@ -3070,6 +3074,122 @@ impl GigaMuxApp {
                 targets,
                 test_slot2,
                 only_name,
+                None,
+                &cancel,
+                |ev| {
+                    let _ = tx_ev.send(AppEvent::Vmaf(ev));
+                },
+            );
+            let _ = tx.send(AppEvent::VmafDone(result));
+        });
+    }
+
+    /// Output basenames that exist on disk but have no cached VMAF score yet.
+    fn unscored_output_names(&self) -> HashSet<String> {
+        self.names_for(FileSide::Output)
+            .into_iter()
+            .filter(|n| self.live_vmaf_score(FileSide::Output, n).is_none())
+            .collect()
+    }
+
+    /// When armed and idle: silent integrity Check, then VMAF only unscored intact outputs.
+    fn try_start_auto_vmaf(&mut self) {
+        if !self.auto_vmaf_armed || !self.prefs.auto_vmaf_when_idle {
+            return;
+        }
+        if !self.history_idle() || self.pending_check.is_some() {
+            return;
+        }
+        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+            self.auto_vmaf_armed = false;
+            self.push_session("auto VMAF: skipped — set input and output folders");
+            return;
+        }
+        if !libvmaf_available() {
+            self.auto_vmaf_armed = false;
+            self.push_session("auto VMAF: skipped — libvmaf unavailable");
+            return;
+        }
+        let total_out = self.names_for(FileSide::Output).len();
+        let unscored = self.unscored_output_names();
+        let already = total_out.saturating_sub(unscored.len());
+        if unscored.is_empty() {
+            self.auto_vmaf_armed = false;
+            if total_out == 0 {
+                self.push_session("auto VMAF: nothing to score");
+            } else {
+                self.push_session(format!(
+                    "auto VMAF: skipped — {already} already scored, 0 unscored"
+                ));
+            }
+            return;
+        }
+        self.auto_vmaf_armed = false;
+        self.start_auto_vmaf(unscored, already);
+    }
+
+    /// Background: run_check (no purge UI) → filter High/Medium → run_vmaf allowlist.
+    fn start_auto_vmaf(&mut self, unscored: HashSet<String>, already_scored: usize) {
+        let input = self.prefs.input_dir.clone();
+        let output = self.prefs.output_dir.clone();
+        let targets = self.prefs.slot1.output_targets();
+        let test_slot2 = self
+            .prefs
+            .test_mode
+            .then(|| self.prefs.slot2.output_targets());
+        self.cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.cancel);
+        let (tx, rx) = mpsc::channel();
+        self.busy = true;
+        self.job = Some(JobKind::Vmaf);
+        self.event_rx = Some(rx);
+        self.push_session(format!(
+            "auto VMAF: Check then score ({} unscored, {already_scored} already scored)…",
+            unscored.len()
+        ));
+        self.log_open = true;
+        self.encode_progress = None;
+        thread::spawn(move || {
+            let tx_ev = tx.clone();
+            let send_log = |msg: String| {
+                let _ = tx_ev.send(AppEvent::Vmaf(VmafEvent::Log(msg)));
+            };
+            let check = match run_check(&input, &output, targets, test_slot2) {
+                Ok(r) => r,
+                Err(e) => {
+                    send_log(format!("auto VMAF: check failed — {e}"));
+                    let _ = tx.send(AppEvent::VmafDone(Err(format!("auto VMAF check: {e}"))));
+                    return;
+                }
+            };
+            let blocked = integrity_blocked_outputs(&check.issues);
+            let integrity_n = unscored.iter().filter(|n| blocked.contains(*n)).count();
+            let allow: HashSet<String> = unscored
+                .into_iter()
+                .filter(|n| !blocked.contains(n))
+                .collect();
+            if integrity_n > 0 {
+                send_log(format!(
+                    "auto VMAF: skipped {integrity_n} — integrity (no auto-delete)"
+                ));
+            }
+            if allow.is_empty() {
+                send_log("auto VMAF: nothing left to score after integrity filter".into());
+                let _ = tx_ev.send(AppEvent::Vmaf(VmafEvent::Finished { ok: 0, failed: 0 }));
+                let _ = tx.send(AppEvent::VmafDone(Ok(VmafReport::default())));
+                return;
+            }
+            send_log(format!(
+                "auto VMAF: scoring {} pair(s)…",
+                allow.len()
+            ));
+            let result = run_vmaf(
+                &input,
+                &output,
+                targets,
+                test_slot2,
+                None,
+                Some(allow),
                 &cancel,
                 |ev| {
                     let _ = tx_ev.send(AppEvent::Vmaf(ev));
@@ -3193,6 +3313,10 @@ impl GigaMuxApp {
                     ));
                     finished = true;
                     self.refresh_lists();
+                    // Arm auto-VMAF once the batch produced at least one ok output.
+                    if ok > 0 && self.prefs.auto_vmaf_when_idle {
+                        self.auto_vmaf_armed = true;
+                    }
                 }
                 AppEvent::CheckDone(result) => {
                     finished = true;
@@ -4995,6 +5119,28 @@ impl GigaMuxApp {
         {
             let _ = prefs::save(&self.prefs);
         }
+        {
+            let was = self.prefs.auto_vmaf_when_idle;
+            if ui
+                .checkbox(
+                    &mut self.prefs.auto_vmaf_when_idle,
+                    "Auto VMAF when idle",
+                )
+                .on_hover_text(
+                    "After encode (or when enabled while idle): integrity-Check first, then VMAF unscored intact pairs.",
+                )
+                .changed()
+            {
+                let _ = prefs::save(&self.prefs);
+                // Turning on while idle arms a one-shot pass over current unscored outputs.
+                if self.prefs.auto_vmaf_when_idle && !was && self.history_idle() {
+                    self.auto_vmaf_armed = true;
+                }
+                if !self.prefs.auto_vmaf_when_idle {
+                    self.auto_vmaf_armed = false;
+                }
+            }
+        }
         if ui
             .checkbox(
                 &mut self.prefs.check_ignore_orphan_outputs,
@@ -6008,6 +6154,8 @@ impl eframe::App for GigaMuxApp {
         self.tick_delete_queue(ctx);
         self.tick_history_nav(ctx);
         self.poll_preview_cache(ctx);
+        // Pref-armed idle pass: silent Check → filtered VMAF (no purge window).
+        self.try_start_auto_vmaf();
         self.handle_shortcuts(ctx);
     }
 

@@ -284,6 +284,7 @@ fn resolve_pairs(
     targets: OutputTargets,
     test_slot2: Option<OutputTargets>,
     only_basename: Option<&str>,
+    only_outputs: Option<&HashSet<String>>,
 ) -> Result<Vec<(String, String, PathBuf, PathBuf, f64)>, String> {
     let inputs = list_media(input_dir, true);
     let outputs = list_media(output_dir, false);
@@ -332,6 +333,12 @@ fn resolve_pairs(
             if !output_set.contains(&out_name) {
                 continue;
             }
+            // Auto-VMAF / filtered batches: only score listed output basenames.
+            if let Some(allow) = only_outputs {
+                if !allow.contains(&out_name) {
+                    continue;
+                }
+            }
             any_for_input = true;
             pairs.push((
                 in_name.clone(),
@@ -353,6 +360,10 @@ fn resolve_pairs(
         }
     }
     if pairs.is_empty() {
+        // Allowlist filter with nothing left is a soft empty batch (caller logs).
+        if only_outputs.is_some() {
+            return Ok(pairs);
+        }
         return Err(if only_basename.is_some() {
             "no matching input/output pair for VMAF".into()
         } else {
@@ -362,7 +373,7 @@ fn resolve_pairs(
     Ok(pairs)
 }
 
-/// Score one pair (`only_basename`) or every matched pair under the folders.
+/// Score one pair (`only_basename`), an output-name allowlist, or every matched pair.
 /// Also writes a gzipped per-job log under `%APPDATA%\GigaMux\config\logs\`.
 /// When `test_slot2` is set, scores input→test1 and input→test2 for each input.
 pub fn run_vmaf(
@@ -371,6 +382,7 @@ pub fn run_vmaf(
     targets: OutputTargets,
     test_slot2: Option<OutputTargets>,
     only_basename: Option<String>,
+    only_outputs: Option<HashSet<String>>,
     cancel: &AtomicBool,
     mut on_event: impl FnMut(VmafEvent),
 ) -> Result<VmafReport, String> {
@@ -410,6 +422,7 @@ pub fn run_vmaf(
         targets,
         test_slot2,
         only_basename.as_deref(),
+        only_outputs.as_ref(),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -418,6 +431,11 @@ pub fn run_vmaf(
             return Err(e);
         }
     };
+    if pairs.is_empty() {
+        on_event(VmafEvent::Log("VMAF: nothing to score".into()));
+        on_event(VmafEvent::Finished { ok: 0, failed: 0 });
+        return Ok(VmafReport::default());
+    }
     let total_files = pairs.len();
     let total_duration_s: f64 = pairs.iter().map(|p| p.4.max(0.0)).sum();
     on_event(VmafEvent::BatchStarted {

@@ -116,6 +116,9 @@ pub struct Prefs {
     /// When deleting after Check, skip outputs with no matching input stem. Default off.
     #[serde(default)]
     pub check_ignore_orphan_outputs: bool,
+    /// When idle after encode (or when enabled), Check then VMAF unscored intact pairs. Default off.
+    #[serde(default)]
+    pub auto_vmaf_when_idle: bool,
 }
 
 impl Default for Prefs {
@@ -133,6 +136,7 @@ impl Default for Prefs {
             warn_permanent_delete: true,
             job_done_chime: true,
             check_ignore_orphan_outputs: false,
+            auto_vmaf_when_idle: false,
         }
     }
 }
