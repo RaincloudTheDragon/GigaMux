@@ -31,3 +31,51 @@ Your codec choices in GigaMux:
   - Supports containers `.mp4`, `.mkv`, `.webm`
 - `AVC`/`H.264`: Denoted as `H.264` in GigaMux due to it being the more common name for `AVC`. Not strongly recommended if your nvenc generation is less than 5th gen (Maxwell 2.0; 900 series) but still a strong option for maximum deliverability; it's one of the longest-living codecs and has wide support on just about everything that can play video. Software encoding via ol' reliable `libx264`.
   - Supports containers `.mp4`, `.mkv`
+
+### Requirements
+
+- Windows desktop app (egui shell in this repo).
+- `ffmpeg` on `PATH`. Encoding works with a normal build; **VMAF** needs a full build that includes the `libvmaf` filter (e.g. [gyan.dev full](https://www.gyan.dev/ffmpeg/builds/)).
+- Hardware encode (NVENC / QSV where available) is optional; software encoders are always selectable.
+
+### Quick start
+
+1. Set **Input** and **Output** folders (`Change…` on each path row).
+2. Pick Opaque targets (codec / container / Use hardware). Alpha targets are ignored unless an input has Alpha (only use if you need VP9 with transparency).
+3. Leave Maxrate empty for the GigaMux Target (CQ0 + auto ceiling from the source average bitrate), or type a kbps override.
+4. Select files and **Encode** (or press **F12**). Right-click a row to encode one file. Existing outputs are skipped unless you force them.
+5. **Check** so you know your outputs are intact.
+6. Use VMAF to get scores for your outputs. Option for minmaxers, quite useful for test mode so you can choose a target.
+
+### Test mode
+
+Enable **Test mode** on the Output path row (next to Change…). Each selected input encodes twice, sequentially, into the same folder:
+
+- `test1_{stem}.{ext}` — Test1 targets
+- `test2_{stem}.{ext}` — Test2 targets
+
+The Output column splits top/bottom with independent codec, container, hardware, and Maxrate per slot. A mid strip shows Size Δ and VMAF when both files exist. Use this to A/B Maxrate caps (e.g. HEVC Target vs AV1 + ~18000 kbps) before a full batch; see [Comparing NVENC AV1 and HEVC](docs/codec-efficiency.md).
+
+Navigation while Test mode is on (Output list):
+
+- `←` / `→` — jump by stem, prefer Test1
+- `Shift+←` / `Shift+→` — same, prefer Test2
+- `Shift+↑` / `Shift+↓` — swap to the sibling test file
+
+### Check & VMAF
+
+- **Check** probes each selected pair and opens a severity tree (High / Medium / Low). Medium findings stay listed with the checkbox off by default.
+- **VMAF** scores input → output via `libvmaf`. In Test mode it scores both `test1_*` and `test2_*` against the source so you can compare slots.
+
+### Shortcuts
+
+| Key | Action |
+| --- | --- |
+| `F12` | Encode selection |
+| `F5` | Reload / re-index folders |
+| `Ctrl+F5` | Wipe preview cache, then re-index (can be heavy; wipes expensive VMAF results) |
+| `←` / `→` | Jump to paired file (Input ↔ Output; Test mode prefers Test1) |
+| `Shift+←` / `Shift+→` | Test mode: pair jump preferring Test2 |
+| `Shift+↑` / `Shift+↓` | Test mode Output: sibling test1 ↔ test2 |
+| `Ctrl+Z` | Undo delete / rename |
+| `Ctrl+J` | Expand/toggle log |
