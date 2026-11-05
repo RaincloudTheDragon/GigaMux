@@ -19,7 +19,13 @@ use gigamux_core::check::{
     issue_has_deletable_output, list_media, permanent_delete_file, restore_trashed_file, run_check,
     trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
-use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
+use gigamux_core::encode::{
+    build_farm_ffmpeg_argv, run_batch, EncodeEvent, EncodeOptions, FarmEncodeRequest,
+};
+use gigamux_core::flamenco::{
+    deploy_gigamux_js, discover_manager, ensure_worker_tags, make_gigamux_encode_job,
+    scripts_dir_from_manager_install, submit_job, REQUIRED_WORKER_TAGS,
+};
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
 use gigamux_core::gpu::{
     list_av1_nvenc_devices, list_nvenc_devices, qsv_vp9_available, GpuChoice, NvencDevice,
@@ -1765,6 +1771,10 @@ impl GigaMuxApp {
             self.prefs.job_done_chime = d.job_done_chime;
             self.prefs.check_ignore_orphan_outputs = d.check_ignore_orphan_outputs;
             self.prefs.auto_vmaf_when_idle = d.auto_vmaf_when_idle;
+            self.prefs.flamenco_manager_url = d.flamenco_manager_url;
+            self.prefs.flamenco_scripts_dir = d.flamenco_scripts_dir;
+            self.prefs.flamenco_worker_tag = d.flamenco_worker_tag;
+            self.prefs.flamenco_ffmpeg_exe = d.flamenco_ffmpeg_exe;
             touched_prefs = true;
             parts.push("misc".into());
         }
@@ -1802,6 +1812,100 @@ impl GigaMuxApp {
             self.push_session("purge: nothing selected");
         } else {
             self.push_session(format!("purged: {}", parts.join(", ")));
+        }
+    }
+
+    /// Submit one input to Flamenco (stock worker `exec` ffmpeg via `GigaMux.js`).
+    fn submit_flamenco_encode(&mut self, only_name: Option<String>) {
+        let url = self.prefs.flamenco_manager_url.trim().to_string();
+        if url.is_empty() {
+            self.push_session("set Flamenco Manager URL in Settings → Files");
+            self.log_open = true;
+            self.show_settings = true;
+            self.settings_tab = SettingsTab::Files;
+            self.settings_raise = true;
+            return;
+        }
+        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+            self.push_session("set both input and output folders before Flamenco submit");
+            self.log_open = true;
+            return;
+        }
+        self.commit_maxrate_override_edit(TestBatch::One);
+        self.commit_cq_override_edit(TestBatch::One);
+        let name = only_name.or_else(|| {
+            self.active
+                .as_ref()
+                .filter(|(s, _)| *s == FileSide::Input)
+                .map(|(_, n)| n.clone())
+        });
+        let Some(name) = name else {
+            self.push_session("select an input file (or use context menu) for Flamenco submit");
+            self.log_open = true;
+            return;
+        };
+        let input = self.prefs.input_dir.join(&name);
+        if !input.is_file() {
+            self.push_session(format!("Flamenco: input not found: {name}"));
+            self.log_open = true;
+            return;
+        }
+        // Effective HW for this machine (same as local encode mute).
+        let mut slot = self.prefs.slot1.clone();
+        slot.use_hardware = self.effective_use_hardware_for(&slot);
+        let farm = FarmEncodeRequest {
+            input,
+            output_dir: self.prefs.output_dir.clone(),
+            gpu: self.prefs.gpu,
+            preserve_obs_metadata: self.prefs.preserve_obs_metadata,
+            use_peak_bitrate: self.prefs.use_peak_bitrate,
+            slot,
+            // Farm v0: one full deliver (not test1_/test2_ dual).
+            test_batch: None,
+        };
+        let cmd = match build_farm_ffmpeg_argv(&farm) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_session(format!("Flamenco argv: {e}"));
+                self.log_open = true;
+                return;
+            }
+        };
+        let exe = self.prefs.flamenco_ffmpeg_exe.trim();
+        let exe = if exe.is_empty() { None } else { Some(exe) };
+        let tag = self.prefs.flamenco_worker_tag.trim();
+        let tag = if tag.is_empty() { None } else { Some(tag) };
+        let job = match make_gigamux_encode_job(
+            format!("GigaMux {name}"),
+            exe,
+            &cmd.argv,
+            tag,
+        ) {
+            Ok(j) => j,
+            Err(e) => {
+                self.push_session(format!("Flamenco job: {e}"));
+                self.log_open = true;
+                return;
+            }
+        };
+        let out_name = cmd
+            .output
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cmd.output.display().to_string());
+        match submit_job(&url, &job) {
+            Ok(id) => {
+                self.push_session(format!(
+                    "Flamenco submitted: job {id}; {name} → {out_name} ({}k / {})",
+                    cmd.bitrate_k, cmd.bitrate_label
+                ));
+                self.log_open = true;
+                let _ = prefs::save(&self.prefs);
+            }
+            Err(e) => {
+                self.push_session(format!("Flamenco submit failed: {e}"));
+                self.log_open = true;
+            }
         }
     }
 
@@ -4297,6 +4401,26 @@ impl GigaMuxApp {
                                 self.start_encode(Some(name.clone()));
                                 ui.close();
                             }
+                            if is_input {
+                                let farm_ok = !self.prefs.flamenco_manager_url.trim().is_empty();
+                                if ui
+                                    .add_enabled(
+                                        farm_ok,
+                                        egui::Button::new("Send to Flamenco"),
+                                    )
+                                    .on_hover_text(
+                                        "Submit this file to Flamenco Manager (GigaMux.js → worker ffmpeg)",
+                                    )
+                                    .on_disabled_hover_text(
+                                        "Set Flamenco Manager URL in Settings → Files",
+                                    )
+                                    .clicked()
+                                {
+                                    self.select_file(FileSide::Input, name.clone());
+                                    self.submit_flamenco_encode(Some(name.clone()));
+                                    ui.close();
+                                }
+                            }
                             {
                                 let vmaf_ok = self.vmaf_available;
                                 let disabled_hint = if !vmaf_ok {
@@ -4561,6 +4685,24 @@ impl GigaMuxApp {
                     );
                 if encode.clicked() {
                     self.start_encode(None);
+                }
+                ui.add_space(6.0);
+                {
+                    let farm_ok = !self.prefs.flamenco_manager_url.trim().is_empty();
+                    let farm = ui
+                        .add_enabled(
+                            farm_ok,
+                            egui::Button::new("Flamenco").min_size(egui::vec2(120.0, 28.0)),
+                        )
+                        .on_hover_text(
+                            "Send the selected input to Flamenco (worker ffmpeg via GigaMux.js). Use Settings → Files to Find Manager, Deploy JS, Ensure tags.",
+                        )
+                        .on_disabled_hover_text(
+                            "Set Flamenco Manager URL (or Find) in Settings → Files",
+                        );
+                    if farm.clicked() {
+                        self.submit_flamenco_encode(None);
+                    }
                 }
                 ui.add_space(6.0);
                 let check = ui.add_enabled(
@@ -5193,6 +5335,159 @@ impl GigaMuxApp {
         {
             let _ = prefs::save(&self.prefs);
         }
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Flamenco").strong());
+        ui.horizontal(|ui| {
+            ui.label("Manager URL");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.prefs.flamenco_manager_url)
+                        .desired_width(240.0)
+                        .hint_text("http://127.0.0.1:8080"),
+                )
+                .changed()
+            {
+                let _ = prefs::save(&self.prefs);
+            }
+            if ui
+                .button("Find")
+                .on_hover_text(
+                    "UPnP/SSDP discovery (same as Flamenco workers). Manager must have autodiscoverable enabled.",
+                )
+                .clicked()
+            {
+                match discover_manager(std::time::Duration::from_secs(4)) {
+                    Ok(url) => {
+                        self.prefs.flamenco_manager_url = url.trim_end_matches('/').to_string();
+                        let _ = prefs::save(&self.prefs);
+                        self.push_session(format!(
+                            "Flamenco discovered Manager {}",
+                            self.prefs.flamenco_manager_url
+                        ));
+                    }
+                    Err(e) => self.push_session(format!("Flamenco discover: {e}")),
+                }
+                self.log_open = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("scripts/");
+            ui.label(
+                egui::RichText::new(if self.prefs.flamenco_scripts_dir.is_empty() {
+                    "(not set)".into()
+                } else {
+                    self.prefs.flamenco_scripts_dir.clone()
+                })
+                .weak()
+                .small(),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button("Deploy GigaMux.js…")
+                .on_hover_text(
+                    "Copy bundled GigaMux.js into Manager scripts/. Pick the Manager install folder (has flamenco-manager.yaml) or the scripts/ folder itself.",
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Flamenco Manager folder or scripts/")
+                    .pick_folder()
+                {
+                    let scripts = if path.join("flamenco-manager.yaml").is_file() {
+                        scripts_dir_from_manager_install(&path)
+                    } else if path.file_name().is_some_and(|n| n == "scripts")
+                        || path.join("GigaMux.js").exists()
+                        || path
+                            .read_dir()
+                            .ok()
+                            .map(|mut d| d.any(|e| e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "js"))))
+                            .unwrap_or(false)
+                    {
+                        Ok(path.clone())
+                    } else {
+                        // Still try as Manager dir (creates scripts/ if yaml present).
+                        scripts_dir_from_manager_install(&path).or_else(|_| Ok(path.clone()))
+                    };
+                    match scripts.and_then(|dir| {
+                        deploy_gigamux_js(&dir).map(|dest| (dir, dest))
+                    }) {
+                        Ok((dir, dest)) => {
+                            self.prefs.flamenco_scripts_dir =
+                                dir.to_string_lossy().into_owned();
+                            let _ = prefs::save(&self.prefs);
+                            self.push_session(format!(
+                                "Flamenco deployed {}",
+                                dest.display()
+                            ));
+                        }
+                        Err(e) => self.push_session(format!("Flamenco deploy: {e}")),
+                    }
+                    self.log_open = true;
+                }
+            }
+            let can_tags = !self.prefs.flamenco_manager_url.trim().is_empty();
+            if ui
+                .add_enabled(can_tags, egui::Button::new("Ensure tags"))
+                .on_hover_text(format!(
+                    "Create missing worker tags via REST: {}",
+                    REQUIRED_WORKER_TAGS
+                        .iter()
+                        .map(|(n, _)| *n)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .on_disabled_hover_text("Set Manager URL (or Find) first")
+                .clicked()
+            {
+                let url = self.prefs.flamenco_manager_url.clone();
+                match ensure_worker_tags(&url) {
+                    Ok(created) if created.is_empty() => {
+                        self.push_session("Flamenco tags: already present");
+                    }
+                    Ok(created) => {
+                        self.push_session(format!(
+                            "Flamenco tags created: {}",
+                            created.join(", ")
+                        ));
+                    }
+                    Err(e) => self.push_session(format!("Flamenco tags: {e}")),
+                }
+                self.log_open = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Worker tag");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.prefs.flamenco_worker_tag)
+                        .desired_width(180.0)
+                        .hint_text("(optional)"),
+                )
+                .on_hover_text(
+                    "Tag name or UUID for submitted jobs. Empty = tagless. Use Ensure tags first for nvenc/qsv/vmaf.",
+                )
+                .changed()
+            {
+                let _ = prefs::save(&self.prefs);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Worker ffmpeg");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.prefs.flamenco_ffmpeg_exe)
+                        .desired_width(280.0)
+                        .hint_text("ffmpeg"),
+                )
+                .on_hover_text(
+                    "Absolute path on workers, or leave empty for `ffmpeg` (PATH / Manager tools/).",
+                )
+                .changed()
+            {
+                let _ = prefs::save(&self.prefs);
+            }
+        });
     }
 
     /// Alt-at-launch: pick which prefs slices / logs to purge.

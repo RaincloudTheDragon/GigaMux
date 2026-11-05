@@ -73,6 +73,29 @@ pub struct EncodeOptions {
     pub only_names: Option<Vec<String>>,
 }
 
+/// One-file encode request for Flamenco (stock worker `exec` ffmpeg).
+#[derive(Debug, Clone)]
+pub struct FarmEncodeRequest {
+    pub input: PathBuf,
+    pub output_dir: PathBuf,
+    pub gpu: GpuChoice,
+    pub preserve_obs_metadata: bool,
+    pub use_peak_bitrate: bool,
+    pub slot: EncodeSlot,
+    /// `None` = normal deliver name; `Some` = `test1_` / `test2_` prefix.
+    pub test_batch: Option<TestBatch>,
+}
+
+/// ffmpeg argv for a Flamenco `misc`/`exec` task (`argv[0]` is the program name).
+#[derive(Debug, Clone)]
+pub struct FarmFfmpegCommand {
+    pub output: PathBuf,
+    /// Full argv including leading `"ffmpeg"` (or replacement exe basename).
+    pub argv: Vec<String>,
+    pub bitrate_k: u32,
+    pub bitrate_label: String,
+}
+
 /// List encodeable media in a directory (non-recursive).
 pub fn list_inputs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
@@ -1197,4 +1220,57 @@ pub fn run_batch(
         skipped,
         failed,
     });
+}
+
+/// Build a single-file ffmpeg argv for Flamenco (same flags as local encode).
+/// Refuses QSV+libvpx alpha hybrid (multi-process locally; not a single `exec` yet).
+pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegCommand, String> {
+    if !req.input.is_file() {
+        return Err(format!("input not found: {}", req.input.display()));
+    }
+    if !req.output_dir.is_dir() {
+        return Err(format!("output dir not found: {}", req.output_dir.display()));
+    }
+    let info = file_info(&req.input)?;
+    let has_alpha = video_has_alpha(&info);
+    if wants_qsv_alpha_hybrid(
+        req.slot.use_hardware,
+        has_alpha,
+        req.slot.alpha_video == AlphaVideo::Vp9,
+        req.slot.alpha_container == OutContainer::Webm,
+    ) {
+        return Err(
+            "Flamenco v0 cannot run QSV+libvpx alpha hybrid (multi-ffmpeg); turn off hardware for alpha or encode opaque"
+                .into(),
+        );
+    }
+    let container = req.slot.container_for(has_alpha);
+    let output = deliver_path(&req.input, &req.output_dir, container, req.test_batch);
+    let (auto_k, auto_label) = video_ceiling_k(&req.input, &info, req.use_peak_bitrate);
+    let (bitrate_k, bitrate_label) = match req.slot.maxrate_override_k.filter(|&k| k > 0) {
+        Some(k) => (k, format!("override {k}k (auto {auto_k}k / {auto_label})")),
+        None => (auto_k, auto_label),
+    };
+    let cq = req.slot.cq_override.unwrap_or(0);
+    let argv = build_cmd(
+        &req.input,
+        &output,
+        &info,
+        has_alpha,
+        req.gpu,
+        bitrate_k,
+        cq,
+        req.preserve_obs_metadata,
+        req.slot.use_hardware,
+        req.slot.opaque_video,
+        req.slot.opaque_container,
+        req.slot.alpha_video,
+        req.slot.alpha_container,
+    );
+    Ok(FarmFfmpegCommand {
+        output,
+        argv,
+        bitrate_k,
+        bitrate_label,
+    })
 }

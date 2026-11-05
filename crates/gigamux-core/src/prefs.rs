@@ -119,6 +119,18 @@ pub struct Prefs {
     /// When idle after encode (or when enabled), Check then VMAF unscored intact pairs. Default off.
     #[serde(default)]
     pub auto_vmaf_when_idle: bool,
+    /// Flamenco Manager base URL (e.g. `http://127.0.0.1:8080`). Empty = farm submit disabled.
+    #[serde(default)]
+    pub flamenco_manager_url: String,
+    /// Last Manager `scripts/` folder used for `GigaMux.js` deploy (optional).
+    #[serde(default)]
+    pub flamenco_scripts_dir: String,
+    /// Optional Flamenco worker tag UUID/name for submitted jobs (empty = tagless).
+    #[serde(default)]
+    pub flamenco_worker_tag: String,
+    /// Absolute path to ffmpeg on workers, or `ffmpeg` for PATH/tools. Empty → `ffmpeg`.
+    #[serde(default)]
+    pub flamenco_ffmpeg_exe: String,
 }
 
 impl Default for Prefs {
@@ -137,6 +149,10 @@ impl Default for Prefs {
             job_done_chime: true,
             check_ignore_orphan_outputs: false,
             auto_vmaf_when_idle: false,
+            flamenco_manager_url: String::new(),
+            flamenco_scripts_dir: String::new(),
+            flamenco_worker_tag: String::new(),
+            flamenco_ffmpeg_exe: String::new(),
         }
     }
 }
