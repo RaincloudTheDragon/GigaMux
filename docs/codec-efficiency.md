@@ -26,9 +26,9 @@ This is auto-CQ behavior under a shared ceiling, not an effect of the source cod
 - Ladder source: Desktop Replay Buffer, HEVC ~40 mbps CBR OBS (same encode settings as the README encoder screenshot).
 - Ladder encodes: RTX 4080 Super NVENC. nvHEVC at the GigaMux Target; nvAV1 at CQ0 with Maxrate overrides 6–26 mbps plus AV1 at the GigaMux Target.
 - Diagnostics: Xiph `crowd_run` / `FourPeople` (pre-capped ~40 mbps HEVC), plus synthetic hard noise and easy soft; HEVC vs AV1 both at the GigaMux Target.
-- Scores: libvmaf pooled mean, host `n_threads`, `n_subsample=4`. Awkward AV1 levels used `av1_cuvid` for decode while scoring.
+- Scores: libvmaf pooled mean, host `n_threads`, `n_subsample=4`. Awkward AV1 levels used `av1_cuvid` for decode while scoring. GigaMux’s in-app VMAF runs full-frame `libvmaf` (no `n_subsample`); absolute scores may differ slightly from the tables below—use rankings and deltas for A/B.
 
-Guidance for these clips and GPU only; smoke-test your own footage.
+Guidance for these clips and GPU only; smoke-test your own footage. In the app, enable **Test mode** (Output path row): put HEVC (or your baseline) on Test1 and AV1 + a Maxrate override on Test2, encode, then read Size Δ / VMAF on the mid strip. CQ stays prefs-only; Maxrate is the product lever.
 
 HEVC GigaMux Target (auto) baseline (Replay): VMAF 97.26, 349.5 MB, ~20 mbps avg.
 
@@ -67,13 +67,13 @@ Already-capped ~40 mbps HEVC masters hide fat-source headroom, but still show ha
 | algo_noise | hard (synthetic) | 247.5 / 78.90 | 236.8 / 79.26 | −4.3% |
 | FourPeople | easier (Xiph) | 48.9 / 97.99 | 50.4 / 98.07 | +3.1% |
 | algo_soft | easy (synthetic) | 6.8 / 96.53 | 7.5 / 96.87 | +10.0% |
-| OBS Replay | easy-ish destkop | 349.5 / 97.26 | 405.8 / 97.36 | +16.1% |
+| OBS Replay | easy-ish desktop | 349.5 / 97.26 | 405.8 / 97.36 | +16.1% |
 
 ## What we ruled out
 
 - Blanket ~½ maxrate for AV1: hard clips already use the full auto ceiling; halving AV1 would starve it while HEVC keeps the budget on auto.
 - Scaling AV1’s ceiling by *source* codec (e.g. H.264 “fat”, HEVC 1.0×): wrong lever here. Overspend cases were HEVC sources under the same ceiling; HEVC→1.0 is a no-op. Not productized.
-- Constant CQ as the size fix: `-cq 0` is automatic; fixed CQ (e.g. 2) can spend *more* than automatic under the same maxrate. With the per-codec CQ0 strategy gap above, Maxrate is the control, not CQ matching.
+- Constant CQ as the size fix: `-cq 0` is automatic; fixed CQ (e.g. 2) can spend *more* than automatic under the same maxrate. With the per-codec CQ0 strategy gap above, Maxrate is the control, not CQ matching. GigaMux keeps CQ prefs-only for that reason; it's outside the specific design scope of GigaMux.
 
 ## Takeaways
 
