@@ -271,6 +271,8 @@ struct GigaMuxApp {
     av1_devices: Vec<NvencDevice>,
     /// Intel QSV can open `vp9_qsv` (false on AMD / Intel F / no capable iGPU).
     qsv_available: bool,
+    /// This ffmpeg build exposes the `libvmaf` filter (probed once at launch).
+    vmaf_available: bool,
     gpu_warn: Option<String>,
     input_files: Vec<PathBuf>,
     output_files: Vec<PathBuf>,
@@ -600,6 +602,8 @@ impl GigaMuxApp {
         let av1_devices = list_av1_nvenc_devices(&devices);
         // Same idea for QSV: device present ≠ `vp9_qsv` encode works.
         let qsv_available = qsv_vp9_available();
+        // ffmpeg `-filters` probe — avoid spawning every frame for greyed VMAF controls.
+        let vmaf_available = libvmaf_available();
         let (gpu, warn) = prefs.gpu.sanitize(&devices);
         prefs.gpu = gpu;
         // Opaque VP8 has no HW path: UI greys the checkbox but keeps the prefs flag.
@@ -634,6 +638,7 @@ impl GigaMuxApp {
             devices,
             av1_devices,
             qsv_available,
+            vmaf_available,
             gpu_warn: warn,
             input_files: Vec::new(),
             output_files: Vec::new(),
@@ -3041,6 +3046,13 @@ impl GigaMuxApp {
         if self.busy || self.delete_queue.is_some() || self.history_nav.is_some() {
             return;
         }
+        if !self.vmaf_available {
+            self.push_session(
+                "VMAF unavailable — ffmpeg has no libvmaf filter (install a full build)",
+            );
+            self.log_open = true;
+            return;
+        }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
             self.push_session("set both input and output folders before VMAF");
             self.log_open = true;
@@ -3105,7 +3117,7 @@ impl GigaMuxApp {
             self.push_session("auto VMAF: skipped — set input and output folders");
             return;
         }
-        if !libvmaf_available() {
+        if !self.vmaf_available {
             self.auto_vmaf_armed = false;
             self.push_session("auto VMAF: skipped — libvmaf unavailable");
             return;
@@ -4285,16 +4297,28 @@ impl GigaMuxApp {
                                 self.start_encode(Some(name.clone()));
                                 ui.close();
                             }
-                            if ui
-                                .add_enabled(!self.busy, egui::Button::new("VMAF this file"))
-                                .on_hover_text(
-                                    "libvmaf: this file’s input vs matching output (same stem)",
-                                )
-                                .clicked()
                             {
-                                self.select_file(side, name.clone());
-                                self.start_vmaf(Some(name.clone()));
-                                ui.close();
+                                let vmaf_ok = self.vmaf_available;
+                                let disabled_hint = if !vmaf_ok {
+                                    "ffmpeg has no libvmaf filter — install a full build (e.g. gyan.dev full)"
+                                } else {
+                                    "Wait for the current job to finish"
+                                };
+                                if ui
+                                    .add_enabled(
+                                        !self.busy && vmaf_ok,
+                                        egui::Button::new("VMAF this file"),
+                                    )
+                                    .on_hover_text(
+                                        "libvmaf: this file’s input vs matching output (same stem)",
+                                    )
+                                    .on_disabled_hover_text(disabled_hint)
+                                    .clicked()
+                                {
+                                    self.select_file(side, name.clone());
+                                    self.start_vmaf(Some(name.clone()));
+                                    ui.close();
+                                }
                             }
                             if ui.button("Open in player").clicked() {
                                 self.select_file(side, name.clone());
@@ -4547,16 +4571,25 @@ impl GigaMuxApp {
                     self.start_check();
                 }
                 ui.add_space(6.0);
-                let vmaf = ui
-                    .add_enabled(
-                        !self.busy,
-                        egui::Button::new("VMAF").min_size(egui::vec2(120.0, 28.0)),
-                    )
-                    .on_hover_text(
-                        "libvmaf all input→output pairs. Right-click a file for one pair. Esc cancels.",
-                    );
-                if vmaf.clicked() {
-                    self.start_vmaf(None);
+                {
+                    let vmaf_ok = self.vmaf_available;
+                    let disabled_hint = if !vmaf_ok {
+                        "ffmpeg has no libvmaf filter — install a full build (e.g. gyan.dev full)"
+                    } else {
+                        "Wait for the current job to finish"
+                    };
+                    let vmaf = ui
+                        .add_enabled(
+                            !self.busy && vmaf_ok,
+                            egui::Button::new("VMAF").min_size(egui::vec2(120.0, 28.0)),
+                        )
+                        .on_hover_text(
+                            "libvmaf all input→output pairs. Right-click a file for one pair. Esc cancels.",
+                        )
+                        .on_disabled_hover_text(disabled_hint);
+                    if vmaf.clicked() {
+                        self.start_vmaf(None);
+                    }
                 }
                 if self.busy && self.encode_progress.is_none() {
                     let label = match self.job {
@@ -5051,6 +5084,7 @@ impl GigaMuxApp {
                     }
                     self.av1_devices = list_av1_nvenc_devices(&self.devices);
                     self.qsv_available = qsv_vp9_available();
+                    self.vmaf_available = libvmaf_available();
                     let _ = prefs::save(&self.prefs);
                 }
             });
@@ -5121,16 +5155,22 @@ impl GigaMuxApp {
         }
         {
             let was = self.prefs.auto_vmaf_when_idle;
-            if ui
-                .checkbox(
-                    &mut self.prefs.auto_vmaf_when_idle,
-                    "Auto VMAF when idle",
-                )
+            let vmaf_ok = self.vmaf_available;
+            let resp = ui
+                .add_enabled_ui(vmaf_ok, |ui| {
+                    ui.checkbox(
+                        &mut self.prefs.auto_vmaf_when_idle,
+                        "Auto VMAF when idle",
+                    )
+                })
+                .inner
                 .on_hover_text(
                     "After encode (or when enabled while idle): integrity-Check first, then VMAF unscored intact pairs.",
                 )
-                .changed()
-            {
+                .on_disabled_hover_text(
+                    "ffmpeg has no libvmaf filter — install a full build (e.g. gyan.dev full)",
+                );
+            if resp.changed() {
                 let _ = prefs::save(&self.prefs);
                 // Turning on while idle arms a one-shot pass over current unscored outputs.
                 if self.prefs.auto_vmaf_when_idle && !was && self.history_idle() {
