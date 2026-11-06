@@ -4811,81 +4811,26 @@ impl GigaMuxApp {
 
 
     fn ui_center(&mut self, ui: &mut egui::Ui) {
-        // Split preview vs actions into separate bands so log expand/collapse never lets Settings / Encode / Check overlap the preview (or each other).
+        // Bottom-up: action stack hugs a fixed gap above the log; preview fills whatever remains.
+        // (Central panel already ends at the log / progress strip, so this tracks log height for free.)
+        const GAP_ABOVE_LOG: f32 = 8.0;
         let full = ui.available_size();
-        // Cog + Encode/Check/VMAF + gaps; leave a little air above the log strip.
-        let actions_h = 184.0;
-        let preview_h = (full.y - actions_h).max(48.0);
-
         ui.allocate_ui_with_layout(
-            egui::vec2(full.x, preview_h),
-            egui::Layout::top_down(egui::Align::Center),
+            full,
+            egui::Layout::bottom_up(egui::Align::Center),
             |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("center_preview")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_space(8.0);
-                        self.ui_preview(ui);
-                    });
-            },
-        );
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(full.x, actions_h.min(ui.available_height().max(actions_h * 0.5))),
-            egui::Layout::top_down(egui::Align::Center),
-            |ui| {
-                ui.add_space(8.0);
-                if ui
-                    .add_sized(
-                        [40.0, 40.0],
-                        egui::Button::new(egui::RichText::new("\u{2699}").size(22.0)),
-                    )
-                    .on_hover_text("Settings")
-                    .clicked()
-                {
-                    self.show_settings = true;
-                    self.settings_raise = true;
+                ui.add_space(GAP_ABOVE_LOG);
+                // First widgets sit nearest the log (bottom_up draws upward).
+                if self.busy && self.encode_progress.is_none() {
+                    let label = match self.job {
+                        Some(JobKind::Encode) => "Encoding…",
+                        Some(JobKind::Check) => "Checking…",
+                        Some(JobKind::Vmaf) => "VMAF…",
+                        None => "Busy…",
+                    };
+                    ui.label(label);
+                    ui.add_space(6.0);
                 }
-                ui.add_space(10.0);
-                let encode = ui
-                    .add_enabled(
-                        !self.busy,
-                        egui::Button::new("Encode all").min_size(egui::vec2(140.0, 36.0)),
-                    )
-                    .on_hover_text(
-                        "Encode every file in the input folder (F12). Right-click a file to encode only that one.",
-                    );
-                if encode.clicked() {
-                    self.start_encode(None);
-                }
-                ui.add_space(6.0);
-                {
-                    let farm_ok = !self.prefs.flamenco_manager_url.trim().is_empty();
-                    let farm = ui
-                        .add_enabled(
-                            farm_ok,
-                            egui::Button::new("Flamenco").min_size(egui::vec2(120.0, 28.0)),
-                        )
-                        .on_hover_text(
-                            "Send the selected input to Flamenco (worker ffmpeg via GigaMux.js). Use Settings → Files to Find Manager, Deploy JS, Ensure tags.",
-                        )
-                        .on_disabled_hover_text(
-                            "Set Flamenco Manager URL (or Find) in Settings → Files",
-                        );
-                    if farm.clicked() {
-                        self.submit_flamenco_encode(None);
-                    }
-                }
-                ui.add_space(6.0);
-                let check = ui.add_enabled(
-                    !self.busy,
-                    egui::Button::new("Check").min_size(egui::vec2(120.0, 28.0)),
-                );
-                if check.clicked() {
-                    self.start_check();
-                }
-                ui.add_space(6.0);
                 {
                     let vmaf_ok = self.vmaf_available;
                     let disabled_hint = if !vmaf_ok {
@@ -4906,16 +4851,73 @@ impl GigaMuxApp {
                         self.start_vmaf(None);
                     }
                 }
-                if self.busy && self.encode_progress.is_none() {
-                    let label = match self.job {
-                        Some(JobKind::Encode) => "Encoding…",
-                        Some(JobKind::Check) => "Checking…",
-                        Some(JobKind::Vmaf) => "VMAF…",
-                        None => "Busy…",
-                    };
-                    ui.label(label);
+                ui.add_space(6.0);
+                let check = ui.add_enabled(
+                    !self.busy,
+                    egui::Button::new("Check").min_size(egui::vec2(120.0, 28.0)),
+                );
+                if check.clicked() {
+                    self.start_check();
+                }
+                ui.add_space(6.0);
+                {
+                    let farm_ok = !self.prefs.flamenco_manager_url.trim().is_empty();
+                    let farm = ui
+                        .add_enabled(
+                            farm_ok,
+                            egui::Button::new("Flamenco").min_size(egui::vec2(120.0, 28.0)),
+                        )
+                        .on_hover_text(
+                            "Send the selected input to Flamenco (worker ffmpeg via GigaMux.js). Use Settings → Files to Find Manager, Deploy JS, Ensure tags.",
+                        )
+                        .on_disabled_hover_text(
+                            "Set Flamenco Manager URL (or Find) in Settings → Files",
+                        );
+                    if farm.clicked() {
+                        self.submit_flamenco_encode(None);
+                    }
+                }
+                ui.add_space(6.0);
+                let encode = ui
+                    .add_enabled(
+                        !self.busy,
+                        egui::Button::new("Encode all").min_size(egui::vec2(140.0, 36.0)),
+                    )
+                    .on_hover_text(
+                        "Encode every file in the input folder (F12). Right-click a file to encode only that one.",
+                    );
+                if encode.clicked() {
+                    self.start_encode(None);
+                }
+                ui.add_space(10.0);
+                if ui
+                    .add_sized(
+                        [40.0, 40.0],
+                        egui::Button::new(egui::RichText::new("\u{2699}").size(22.0)),
+                    )
+                    .on_hover_text("Settings")
+                    .clicked()
+                {
+                    self.show_settings = true;
+                    self.settings_raise = true;
                 }
                 ui.add_space(8.0);
+
+                // Remaining height is the preview band (above the action stack).
+                let preview_h = ui.available_height().max(48.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), preview_h),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("center_preview")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add_space(8.0);
+                                self.ui_preview(ui);
+                            });
+                    },
+                );
             },
         );
     }
