@@ -362,6 +362,8 @@ struct GigaMuxApp {
     taskbar_showing: bool,
     /// Inline F2 rename of the active list row.
     rename_edit: Option<RenameEdit>,
+    /// Last Input/Output `list_media` pass (idle auto-refresh cadence).
+    lists_refreshed_at: Instant,
 }
 
 /// How to commit an inline F2 rename.
@@ -713,6 +715,7 @@ impl GigaMuxApp {
             #[cfg(windows)]
             taskbar_showing: false,
             rename_edit: None,
+            lists_refreshed_at: Instant::now(),
         };
         app.load_preview_cache_from_disk();
         app.refresh_lists();
@@ -1683,7 +1686,11 @@ impl GigaMuxApp {
         }
     }
 
+    /// Idle re-scan interval so farm/external outputs appear without a manual refresh.
+    const LISTS_IDLE_REFRESH: Duration = Duration::from_secs(60);
+
     fn refresh_lists(&mut self) {
+        self.lists_refreshed_at = Instant::now();
         self.input_files = if prefs::dir_ok(&self.prefs.input_dir) {
             list_media(&self.prefs.input_dir, true)
         } else {
@@ -1726,6 +1733,20 @@ impl GigaMuxApp {
         if self.scrub_stale_vmaf() {
             self.save_preview_cache_to_disk();
         }
+    }
+
+    /// Once a minute while idle: re-list folders and top up preview cache (e.g. farm delivers).
+    fn tick_idle_list_refresh(&mut self, ctx: &egui::Context) {
+        if !(self.history_idle() && self.rename_edit.is_none()) {
+            return;
+        }
+        let due = self.lists_refreshed_at + Self::LISTS_IDLE_REFRESH;
+        let now = Instant::now();
+        if now >= due {
+            self.refresh_lists();
+        }
+        let next = self.lists_refreshed_at + Self::LISTS_IDLE_REFRESH;
+        ctx.request_repaint_after(next.saturating_duration_since(Instant::now()));
     }
 
     /// UI session pane + durable `session.log` (UI-only actions; not job-mirrored lines).
@@ -7354,6 +7375,7 @@ impl eframe::App for GigaMuxApp {
             }
         }
         self.try_start_auto_vmaf();
+        self.tick_idle_list_refresh(ctx);
         // Suspend live ffmpeg on user input; resume after 1 s system idle.
         self.tick_ffmpeg_idle_pause();
         self.handle_shortcuts(ctx);
