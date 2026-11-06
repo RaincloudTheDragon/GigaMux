@@ -13,6 +13,7 @@ use eframe::egui;
 
 #[cfg(windows)]
 mod taskbar_progress;
+mod ffmpeg_idle_pause;
 
 use gigamux_core::check::{
     check_issue_category, check_issue_severity, delete_issue_outputs, integrity_blocked_outputs,
@@ -26,6 +27,7 @@ use gigamux_core::flamenco::{
     deploy_gigamux_js, discover_manager, ensure_worker_tags, make_gigamux_encode_job,
     scripts_dir_from_manager_install, submit_job, REQUIRED_WORKER_TAGS,
 };
+use gigamux_core::ffmpeg_active::active_ffmpeg_pid;
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
 use gigamux_core::gpu::{
     list_av1_nvenc_devices, list_nvenc_devices, qsv_vp9_available, GpuChoice, NvencDevice,
@@ -312,8 +314,16 @@ struct GigaMuxApp {
     event_rx: Option<Receiver<AppEvent>>,
     /// Check results viewport (severity tree + selective purge).
     pending_check: Option<CheckResultsWindow>,
-    /// Pref-armed: when idle, silent Check then VMAF unscored intact pairs.
+    /// Pref-armed: when idle and due, silent Check then VMAF unscored intact pairs.
     auto_vmaf_armed: bool,
+    /// Earliest Instant to start the next auto VMAF pass (None while disarmed or in-flight).
+    auto_vmaf_due_at: Option<Instant>,
+    /// True while the in-flight VMAF job is the auto (Check→score) path; drives reschedule on done.
+    auto_vmaf_pass: bool,
+    /// Shutter-style: ffmpeg process tree is NtSuspended until 1 s system idle.
+    ffmpeg_suspended: bool,
+    /// Last observed system idle ms (detect fresh input via decrease).
+    last_system_idle_ms: u64,
     /// Confirm before Recycle Bin (unless the user opted out).
     pending_recycle_delete: Option<RecycleDeletePrompt>,
     /// Recycle Bin failed — confirm permanent delete (or proceed if warnings disabled).
@@ -381,6 +391,10 @@ struct RenameEdit {
 
 /// Pace between one-by-one delete / restore steps so the list visibly moves.
 const DELETE_STEP_MS: u64 = 90;
+/// Auto VMAF: retry while unscored outputs remain (other workers / integrity / score fail).
+const AUTO_VMAF_RETRY_BUSY: Duration = Duration::from_secs(5 * 60);
+/// Auto VMAF: watch interval once every output has a score.
+const AUTO_VMAF_RETRY_CAUGHT_UP: Duration = Duration::from_secs(60 * 60);
 /// Cap Ctrl+Z undo gestures (not individual files) so the stack cannot grow without bound.
 const DELETE_UNDO_CAP: usize = 50;
 /// Pointer travel before a press becomes a marquee instead of a click.
@@ -649,6 +663,10 @@ impl GigaMuxApp {
             event_rx: None,
             pending_check: None,
             auto_vmaf_armed: false,
+            auto_vmaf_due_at: None,
+            auto_vmaf_pass: false,
+            ffmpeg_suspended: false,
+            last_system_idle_ms: u64::MAX,
             pending_recycle_delete: None,
             pending_permanent_delete: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
@@ -672,6 +690,10 @@ impl GigaMuxApp {
         app.refresh_lists();
         let started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         app.push_session(format!("—— session start {started} ——"));
+        // Pref on at launch: one immediate idle pass, then 5m/1h cadence after each finish.
+        if app.prefs.auto_vmaf_when_idle {
+            app.schedule_auto_vmaf(Duration::ZERO);
+        }
         app
     }
 
@@ -1793,6 +1815,7 @@ impl GigaMuxApp {
             self.prefs.job_done_chime = d.job_done_chime;
             self.prefs.check_ignore_orphan_outputs = d.check_ignore_orphan_outputs;
             self.prefs.auto_vmaf_when_idle = d.auto_vmaf_when_idle;
+            self.prefs.work_during_inactivity = d.work_during_inactivity;
             self.prefs.flamenco_manager_url = d.flamenco_manager_url;
             self.prefs.flamenco_scripts_dir = d.flamenco_scripts_dir;
             self.prefs.flamenco_worker_tag = d.flamenco_worker_tag;
@@ -3256,21 +3279,82 @@ impl GigaMuxApp {
             .collect()
     }
 
-    /// When armed and idle: silent integrity Check, then VMAF only unscored intact outputs.
+    /// Arm auto VMAF to fire once app-idle after `delay` (ZERO = ASAP).
+    fn schedule_auto_vmaf(&mut self, delay: Duration) {
+        self.auto_vmaf_armed = true;
+        self.auto_vmaf_due_at = Some(Instant::now() + delay);
+    }
+
+    /// Drop the pending auto VMAF schedule (pref off or unrecoverable skip).
+    fn clear_auto_vmaf_schedule(&mut self) {
+        self.auto_vmaf_armed = false;
+        self.auto_vmaf_due_at = None;
+    }
+
+    /// Resume a suspended ffmpeg tree (toggle off, or job ended while paused).
+    fn resume_ffmpeg_if_suspended(&mut self) {
+        if !self.ffmpeg_suspended {
+            return;
+        }
+        if let Some(pid) = active_ffmpeg_pid() {
+            let _ = ffmpeg_idle_pause::resume_process_tree(pid);
+        }
+        self.ffmpeg_suspended = false;
+        self.last_system_idle_ms = u64::MAX;
+    }
+
+    /// Shutter-style: suspend active ffmpeg on fresh input; resume after [`ffmpeg_idle_pause::IDLE_RESUME`].
+    fn tick_ffmpeg_idle_pause(&mut self) {
+        if !self.prefs.work_during_inactivity {
+            self.resume_ffmpeg_if_suspended();
+            return;
+        }
+        let Some(pid) = active_ffmpeg_pid() else {
+            self.ffmpeg_suspended = false;
+            self.last_system_idle_ms = u64::MAX;
+            return;
+        };
+        let idle = ffmpeg_idle_pause::system_idle();
+        let idle_ms = idle.as_millis() as u64;
+        // Fresh input while running → pause immediately (do not treat the Start click as a pause).
+        if idle_ms < self.last_system_idle_ms && !self.ffmpeg_suspended {
+            if ffmpeg_idle_pause::suspend_process_tree(pid) {
+                self.ffmpeg_suspended = true;
+                self.note_session_ui(
+                    "ffmpeg paused (user activity) — resumes after 1 s idle",
+                );
+            }
+        }
+        self.last_system_idle_ms = idle_ms;
+        if self.ffmpeg_suspended && idle >= ffmpeg_idle_pause::IDLE_RESUME {
+            if ffmpeg_idle_pause::resume_process_tree(pid) {
+                self.ffmpeg_suspended = false;
+                self.note_session_ui("ffmpeg resumed");
+            }
+        }
+    }
+
+    /// When armed, due, and idle: silent integrity Check, then VMAF only unscored intact outputs.
     fn try_start_auto_vmaf(&mut self) {
         if !self.auto_vmaf_armed || !self.prefs.auto_vmaf_when_idle {
+            return;
+        }
+        let Some(due) = self.auto_vmaf_due_at else {
+            return;
+        };
+        if Instant::now() < due {
             return;
         }
         if !self.history_idle() || self.pending_check.is_some() {
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
-            self.auto_vmaf_armed = false;
+            self.clear_auto_vmaf_schedule();
             self.push_session("auto VMAF: skipped — set input and output folders");
             return;
         }
         if !self.vmaf_available {
-            self.auto_vmaf_armed = false;
+            self.clear_auto_vmaf_schedule();
             self.push_session("auto VMAF: skipped — libvmaf unavailable");
             return;
         }
@@ -3278,17 +3362,18 @@ impl GigaMuxApp {
         let unscored = self.unscored_output_names();
         let already = total_out.saturating_sub(unscored.len());
         if unscored.is_empty() {
-            self.auto_vmaf_armed = false;
+            // Caught up: keep watching hourly for new / still-writing outputs.
             if total_out == 0 {
-                self.push_session("auto VMAF: nothing to score");
+                self.push_session("auto VMAF: nothing to score — next check in 1 h");
             } else {
                 self.push_session(format!(
-                    "auto VMAF: skipped — {already} already scored, 0 unscored"
+                    "auto VMAF: skipped — {already} already scored, 0 unscored — next check in 1 h"
                 ));
             }
+            self.schedule_auto_vmaf(AUTO_VMAF_RETRY_CAUGHT_UP);
             return;
         }
-        self.auto_vmaf_armed = false;
+        self.clear_auto_vmaf_schedule();
         self.start_auto_vmaf(unscored, already);
     }
 
@@ -3302,6 +3387,7 @@ impl GigaMuxApp {
         let (tx, rx) = mpsc::channel();
         self.busy = true;
         self.job = Some(JobKind::Vmaf);
+        self.auto_vmaf_pass = true;
         self.event_rx = Some(rx);
         self.push_session(format!(
             "auto VMAF: Check then score ({} unscored, {already_scored} already scored)…",
@@ -3363,6 +3449,9 @@ impl GigaMuxApp {
             return;
         };
         let mut finished = false;
+        // Capture before the job clears so only auto Check→VMAF passes reschedule.
+        let auto_pass = self.auto_vmaf_pass;
+        let mut auto_vmaf_err = false;
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 AppEvent::Encode(EncodeEvent::Log(msg)) => {
@@ -3472,9 +3561,9 @@ impl GigaMuxApp {
                     ));
                     finished = true;
                     self.refresh_lists();
-                    // Arm auto-VMAF once the batch produced at least one ok output.
+                    // Immediate auto-VMAF once the batch produced at least one ok output.
                     if ok > 0 && self.prefs.auto_vmaf_when_idle {
-                        self.auto_vmaf_armed = true;
+                        self.schedule_auto_vmaf(Duration::ZERO);
                     }
                 }
                 AppEvent::CheckDone(result) => {
@@ -3560,7 +3649,12 @@ impl GigaMuxApp {
                     match result {
                         // Scores were already stored on each FileDone; this is a safety net + log panel.
                         Ok(report) => self.apply_vmaf_report(report),
-                        Err(e) => self.push_session(format!("VMAF failed: {e}")),
+                        Err(e) => {
+                            if auto_pass {
+                                auto_vmaf_err = true;
+                            }
+                            self.push_session(format!("VMAF failed: {e}"));
+                        }
                     }
                 }
             }
@@ -3570,6 +3664,20 @@ impl GigaMuxApp {
             self.job = None;
             self.encode_progress = None;
             self.event_rx = None;
+            if auto_pass {
+                self.auto_vmaf_pass = false;
+                // 5m while unscored remain (or the pass errored); 1h when caught up.
+                if self.prefs.auto_vmaf_when_idle {
+                    self.refresh_lists();
+                    if auto_vmaf_err || !self.unscored_output_names().is_empty() {
+                        self.schedule_auto_vmaf(AUTO_VMAF_RETRY_BUSY);
+                        self.push_session("auto VMAF: next check in 5 min");
+                    } else {
+                        self.schedule_auto_vmaf(AUTO_VMAF_RETRY_CAUGHT_UP);
+                        self.push_session("auto VMAF: next check in 1 h");
+                    }
+                }
+            }
             if self.prefs.job_done_chime {
                 play_job_done_chime();
             }
@@ -4901,6 +5009,25 @@ impl GigaMuxApp {
                     self.show_settings = true;
                     self.settings_raise = true;
                 }
+                // Above the cog (bottom_up: later = higher): Shutter-style encode/VMAF pause.
+                ui.add_space(6.0);
+                {
+                    let was = self.prefs.work_during_inactivity;
+                    let resp = ui
+                        .checkbox(
+                            &mut self.prefs.work_during_inactivity,
+                            "Work during inactivity",
+                        )
+                        .on_hover_text(
+                            "Pause encode/VMAF ffmpeg when you use the mouse or keyboard; resume after 1 s idle.",
+                        );
+                    if resp.changed() {
+                        let _ = prefs::save(&self.prefs);
+                        if was && !self.prefs.work_during_inactivity {
+                            self.resume_ffmpeg_if_suspended();
+                        }
+                    }
+                }
                 ui.add_space(8.0);
 
                 // Remaining height is the preview band (above the action stack).
@@ -4958,10 +5085,17 @@ impl GigaMuxApp {
             )
         };
 
+        let paused = self.ffmpeg_suspended;
         egui::Panel::bottom("encode_progress")
-            .exact_size(78.0)
+            .exact_size(if paused { 94.0 } else { 78.0 })
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
+                    if paused {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 160, 60),
+                            "Paused — resumes after 1 s idle",
+                        );
+                    }
                     let bar_w = (ui.available_width() - 24.0).clamp(160.0, 640.0);
                     ui.label(egui::RichText::new(file_caption).small());
                     Self::progress_bar_with_center_label(ui, bar_w, file_frac, &file_label);
@@ -5526,19 +5660,19 @@ impl GigaMuxApp {
                 })
                 .inner
                 .on_hover_text(
-                    "After encode (or when enabled while idle): integrity-Check first, then VMAF unscored intact pairs.",
+                    "On startup, after encode, or when enabled while idle: integrity-Check then VMAF unscored intact pairs. Retries every 5 min while work remains, else every 1 h.",
                 )
                 .on_disabled_hover_text(
                     "ffmpeg has no libvmaf filter — install a full build (e.g. gyan.dev full)",
                 );
             if resp.changed() {
                 let _ = prefs::save(&self.prefs);
-                // Turning on while idle arms a one-shot pass over current unscored outputs.
+                // Turning on while idle arms an immediate pass over current unscored outputs.
                 if self.prefs.auto_vmaf_when_idle && !was && self.history_idle() {
-                    self.auto_vmaf_armed = true;
+                    self.schedule_auto_vmaf(Duration::ZERO);
                 }
                 if !self.prefs.auto_vmaf_when_idle {
-                    self.auto_vmaf_armed = false;
+                    self.clear_auto_vmaf_schedule();
                 }
             }
         }
@@ -6709,7 +6843,18 @@ impl eframe::App for GigaMuxApp {
         self.tick_history_nav(ctx);
         self.poll_preview_cache(ctx);
         // Pref-armed idle pass: silent Check → filtered VMAF (no purge window).
+        // Wake when the next due Instant arrives even if the UI is otherwise idle.
+        if self.prefs.auto_vmaf_when_idle && self.auto_vmaf_armed {
+            if let Some(due) = self.auto_vmaf_due_at {
+                let now = Instant::now();
+                if now < due {
+                    ctx.request_repaint_after(due.saturating_duration_since(now));
+                }
+            }
+        }
         self.try_start_auto_vmaf();
+        // Suspend live ffmpeg on user input; resume after 1 s system idle.
+        self.tick_ffmpeg_idle_pause();
         self.handle_shortcuts(ctx);
     }
 

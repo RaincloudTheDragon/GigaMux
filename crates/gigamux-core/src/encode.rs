@@ -752,6 +752,8 @@ fn run_ffmpeg(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("ffmpeg spawn: {e}"))?;
+    // UI may Shutter-style suspend/resume this tree while the encode runs.
+    let _active = crate::ffmpeg_active::ActiveFfmpegGuard::new(child.id());
 
     let mut stderr = child
         .stderr

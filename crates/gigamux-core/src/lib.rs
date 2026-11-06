@@ -2,6 +2,7 @@
 
 pub mod check;
 pub mod encode;
+pub mod ffmpeg_active;
 pub mod flamenco;
 pub mod gpu;
 pub mod job_log;
@@ -22,6 +23,7 @@ pub use encode::{
     build_farm_ffmpeg_argv, run_batch, EncodeEvent, EncodeOptions, FarmEncodeRequest,
     FarmFfmpegCommand,
 };
+pub use ffmpeg_active::{active_ffmpeg_pid, ActiveFfmpegGuard};
 pub use flamenco::{
     deploy_gigamux_js, discover_manager, ensure_worker_tags, fetch_worker_tags,
     make_gigamux_encode_job, ping_manager, scripts_dir_from_manager_install, submit_job,

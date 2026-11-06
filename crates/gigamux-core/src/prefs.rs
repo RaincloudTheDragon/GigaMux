@@ -129,9 +129,12 @@ pub struct Prefs {
     /// When deleting after Check, skip outputs with no matching input stem. Default off.
     #[serde(default)]
     pub check_ignore_orphan_outputs: bool,
-    /// When idle after encode (or when enabled), Check then VMAF unscored intact pairs. Default off.
+    /// When idle: Check then VMAF unscored intact pairs (startup/encode/toggle; then 5m while work remains, 1h when caught up). Default off.
     #[serde(default)]
     pub auto_vmaf_when_idle: bool,
+    /// Shutter-style: suspend encode/VMAF ffmpeg on input; resume after 1 s idle. Default off.
+    #[serde(default)]
+    pub work_during_inactivity: bool,
     /// Flamenco Manager base URL (e.g. `http://127.0.0.1:8080`). Empty = farm submit disabled.
     #[serde(default)]
     pub flamenco_manager_url: String,
@@ -165,6 +168,7 @@ impl Default for Prefs {
             job_done_chime: true,
             check_ignore_orphan_outputs: false,
             auto_vmaf_when_idle: false,
+            work_during_inactivity: false,
             flamenco_manager_url: String::new(),
             flamenco_scripts_dir: String::new(),
             flamenco_worker_tag: String::new(),
