@@ -338,6 +338,8 @@ struct GigaMuxApp {
     pending_permanent_delete: Option<PermanentDeletePrompt>,
     /// Flamenco sender options (Submit posts jobs; Cancel dismisses).
     pending_flamenco: Option<FlamencoSubmitPrompt>,
+    /// Important error modal (session log still gets the line; panel stays collapsed).
+    pending_alert: Option<AlertPrompt>,
     /// Alt held at launch — choose which prefs / logs to purge.
     pending_purge: Option<PurgePrompt>,
     /// One-by-one delete cascade (list shrinks between each file).
@@ -602,6 +604,13 @@ struct FlamencoSubmitPrompt {
     estimate_name: String,
 }
 
+/// Modal for important errors (does not expand the log panel).
+#[derive(Clone)]
+struct AlertPrompt {
+    title: String,
+    message: String,
+}
+
 /// Alt-at-launch purge chooser (which prefs slices + optional logs).
 #[derive(Clone)]
 struct PurgePrompt {
@@ -705,6 +714,7 @@ impl GigaMuxApp {
             pending_recycle_delete: None,
             pending_permanent_delete: None,
             pending_flamenco: None,
+            pending_alert: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
             delete_queue: None,
             undo_history: UndoHistory::new(),
@@ -1602,8 +1612,10 @@ impl GigaMuxApp {
         } else if let Some(parent) = path.parent().filter(|p| p.is_dir()) {
             parent.to_path_buf()
         } else {
-            self.push_session(format!("drop ignored (not a folder): {}", path.display()));
-            self.log_open = true;
+            self.alert_error(
+                "Drop",
+                format!("drop ignored (not a folder): {}", path.display()),
+            );
             return;
         };
         if is_input {
@@ -1686,8 +1698,10 @@ impl GigaMuxApp {
             Some(FileSide::Input) => self.set_folder_from_path(true, path),
             Some(FileSide::Output) => self.set_folder_from_path(false, path),
             None => {
-                self.push_session("drop a folder onto the Input or Output pane to set it");
-                self.log_open = true;
+                self.alert_error(
+                    "Drop",
+                    "drop a folder onto the Input or Output pane to set it",
+                );
             }
         }
     }
@@ -1807,6 +1821,22 @@ impl GigaMuxApp {
         // Do not rewrite disk from the UI tail — job lines live on disk beyond the pane.
     }
 
+    /// Important error: session log + modal. Never auto-expands the log panel.
+    fn alert_error(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let title = title.into();
+        let message = message.into();
+        self.push_session(message.clone());
+        self.pending_alert = Some(AlertPrompt { title, message });
+    }
+
+    /// Modal only when the session line was already written another way.
+    fn show_alert(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        self.pending_alert = Some(AlertPrompt {
+            title: title.into(),
+            message: message.into(),
+        });
+    }
+
     /// Session pane only — durable line already written by [`job_log::JobLog`].
     fn note_session_ui(&mut self, line: impl Into<String>) {
         self.session_log.push(line.into());
@@ -1843,9 +1873,8 @@ impl GigaMuxApp {
         {
             match prefs::export_profile(&self.prefs, &path) {
                 Ok(()) => self.push_session(format!("exported profile → {}", path.display())),
-                Err(e) => self.push_session(format!("export failed: {e}")),
+                Err(e) => self.alert_error("Export", format!("export failed: {e}")),
             }
-            self.log_open = true;
         }
     }
 
@@ -1867,9 +1896,8 @@ impl GigaMuxApp {
                     self.refresh_lists();
                     self.push_session(format!("imported profile ← {}", path.display()));
                 }
-                Err(e) => self.push_session(format!("import failed: {e}")),
+                Err(e) => self.alert_error("Import", format!("import failed: {e}")),
             }
-            self.log_open = true;
         }
     }
 
@@ -1964,7 +1992,7 @@ impl GigaMuxApp {
         if p.job_logs {
             match job_log::clear_encode_logs() {
                 Ok(n) => parts.push(format!("job logs ({n})")),
-                Err(e) => self.push_session(format!("job log purge failed: {e}")),
+                Err(e) => self.alert_error("Purge", format!("job log purge failed: {e}")),
             }
         }
 
@@ -1979,16 +2007,20 @@ impl GigaMuxApp {
     fn open_flamenco_submit(&mut self, only_name: Option<String>) {
         let url = self.prefs.flamenco_manager_url.trim();
         if url.is_empty() {
-            self.push_session("set Flamenco Manager URL in Settings → Files");
-            self.log_open = true;
+            self.alert_error(
+                "Flamenco",
+                "set Flamenco Manager URL in Settings → Files",
+            );
             self.show_settings = true;
             self.settings_tab = SettingsTab::Files;
             self.settings_raise = true;
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
-            self.push_session("set both input and output folders before Flamenco submit");
-            self.log_open = true;
+            self.alert_error(
+                "Flamenco",
+                "set both input and output folders before Flamenco submit",
+            );
             return;
         }
         let names: Vec<String> = if let Some(n) = only_name {
@@ -1999,8 +2031,10 @@ impl GigaMuxApp {
             Vec::new()
         };
         if names.is_empty() {
-            self.push_session("select input file(s) (or use context menu) for Flamenco submit");
-            self.log_open = true;
+            self.alert_error(
+                "Flamenco",
+                "select input file(s) (or use context menu) for Flamenco submit",
+            );
             return;
         }
         let (estimate_name, estimate_duration_s) = names
@@ -2049,23 +2083,29 @@ impl GigaMuxApp {
     fn submit_flamenco_encode(&mut self, names: Vec<String>) {
         let url = self.prefs.flamenco_manager_url.trim().to_string();
         if url.is_empty() {
-            self.push_session("set Flamenco Manager URL in Settings → Files");
-            self.log_open = true;
+            self.alert_error(
+                "Flamenco",
+                "set Flamenco Manager URL in Settings → Files",
+            );
             self.show_settings = true;
             self.settings_tab = SettingsTab::Files;
             self.settings_raise = true;
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
-            self.push_session("set both input and output folders before Flamenco submit");
-            self.log_open = true;
+            self.alert_error(
+                "Flamenco",
+                "set both input and output folders before Flamenco submit",
+            );
             return;
         }
         self.commit_maxrate_override_edit(TestBatch::One);
         self.commit_cq_override_edit(TestBatch::One);
         if names.is_empty() {
-            self.push_session("select input file(s) (or use context menu) for Flamenco submit");
-            self.log_open = true;
+            self.alert_error(
+                "Flamenco",
+                "select input file(s) (or use context menu) for Flamenco submit",
+            );
             return;
         }
         // Effective HW for this machine (same as local encode mute); shared across the batch.
@@ -2266,8 +2306,15 @@ impl GigaMuxApp {
                 }
             }
         }
-        self.log_open = true;
-        if names.len() > 1 || skipped > 0 {
+        if failed > 0 {
+            self.alert_error(
+                "Flamenco",
+                format!(
+                    "Flamenco batch: submitted={ok} skipped={skipped} failed={failed} (of {})",
+                    names.len()
+                ),
+            );
+        } else if names.len() > 1 || skipped > 0 {
             self.push_session(format!(
                 "Flamenco batch: submitted={ok} skipped={skipped} failed={failed} (of {})",
                 names.len()
@@ -2284,8 +2331,10 @@ impl GigaMuxApp {
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
-            self.push_session("set both input and output folders before Encode");
-            self.log_open = true;
+            self.alert_error(
+                "Encode",
+                "set both input and output folders before Encode",
+            );
             return;
         }
         self.commit_all_slot_edits();
@@ -2331,7 +2380,6 @@ impl GigaMuxApp {
         } else {
             self.push_session("Encode started (all)…");
         }
-        self.log_open = true;
         thread::spawn(move || {
             run_batch(opts, cancel, |ev| {
                 let _ = tx.send(AppEvent::Encode(ev));
@@ -2345,7 +2393,6 @@ impl GigaMuxApp {
         if matches!(self.job, Some(JobKind::Encode | JobKind::Vmaf)) && self.busy {
             self.cancel.store(true, Ordering::Relaxed);
             self.push_session("cancel requested…");
-            self.log_open = true;
         }
     }
 
@@ -2702,8 +2749,7 @@ impl GigaMuxApp {
             }
         }
         if Self::rename_name_invalid(&draft) {
-            self.push_session("rename failed: invalid name");
-            self.log_open = true;
+            self.alert_error("Rename", "rename failed: invalid name");
             return;
         }
         // Selection on this side, list order; always includes the edited active when multi.
@@ -2734,8 +2780,7 @@ impl GigaMuxApp {
                 // Multi Enter: `stem (1).ext` … keeping each file's original extension.
                 let (stem, _) = Self::split_file_name(&draft);
                 if Self::rename_name_invalid(&stem) {
-                    self.push_session("rename failed: invalid name");
-                    self.log_open = true;
+                    self.alert_error("Rename", "rename failed: invalid name");
                     return;
                 }
                 names
@@ -2751,10 +2796,10 @@ impl GigaMuxApp {
             RenameCommitMode::Pattern => {
                 // Alt+Enter: same strip/add that turned baseline → draft across selection.
                 let Some(affix) = Self::infer_rename_affix_edit(&edit.baseline, &draft) else {
-                    self.push_session(
+                    self.alert_error(
+                        "Rename",
                         "rename pattern failed: could not match edit to the original name",
                     );
-                    self.log_open = true;
                     return;
                 };
                 let mut pairs = Vec::with_capacity(names.len());
@@ -2769,17 +2814,19 @@ impl GigaMuxApp {
                         Ok(new_unit) => {
                             let new_name = format!("{new_unit}{ext}");
                             if Self::rename_name_invalid(&new_name) {
-                                self.push_session(format!(
-                                    "rename failed: invalid name ({new_name})"
-                                ));
-                                self.log_open = true;
+                                self.alert_error(
+                                    "Rename",
+                                    format!("rename failed: invalid name ({new_name})"),
+                                );
                                 return;
                             }
                             pairs.push((old.clone(), new_name));
                         }
                         Err(e) => {
-                            self.push_session(format!("rename pattern failed: {e}"));
-                            self.log_open = true;
+                            self.alert_error(
+                                "Rename",
+                                format!("rename pattern failed: {e}"),
+                            );
                             return;
                         }
                     }
@@ -2793,8 +2840,7 @@ impl GigaMuxApp {
         let done = match self.apply_rename_pairs(edit.side, &pairs) {
             Ok(d) => d,
             Err(e) => {
-                self.push_session(format!("rename failed: {e}"));
-                self.log_open = true;
+                self.alert_error("Rename", format!("rename failed: {e}"));
                 return;
             }
         };
@@ -2844,8 +2890,7 @@ impl GigaMuxApp {
             return;
         };
         if self.busy {
-            self.push_session("can't delete while a job is running");
-            self.log_open = true;
+            self.alert_error("Delete", "can't delete while a job is running");
             return;
         }
         if self.pending_recycle_delete.is_some()
@@ -2951,8 +2996,7 @@ impl GigaMuxApp {
                 self.after_one_deleted(side, &name);
             }
             Err(e) if e == "not present on disk" => {
-                self.push_session(format!("delete failed ({name}): {e}"));
-                self.log_open = true;
+                self.alert_error("Delete", format!("delete failed ({name}): {e}"));
                 self.after_one_deleted(side, &name);
             }
             Err(e) => {
@@ -2976,8 +3020,10 @@ impl GigaMuxApp {
                         self.after_one_deleted(side, &name);
                     }
                     Err(e2) => {
-                        self.push_session(format!("permanent delete failed ({name}): {e2}"));
-                        self.log_open = true;
+                        self.alert_error(
+                            "Delete",
+                            format!("permanent delete failed ({name}): {e2}"),
+                        );
                         self.after_one_deleted(side, &name);
                     }
                 }
@@ -3093,8 +3139,7 @@ impl GigaMuxApp {
     /// Jump to a waypoint index (`0` = Original, `steps.len()` = tip). Blender Undo History.
     fn history_jump(&mut self, target: usize) {
         if !self.history_idle() {
-            self.push_session("can't jump history while a job is running");
-            self.log_open = true;
+            self.alert_error("History", "can't jump history while a job is running");
             return;
         }
         let target = target.min(self.undo_history.steps.len());
@@ -3183,8 +3228,10 @@ impl GigaMuxApp {
                         }
                     }
                     Err(e) => {
-                        self.push_session(format!("rename undo/redo failed: {e}"));
-                        self.log_open = true;
+                        self.alert_error(
+                            "History",
+                            format!("rename undo/redo failed: {e}"),
+                        );
                     }
                 }
                 self.history_nav_start_next_batch();
@@ -3280,8 +3327,7 @@ impl GigaMuxApp {
                     }
                 }
                 Err(e) => {
-                    self.push_session(format!("undo failed ({name}): {e}"));
-                    self.log_open = true;
+                    self.alert_error("History", format!("undo failed ({name}): {e}"));
                 }
             },
             HistoryDir::Redo => match trash_file(&path) {
@@ -3293,8 +3339,10 @@ impl GigaMuxApp {
                     self.after_one_deleted(side, &name);
                 }
                 Err(e) => {
-                    self.push_session(format!("redo delete failed ({name}): {e}"));
-                    self.log_open = true;
+                    self.alert_error(
+                        "History",
+                        format!("redo delete failed ({name}): {e}"),
+                    );
                 }
             },
         }
@@ -3324,8 +3372,10 @@ impl GigaMuxApp {
                     self.after_one_deleted(side, name);
                 }
                 Err(e) => {
-                    self.push_session(format!("permanent delete failed ({name}): {e}"));
-                    self.log_open = true;
+                    self.alert_error(
+                        "Delete",
+                        format!("permanent delete failed ({name}): {e}"),
+                    );
                     self.after_one_deleted(side, name);
                 }
             }
@@ -3429,7 +3479,9 @@ impl GigaMuxApp {
             self.start_encode(None);
         }
         if esc {
-            if self.pending_purge.is_some() {
+            if self.pending_alert.is_some() {
+                self.pending_alert = None;
+            } else if self.pending_purge.is_some() {
                 self.pending_purge = None;
             } else if self.pending_permanent_delete.is_some() {
                 self.pending_permanent_delete = None;
@@ -3538,8 +3590,10 @@ impl GigaMuxApp {
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
-            self.push_session("set both input and output folders before Check");
-            self.log_open = true;
+            self.alert_error(
+                "Check",
+                "set both input and output folders before Check",
+            );
             return;
         }
         let input = self.prefs.input_dir.clone();
@@ -3550,7 +3604,6 @@ impl GigaMuxApp {
         self.job = Some(JobKind::Check);
         self.event_rx = Some(rx);
         self.push_session("Check started…");
-        self.log_open = true;
         thread::spawn(move || {
             let result = run_check(&input, &output, &slots);
             let _ = tx.send(AppEvent::CheckDone(result));
@@ -3563,15 +3616,17 @@ impl GigaMuxApp {
             return;
         }
         if !self.vmaf_available {
-            self.push_session(
+            self.alert_error(
+                "VMAF",
                 "VMAF unavailable — ffmpeg has no libvmaf filter (install a full build)",
             );
-            self.log_open = true;
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
-            self.push_session("set both input and output folders before VMAF");
-            self.log_open = true;
+            self.alert_error(
+                "VMAF",
+                "set both input and output folders before VMAF",
+            );
             return;
         }
         let input = self.prefs.input_dir.clone();
@@ -3588,7 +3643,6 @@ impl GigaMuxApp {
             .map(|n| format!("VMAF started — {n}"))
             .unwrap_or_else(|| "VMAF started — all pairs".into());
         self.push_session(label);
-        self.log_open = true;
         self.encode_progress = None;
         thread::spawn(move || {
             let tx_ev = tx.clone();
@@ -3729,7 +3783,6 @@ impl GigaMuxApp {
             "auto VMAF: Check then score ({} unscored, {already_scored} already scored)…",
             unscored.len()
         ));
-        self.log_open = true;
         self.encode_progress = None;
         thread::spawn(move || {
             let tx_ev = tx.clone();
@@ -3892,9 +3945,12 @@ impl GigaMuxApp {
                     skipped,
                     failed,
                 }) => {
-                    self.note_session_ui(format!(
-                        "finished — ok={ok} skipped={skipped} failed={failed}"
-                    ));
+                    let summary =
+                        format!("finished — ok={ok} skipped={skipped} failed={failed}");
+                    self.note_session_ui(summary.clone());
+                    if failed > 0 {
+                        self.show_alert("Encode", summary);
+                    }
                     finished = true;
                     self.refresh_lists();
                     // Immediate auto-VMAF once the batch produced at least one ok output.
@@ -3906,7 +3962,7 @@ impl GigaMuxApp {
                     finished = true;
                     match result {
                         Ok(report) => self.apply_check_report(report),
-                        Err(e) => self.push_session(format!("check failed: {e}")),
+                        Err(e) => self.alert_error("Check", format!("check failed: {e}")),
                     }
                     self.refresh_lists();
                 }
@@ -3975,9 +4031,12 @@ impl GigaMuxApp {
                         }
                     }
                     VmafEvent::Finished { ok, failed } => {
-                        self.note_session_ui(format!(
-                            "VMAF finished — scored={ok} failed={failed}"
-                        ));
+                        let summary =
+                            format!("VMAF finished — scored={ok} failed={failed}");
+                        self.note_session_ui(summary.clone());
+                        if failed > 0 && !auto_pass {
+                            self.show_alert("VMAF", summary);
+                        }
                     }
                 },
                 AppEvent::VmafDone(result) => {
@@ -3986,10 +4045,13 @@ impl GigaMuxApp {
                         // Scores were already stored on each FileDone; this is a safety net + log panel.
                         Ok(report) => self.apply_vmaf_report(report),
                         Err(e) => {
+                            let msg = format!("VMAF failed: {e}");
                             if auto_pass {
                                 auto_vmaf_err = true;
+                                self.push_session(msg);
+                            } else {
+                                self.alert_error("VMAF", msg);
                             }
-                            self.push_session(format!("VMAF failed: {e}"));
                         }
                     }
                 }
@@ -4062,7 +4124,6 @@ impl GigaMuxApp {
 
     /// End-of-batch safety net: any scored pairs not yet cached (should be rare after live FileDone).
     fn apply_vmaf_report(&mut self, report: VmafReport) {
-        self.log_open = true;
         self.log_show_session = true;
         for r in &report.results {
             if let Some(s) = r.score {
@@ -4080,7 +4141,6 @@ impl GigaMuxApp {
     }
 
     fn apply_check_report(&mut self, report: CheckReport) {
-        self.log_open = true;
         self.log_show_session = true;
         if report.ok() {
             self.push_session(format!(
@@ -5065,7 +5125,7 @@ impl GigaMuxApp {
                             if ui.button("Open in player").clicked() {
                                 self.select_file(side, name.clone());
                                 if let Err(e) = open_path_in_os(path) {
-                                    self.push_session(format!("open failed: {e}"));
+                                    self.alert_error("Open", format!("open failed: {e}"));
                                 }
                                 ui.close();
                             }
@@ -5076,7 +5136,7 @@ impl GigaMuxApp {
                             {
                                 self.select_file(side, name.clone());
                                 if let Err(e) = reveal_path_in_os(path) {
-                                    self.push_session(format!("reveal failed: {e}"));
+                                    self.alert_error("Reveal", format!("reveal failed: {e}"));
                                 }
                                 ui.close();
                             }
@@ -5238,7 +5298,7 @@ impl GigaMuxApp {
                     if let Some((name, path)) = pending_dbl {
                         self.select_file(side, name);
                         if let Err(e) = open_path_in_os(&path) {
-                            self.push_session(format!("open failed: {e}"));
+                            self.alert_error("Open", format!("open failed: {e}"));
                         }
                     } else if let Some((name, shift, ctrl)) = pending_click {
                         if shift {
@@ -5911,7 +5971,7 @@ impl GigaMuxApp {
                             self.gpu_warn = warn;
                             self.devices = d;
                         }
-                        Err(e) => self.push_session(format!("GPU probe failed: {e}")),
+                        Err(e) => self.alert_error("GPU", format!("GPU probe failed: {e}")),
                     }
                     self.av1_devices = list_av1_nvenc_devices(&self.devices);
                     self.qsv_available = qsv_vp9_available();
@@ -6054,9 +6114,8 @@ impl GigaMuxApp {
                             self.prefs.flamenco_manager_url
                         ));
                     }
-                    Err(e) => self.push_session(format!("Flamenco discover: {e}")),
+                    Err(e) => self.alert_error("Flamenco", format!("Flamenco discover: {e}")),
                 }
-                self.log_open = true;
             }
         });
         ui.horizontal(|ui| {
@@ -6110,9 +6169,8 @@ impl GigaMuxApp {
                                 dest.display()
                             ));
                         }
-                        Err(e) => self.push_session(format!("Flamenco deploy: {e}")),
+                        Err(e) => self.alert_error("Flamenco", format!("Flamenco deploy: {e}")),
                     }
-                    self.log_open = true;
                 }
             }
             let can_tags = !self.prefs.flamenco_manager_url.trim().is_empty();
@@ -6140,9 +6198,8 @@ impl GigaMuxApp {
                             created.join(", ")
                         ));
                     }
-                    Err(e) => self.push_session(format!("Flamenco tags: {e}")),
+                    Err(e) => self.alert_error("Flamenco", format!("Flamenco tags: {e}")),
                 }
-                self.log_open = true;
             }
         });
         ui.horizontal(|ui| {
@@ -6205,6 +6262,36 @@ impl GigaMuxApp {
                 let _ = prefs::save(&self.prefs);
             }
         });
+    }
+
+    /// Important-error modal (OK / Esc). Does not expand the log panel.
+    fn ui_alert_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.pending_alert.clone() else {
+            return;
+        };
+        let mut dismiss = false;
+        egui::Window::new(&prompt.title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(&prompt.message);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                    if ui.button("Open log").clicked() {
+                        self.log_open = true;
+                        self.log_show_session = true;
+                        dismiss = true;
+                    }
+                });
+            });
+        if dismiss || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.pending_alert = None;
+        }
     }
 
     /// Alt-at-launch: pick which prefs slices / logs to purge.
@@ -7495,6 +7582,7 @@ impl eframe::App for GigaMuxApp {
         self.handle_folder_dnd(&ctx);
 
         self.ui_settings(&ctx);
+        self.ui_alert_prompt(&ctx);
         self.ui_purge_prefs_prompt(&ctx);
         self.ui_check_prompt(&ctx);
         self.ui_flamenco_submit_prompt(&ctx);
