@@ -161,7 +161,11 @@ pub fn vmaf_event_line(ev: &VmafEvent) -> Option<String> {
         } => Some(format!(
             "=== pair {index}/{total}: {name} ({duration_s:.3}s) ==="
         )),
-        VmafEvent::FileDone { name, score } => Some(format!("done: {name} — VMAF {score:.4}")),
+        VmafEvent::FileDone {
+            name,
+            output,
+            score,
+        } => Some(format!("done: {name} → {output} — VMAF {score:.4}")),
         VmafEvent::FileFailed { name, error } => Some(format!("error: {name}: {error}")),
         VmafEvent::Finished { ok, failed } => {
             Some(format!("finished — scored={ok} failed={failed}"))

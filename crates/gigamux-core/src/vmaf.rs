@@ -48,7 +48,12 @@ pub enum VmafEvent {
     },
     /// Live ffmpeg out-time for the current pair (seconds).
     FileProgress { out_time_s: f64 },
-    FileDone { name: String, score: f64 },
+    /// `name` = input basename; `output` = scored encode basename (`testN_*` in test mode).
+    FileDone {
+        name: String,
+        output: String,
+        score: f64,
+    },
     FileFailed { name: String, error: String },
     Finished { ok: usize, failed: usize },
 }
@@ -464,6 +469,7 @@ pub fn run_vmaf(
                 on_event(VmafEvent::Log(format!("VMAF {in_name}: {score:.4}")));
                 on_event(VmafEvent::FileDone {
                     name: in_name.clone(),
+                    output: out_name.clone(),
                     score,
                 });
                 report.results.push(VmafResult {

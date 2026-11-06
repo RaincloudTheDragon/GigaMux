@@ -3531,11 +3531,17 @@ impl GigaMuxApp {
                             p.file_out_time_s = out_time_s.max(p.file_out_time_s);
                         }
                     }
-                    VmafEvent::FileDone { name: _, score: _ } => {
+                    VmafEvent::FileDone {
+                        name,
+                        output,
+                        score,
+                    } => {
                         if let Some(p) = &mut self.encode_progress {
                             p.completed_duration_s += p.file_duration_s;
                             p.file_out_time_s = p.file_duration_s;
                         }
+                        // Persist immediately so cancel keeps finished pairs and the UI updates live.
+                        self.persist_vmaf_score(&name, &output, score);
                     }
                     VmafEvent::FileFailed { name: _, error: _ } => {
                         if let Some(p) = &mut self.encode_progress {
@@ -3552,6 +3558,7 @@ impl GigaMuxApp {
                 AppEvent::VmafDone(result) => {
                     finished = true;
                     match result {
+                        // Scores were already stored on each FileDone; this is a safety net + log panel.
                         Ok(report) => self.apply_vmaf_report(report),
                         Err(e) => self.push_session(format!("VMAF failed: {e}")),
                     }
@@ -3573,31 +3580,58 @@ impl GigaMuxApp {
         }
     }
 
-    /// Persist VMAF scores into preview meta (session lines already streamed via [`VmafEvent`]).
+    /// Write one VMAF score into preview cache (+ disk) as soon as a pair finishes.
+    fn persist_vmaf_score(&mut self, input: &str, output: &str, score: f64) {
+        let out_key = Self::preview_key(FileSide::Output, output);
+        let already = self
+            .preview_cache
+            .get(&out_key)
+            .and_then(|e| e.vmaf_score)
+            .is_some();
+        {
+            let e = self
+                .preview_cache
+                .entry(out_key)
+                .or_insert_with(PreviewCacheEntry::pending);
+            e.vmaf_score = Some(score);
+            if e.source_path.is_none() {
+                e.source_path = Some(self.prefs.output_dir.join(output));
+            }
+        }
+        // Mirror onto input only for non-test pairs so multi testN_ scores do not clobber each other.
+        if strip_test_prefix(output).0.is_none() {
+            let in_key = Self::preview_key(FileSide::Input, input);
+            let e = self
+                .preview_cache
+                .entry(in_key)
+                .or_insert_with(PreviewCacheEntry::pending);
+            e.vmaf_score = Some(score);
+            if e.source_path.is_none() {
+                e.source_path = Some(self.prefs.input_dir.join(input));
+            }
+        }
+        if !already {
+            self.push_file_log(input, &format!("VMAF {input} → {output}: {score:.4}"));
+        }
+        self.save_preview_cache_to_disk();
+    }
+
+    /// End-of-batch safety net: any scored pairs not yet cached (should be rare after live FileDone).
     fn apply_vmaf_report(&mut self, report: VmafReport) {
         self.log_open = true;
         self.log_show_session = true;
-        let mut ok = 0usize;
         for r in &report.results {
             if let Some(s) = r.score {
-                ok += 1;
-                let line = format!("VMAF {} → {}: {s:.4}", r.input, r.output);
-                self.push_file_log(&r.input, &line);
-                // Always store on the output. Mirror onto input only for non-test pairs so multi testN_ scores do not clobber each other on the input row.
                 let out_key = Self::preview_key(FileSide::Output, &r.output);
-                if let Some(e) = self.preview_cache.get_mut(&out_key) {
-                    e.vmaf_score = Some(s);
-                }
-                if strip_test_prefix(&r.output).0.is_none() {
-                    let in_key = Self::preview_key(FileSide::Input, &r.input);
-                    if let Some(e) = self.preview_cache.get_mut(&in_key) {
-                        e.vmaf_score = Some(s);
-                    }
+                let missing = self
+                    .preview_cache
+                    .get(&out_key)
+                    .and_then(|e| e.vmaf_score)
+                    .is_none();
+                if missing {
+                    self.persist_vmaf_score(&r.input, &r.output, s);
                 }
             }
-        }
-        if ok > 0 {
-            self.save_preview_cache_to_disk();
         }
     }
 
