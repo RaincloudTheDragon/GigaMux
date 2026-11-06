@@ -5008,6 +5008,17 @@ impl GigaMuxApp {
                                 }
                                 ui.close();
                             }
+                            if ui
+                                .button("Reveal in file browser")
+                                .on_hover_text("Select this file in Explorer / Finder / file manager")
+                                .clicked()
+                            {
+                                self.select_file(side, name.clone());
+                                if let Err(e) = reveal_path_in_os(path) {
+                                    self.push_session(format!("reveal failed: {e}"));
+                                }
+                                ui.close();
+                            }
                             let rename_label = if self.is_selected(side, &name)
                                 && self.selected.len() > 1
                             {
@@ -7232,6 +7243,80 @@ fn open_path_in_os(path: &Path) -> Result<(), String> {
     {
         let _ = path;
         Err("open not supported on this OS".into())
+    }
+}
+
+/// Reveal a file/folder in the OS file browser (select in Explorer / Finder; open parent on Linux).
+fn reveal_path_in_os(path: &Path) -> Result<(), String> {
+    let path = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(target_os = "windows")]
+    {
+        return reveal_path_in_os_windows(&path);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .args(["-R", &path.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("open -R: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = if path.is_dir() {
+            path.clone()
+        } else {
+            path.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.clone())
+        };
+        Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    {
+        let _ = path;
+        Err("reveal not supported on this OS".into())
+    }
+}
+
+/// Windows: Shell `SHOpenFolderAndSelectItems` (explorer `/select,` mishandles spaces and `\\?\`).
+#[cfg(target_os = "windows")]
+fn reveal_path_in_os_windows(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+
+    // canonicalize() often yields `\\?\C:\…` / `\\?\UNC\…`, which ILCreateFromPathW rejects.
+    let s = path.to_string_lossy();
+    let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    };
+    let wide: Vec<u16> = std::ffi::OsStr::new(&s)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    unsafe {
+        // Ignore already-initialized / mode mismatch; egui may have COM up already.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let item = ILCreateFromPathW(PCWSTR(wide.as_ptr()));
+        if item.is_null() {
+            return Err(format!("reveal: could not resolve {s}"));
+        }
+        let hr = SHOpenFolderAndSelectItems(item, None, 0);
+        ILFree(Some(item));
+        hr.map_err(|e| format!("reveal: {e}"))
     }
 }
 
