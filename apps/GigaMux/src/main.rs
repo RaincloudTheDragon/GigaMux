@@ -328,6 +328,8 @@ struct GigaMuxApp {
     pending_recycle_delete: Option<RecycleDeletePrompt>,
     /// Recycle Bin failed — confirm permanent delete (or proceed if warnings disabled).
     pending_permanent_delete: Option<PermanentDeletePrompt>,
+    /// Flamenco sender options (Submit posts jobs; Cancel dismisses).
+    pending_flamenco: Option<FlamencoSubmitPrompt>,
     /// Alt held at launch — choose which prefs / logs to purge.
     pending_purge: Option<PurgePrompt>,
     /// One-by-one delete cascade (list shrinks between each file).
@@ -569,6 +571,17 @@ struct PermanentDeletePrompt {
     trash_error: String,
 }
 
+/// Flamenco sender dialog (opened by Flamenco button / context menu before POST).
+#[derive(Clone)]
+struct FlamencoSubmitPrompt {
+    /// Input basenames to submit (frozen when the dialog opens).
+    names: Vec<String>,
+    /// Draft worker tag (seeded from prefs; written back on Submit).
+    worker_tag: String,
+    /// Draft ffmpeg exe on workers (seeded from prefs; written back on Submit).
+    ffmpeg_exe: String,
+}
+
 /// Alt-at-launch purge chooser (which prefs slices + optional logs).
 #[derive(Clone)]
 struct PurgePrompt {
@@ -669,6 +682,7 @@ impl GigaMuxApp {
             last_system_idle_ms: u64::MAX,
             pending_recycle_delete: None,
             pending_permanent_delete: None,
+            pending_flamenco: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
             delete_queue: None,
             undo_history: UndoHistory::new(),
@@ -1872,9 +1886,43 @@ impl GigaMuxApp {
         }
     }
 
-    /// Submit selected inputs to Flamenco (one job each; stock worker `exec` via `GigaMux.js`).
-    /// `only_name`: force a single file; otherwise every selected Input basename (list order).
-    fn submit_flamenco_encode(&mut self, only_name: Option<String>) {
+    /// Open the Flamenco sender dialog for the current Input selection (or `only_name`).
+    fn open_flamenco_submit(&mut self, only_name: Option<String>) {
+        let url = self.prefs.flamenco_manager_url.trim();
+        if url.is_empty() {
+            self.push_session("set Flamenco Manager URL in Settings → Files");
+            self.log_open = true;
+            self.show_settings = true;
+            self.settings_tab = SettingsTab::Files;
+            self.settings_raise = true;
+            return;
+        }
+        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+            self.push_session("set both input and output folders before Flamenco submit");
+            self.log_open = true;
+            return;
+        }
+        let names: Vec<String> = if let Some(n) = only_name {
+            vec![n]
+        } else if self.active.as_ref().is_some_and(|(s, _)| *s == FileSide::Input) {
+            self.selected_names_ordered()
+        } else {
+            Vec::new()
+        };
+        if names.is_empty() {
+            self.push_session("select input file(s) (or use context menu) for Flamenco submit");
+            self.log_open = true;
+            return;
+        }
+        self.pending_flamenco = Some(FlamencoSubmitPrompt {
+            names,
+            worker_tag: self.prefs.flamenco_worker_tag.clone(),
+            ffmpeg_exe: self.prefs.flamenco_ffmpeg_exe.clone(),
+        });
+    }
+
+    /// Submit the given inputs to Flamenco (one job each; stock worker `exec` via `GigaMux.js`).
+    fn submit_flamenco_encode(&mut self, names: Vec<String>) {
         let url = self.prefs.flamenco_manager_url.trim().to_string();
         if url.is_empty() {
             self.push_session("set Flamenco Manager URL in Settings → Files");
@@ -1891,13 +1939,6 @@ impl GigaMuxApp {
         }
         self.commit_maxrate_override_edit(TestBatch::One);
         self.commit_cq_override_edit(TestBatch::One);
-        let names: Vec<String> = if let Some(n) = only_name {
-            vec![n]
-        } else if self.active.as_ref().is_some_and(|(s, _)| *s == FileSide::Input) {
-            self.selected_names_ordered()
-        } else {
-            Vec::new()
-        };
         if names.is_empty() {
             self.push_session("select input file(s) (or use context menu) for Flamenco submit");
             self.log_open = true;
@@ -3162,6 +3203,8 @@ impl GigaMuxApp {
                 }
             } else if self.pending_recycle_delete.is_some() {
                 self.pending_recycle_delete = None;
+            } else if self.pending_flamenco.is_some() {
+                self.pending_flamenco = None;
             } else if self.delete_queue.is_some() {
                 self.finish_delete_queue();
                 self.push_session("delete cancelled");
@@ -4766,7 +4809,7 @@ impl GigaMuxApp {
                                     if !self.is_selected(FileSide::Input, &name) {
                                         self.select_file(FileSide::Input, name.clone());
                                     }
-                                    self.submit_flamenco_encode(None);
+                                    self.open_flamenco_submit(None);
                                     ui.close();
                                 }
                             }
@@ -5044,13 +5087,13 @@ impl GigaMuxApp {
                             egui::Button::new("Flamenco").min_size(egui::vec2(120.0, 28.0)),
                         )
                         .on_hover_text(
-                            "Send every selected input to Flamenco (one job each via GigaMux.js). Use Settings → Files to Find Manager, Deploy JS, Ensure tags.",
+                            "Open Flamenco sender for every selected input. Use Settings → Files to Find Manager, Deploy JS, Ensure tags.",
                         )
                         .on_disabled_hover_text(
                             "Set Flamenco Manager URL (or Find) in Settings → Files",
                         );
                     if farm.clicked() {
-                        self.submit_flamenco_encode(None);
+                        self.open_flamenco_submit(None);
                     }
                 }
                 ui.add_space(6.0);
@@ -6080,6 +6123,84 @@ impl GigaMuxApp {
             });
     }
 
+    /// Flamenco sender scaffold: review files + tag/exe, then Submit posts jobs.
+    fn ui_flamenco_submit_prompt(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.pending_flamenco.clone() else {
+            return;
+        };
+        let n = prompt.names.len();
+        let manager = self.prefs.flamenco_manager_url.trim().to_string();
+        egui::Window::new("Send to Flamenco")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([420.0, 320.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Manager").strong());
+                ui.label(egui::RichText::new(&manager).weak().small());
+                ui.add_space(8.0);
+
+                ui.label(egui::RichText::new(format!(
+                    "Jobs ({n} file{})",
+                    if n == 1 { "" } else { "s" }
+                )).strong());
+                for name in prompt.names.iter().take(8) {
+                    ui.label(egui::RichText::new(name).strong());
+                }
+                if n > 8 {
+                    ui.label(egui::RichText::new(format!("…and {} more", n - 8)).weak());
+                }
+                ui.add_space(8.0);
+
+                ui.label("Worker tag (optional)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut prompt.worker_tag)
+                        .desired_width(280.0)
+                        .hint_text("nvenc / qsv / …"),
+                );
+                ui.label("ffmpeg on worker (optional)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut prompt.ffmpeg_exe)
+                        .desired_width(280.0)
+                        .hint_text("ffmpeg or absolute path"),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("More sender options will land here (priority, chunking, …).")
+                        .weak()
+                        .small(),
+                );
+
+                if let Some(p) = self.pending_flamenco.as_mut() {
+                    p.worker_tag = prompt.worker_tag.clone();
+                    p.ffmpeg_exe = prompt.ffmpeg_exe.clone();
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.pending_flamenco = None;
+                    }
+                    let submit_label = if n == 1 {
+                        "Submit 1 job".into()
+                    } else {
+                        format!("Submit {n} jobs")
+                    };
+                    if ui
+                        .add(egui::Button::new(submit_label).min_size(egui::vec2(120.0, 28.0)))
+                        .clicked()
+                    {
+                        self.prefs.flamenco_worker_tag = prompt.worker_tag.trim().to_string();
+                        self.prefs.flamenco_ffmpeg_exe = prompt.ffmpeg_exe.trim().to_string();
+                        let _ = prefs::save(&self.prefs);
+                        let names = prompt.names;
+                        self.pending_flamenco = None;
+                        self.submit_flamenco_encode(names);
+                    }
+                });
+            });
+    }
+
     fn ui_recycle_delete_prompt(&mut self, ctx: &egui::Context) {
         let Some(mut prompt) = self.pending_recycle_delete.clone() else {
             return;
@@ -6991,6 +7112,7 @@ impl eframe::App for GigaMuxApp {
         self.ui_settings(&ctx);
         self.ui_purge_prefs_prompt(&ctx);
         self.ui_check_prompt(&ctx);
+        self.ui_flamenco_submit_prompt(&ctx);
         self.ui_recycle_delete_prompt(&ctx);
         self.ui_permanent_delete_prompt(&ctx);
     }
