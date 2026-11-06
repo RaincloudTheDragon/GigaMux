@@ -27,9 +27,10 @@ use gigamux_core::encode::{
 };
 use gigamux_core::flamenco::{
     cancel_exec_mode_for_manager_version, deploy_gigamux_js, discover_manager, ensure_worker_tags,
-    infer_twoway_local_prefix, make_gigamux_chunked_job, make_gigamux_encode_job, ping_manager,
-    scripts_dir_from_manager_install, submit_job, CancelExecMode,
-    FlamencoTwoway, REQUIRED_WORKER_TAGS,
+    flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
+    make_gigamux_chunked_job, make_gigamux_encode_job, ping_manager,
+    scripts_dir_from_manager_install, submit_job, CancelExecMode, FlamencoTwoway,
+    REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::active_ffmpeg_pid;
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
@@ -599,11 +600,21 @@ struct FlamencoSubmitPrompt {
     estimate_name: String,
 }
 
+/// What to do after the user confirms an alert with OK (not Esc / Open log).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum AlertAfterOk {
+    #[default]
+    None,
+    /// Open Settings → Files (e.g. Flamenco URL / Deploy GigaMux.js).
+    OpenSettingsFiles,
+}
+
 /// Modal for important errors (does not expand the log panel).
 #[derive(Clone)]
 struct AlertPrompt {
     title: String,
     message: String,
+    after_ok: AlertAfterOk,
 }
 
 /// Alt-at-launch purge chooser (which prefs slices + optional logs).
@@ -1814,10 +1825,24 @@ impl GigaMuxApp {
 
     /// Important error: session log + modal. Never auto-expands the log panel.
     fn alert_error(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        self.alert_error_with(title, message, AlertAfterOk::None);
+    }
+
+    /// Like [`Self::alert_error`], but run `after_ok` only if the user clicks OK (not Esc / Open log).
+    fn alert_error_with(
+        &mut self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        after_ok: AlertAfterOk,
+    ) {
         let title = title.into();
         let message = message.into();
         self.push_session(message.clone());
-        self.pending_alert = Some(AlertPrompt { title, message });
+        self.pending_alert = Some(AlertPrompt {
+            title,
+            message,
+            after_ok,
+        });
     }
 
     /// Modal only when the session line was already written another way.
@@ -1825,6 +1850,7 @@ impl GigaMuxApp {
         self.pending_alert = Some(AlertPrompt {
             title: title.into(),
             message: message.into(),
+            after_ok: AlertAfterOk::None,
         });
     }
 
@@ -1999,13 +2025,11 @@ impl GigaMuxApp {
     fn open_flamenco_submit(&mut self, only_name: Option<String>) {
         let url = self.prefs.flamenco_manager_url.trim();
         if url.is_empty() {
-            self.alert_error(
+            self.alert_error_with(
                 "Flamenco",
                 "set Flamenco Manager URL in Settings → Files",
+                AlertAfterOk::OpenSettingsFiles,
             );
-            self.show_settings = true;
-            self.settings_tab = SettingsTab::Files;
-            self.settings_raise = true;
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
@@ -2075,13 +2099,11 @@ impl GigaMuxApp {
     fn submit_flamenco_encode(&mut self, names: Vec<String>) {
         let url = self.prefs.flamenco_manager_url.trim().to_string();
         if url.is_empty() {
-            self.alert_error(
+            self.alert_error_with(
                 "Flamenco",
                 "set Flamenco Manager URL in Settings → Files",
+                AlertAfterOk::OpenSettingsFiles,
             );
-            self.show_settings = true;
-            self.settings_tab = SettingsTab::Files;
-            self.settings_raise = true;
             return;
         }
         if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
@@ -2097,6 +2119,18 @@ impl GigaMuxApp {
             self.alert_error(
                 "Flamenco",
                 "select input file(s) (or use context menu) for Flamenco submit",
+            );
+            return;
+        }
+        // Local Deploy path remembered: catch missing GigaMux.js before Manager returns "job type unknown".
+        let scripts_dir = self.prefs.flamenco_scripts_dir.trim();
+        if !scripts_dir.is_empty() && !local_gigamux_js_present(scripts_dir) {
+            self.alert_error_with(
+                "Flamenco",
+                format!(
+                    "GigaMux.js is missing from:\n{scripts_dir}\n\nSettings → Files → Deploy GigaMux.js… then retry."
+                ),
+                AlertAfterOk::OpenSettingsFiles,
             );
             return;
         }
@@ -2169,6 +2203,8 @@ impl GigaMuxApp {
         let mut ok = 0usize;
         let mut skipped = 0usize;
         let mut failed = 0usize;
+        // Pop once for missing/old GigaMux.js; further submits would hit the same Manager error.
+        let mut script_alerted = false;
         for name in &names {
             let input = self.prefs.input_dir.join(name);
             if !input.is_file() {
@@ -2244,6 +2280,17 @@ impl GigaMuxApp {
                     Err(e) => {
                         self.push_session(format!("Flamenco submit failed ({name}): {e}"));
                         failed += 1;
+                        if !script_alerted {
+                            if let Some(hint) = flamenco_script_hint(&e) {
+                                self.alert_error_with(
+                                    "Flamenco",
+                                    hint,
+                                    AlertAfterOk::OpenSettingsFiles,
+                                );
+                                script_alerted = true;
+                                break;
+                            }
+                        }
                     }
                 }
                 continue;
@@ -2299,10 +2346,21 @@ impl GigaMuxApp {
                 Err(e) => {
                     self.push_session(format!("Flamenco submit failed ({name}): {e}"));
                     failed += 1;
+                    if !script_alerted {
+                        if let Some(hint) = flamenco_script_hint(&e) {
+                            self.alert_error_with(
+                                "Flamenco",
+                                hint,
+                                AlertAfterOk::OpenSettingsFiles,
+                            );
+                            script_alerted = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
-        if failed > 0 {
+        if failed > 0 && !script_alerted {
             self.alert_error(
                 "Flamenco",
                 format!(
@@ -6337,6 +6395,7 @@ impl GigaMuxApp {
         let Some(prompt) = self.pending_alert.clone() else {
             return;
         };
+        let mut confirmed_ok = false;
         let mut dismiss = false;
         egui::Window::new(&prompt.title)
             .collapsible(false)
@@ -6348,6 +6407,7 @@ impl GigaMuxApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("OK").clicked() {
+                        confirmed_ok = true;
                         dismiss = true;
                     }
                     if ui.button("Open log").clicked() {
@@ -6357,8 +6417,23 @@ impl GigaMuxApp {
                     }
                 });
             });
+        // Esc (here or global handler): dismiss only — do not run after_ok.
         if dismiss || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.pending_alert = None;
+            let after_ok = self
+                .pending_alert
+                .take()
+                .map(|a| a.after_ok)
+                .unwrap_or(AlertAfterOk::None);
+            if confirmed_ok {
+                match after_ok {
+                    AlertAfterOk::None => {}
+                    AlertAfterOk::OpenSettingsFiles => {
+                        self.show_settings = true;
+                        self.settings_tab = SettingsTab::Files;
+                        self.settings_raise = true;
+                    }
+                }
+            }
         }
     }
 

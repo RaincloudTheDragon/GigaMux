@@ -285,11 +285,9 @@ pub fn submit_job(manager_url: &str, job: &SubmittedJob) -> Result<String, Strin
     if !(200..300).contains(&status) {
         // Truncate huge bodies but keep compileJob errors readable.
         let snippet: String = text.chars().take(500).collect();
-        let hint = if snippet.contains("ffmpeg_argv_json is required") {
-            " (Manager still has old GigaMux.js — Settings → Files → Deploy GigaMux.js…)"
-        } else {
-            ""
-        };
+        let hint = flamenco_script_hint(&snippet)
+            .map(|h| format!(" — {h}"))
+            .unwrap_or_default();
         return Err(format!("Flamenco HTTP {status}: {snippet}{hint}"));
     }
     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -443,6 +441,33 @@ pub fn deploy_gigamux_js(scripts_dir: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// True when `scripts_dir/GigaMux.js` exists (local path from last Deploy).
+pub fn local_gigamux_js_present(scripts_dir: &str) -> bool {
+    let t = scripts_dir.trim();
+    if t.is_empty() {
+        return false;
+    }
+    Path::new(t).join("GigaMux.js").is_file()
+}
+
+/// User-facing hint when Manager rejects a GigaMux job due to missing/old script.
+pub fn flamenco_script_hint(err_or_body: &str) -> Option<&'static str> {
+    let lower = err_or_body.to_ascii_lowercase();
+    if lower.contains("job type unknown") {
+        Some(
+            "GigaMux.js is missing from the Manager scripts/ folder (or Manager has not loaded it). Settings → Files → Deploy GigaMux.js… then retry",
+        )
+    } else if lower.contains("ffmpeg_argv_json is required")
+        || (lower.contains("encode_argvs_json") && lower.contains("required"))
+    {
+        Some(
+            "Manager has an old/incompatible GigaMux.js. Settings → Files → Deploy GigaMux.js… then retry",
+        )
+    } else {
+        None
+    }
+}
+
 /// List existing worker tags on the Manager (`GET /api/v3/worker-mgt/tags`).
 pub fn fetch_worker_tags(manager_url: &str) -> Result<Vec<(String, String)>, String> {
     let base = manager_base(manager_url)?;
@@ -510,6 +535,13 @@ pub fn ensure_worker_tags(manager_url: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_hint_maps_manager_errors() {
+        assert!(flamenco_script_hint(r#"{"code":400,"message":"job type unknown"}"#).is_some());
+        assert!(flamenco_script_hint("ffmpeg_argv_json is required").is_some());
+        assert!(flamenco_script_hint("connection refused").is_none());
+    }
 
     #[test]
     fn infer_drive_root_prefix() {
