@@ -53,6 +53,12 @@ Assign workers to those tags in Flamenco after probing. Submit with **Worker tag
 
 When GigaMux ships a newer bundled `GigaMux.js`, redeploy it to the Manager via **Settings → Files → Deploy GigaMux.js…**. The Manager keeps its own copy until you do this, and GigaMux will not be able to submit jobs.
 
+### Two-way / mixed OS paths
+
+Flamenco only auto-rewrites a setting when the **entire** string starts with the shared prefix (Blender `blendfile`-style). GigaMux stores paths inside `encode_argvs_json`, so the submitter braces them itself: `Z:\GigaMux\…` → `{shared_storage_path}/GigaMux/…`. Set **Settings → Files → Shared path prefix** to the same local root as the Manager two-way value (e.g. `Z:\` with Linux `/mnt/shared`, Audience All). Variable name defaults to `shared_storage_path`.
+
+Farm `.ffconcat` lists use **basenames** (chunks next to the list) so Linux workers are not stuck with Windows absolute paths inside the file.
+
 ### Sender chunk options
 
 | Control | Default | Behavior |

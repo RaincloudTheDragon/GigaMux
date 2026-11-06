@@ -92,6 +92,8 @@ pub fn list_chunk_paths(output_dir: &Path, stem: &str, count: u32, ext: &str) ->
 }
 
 /// Write an ffconcat list with per-file `duration=` lines (video-led joins).
+///
+/// Paths in the same directory as `list_path` are written as basenames so mixed-OS Flamenco workers can open the list without Windows/Linux absolute prefixes.
 pub fn write_ffconcat(
     chunk_paths: &[PathBuf],
     durations_s: &[f64],
@@ -100,14 +102,25 @@ pub fn write_ffconcat(
     if chunk_paths.len() != durations_s.len() {
         return Err("ffconcat paths/durations length mismatch".into());
     }
+    let list_parent = list_path.parent();
     let mut lines = vec!["ffconcat version 1.0".to_string()];
     for (p, dur) in chunk_paths.iter().zip(durations_s.iter()) {
-        let ap = p
-            .canonicalize()
-            .unwrap_or_else(|_| p.to_path_buf())
-            .to_string_lossy()
-            .replace('\\', "/")
-            .replace('\'', r"'\''");
+        // Prefer basename when the chunk sits next to the list (farm-safe).
+        let same_dir = match (list_parent, p.parent()) {
+            (Some(lp), Some(pp)) => lp == pp,
+            _ => false,
+        };
+        let ap = if same_dir {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned())
+        } else {
+            p.canonicalize()
+                .unwrap_or_else(|_| p.to_path_buf())
+                .to_string_lossy()
+                .replace('\\', "/")
+        }
+        .replace('\'', r"'\''");
         lines.push(format!("file '{ap}'"));
         if *dur > 0.0 {
             lines.push(format!("duration {dur:.6}"));

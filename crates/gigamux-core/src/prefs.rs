@@ -156,6 +156,16 @@ pub struct Prefs {
     /// When chunking: only apply to software / alpha paths; HW opaque stays single-task. Default on.
     #[serde(default = "default_true")]
     pub flamenco_only_chunk_software: bool,
+    /// Local shared-storage root matching Manager two-way Windows/Linux value (e.g. `Z:\` or `/mnt/shared`). Empty = no argv rewrite.
+    #[serde(default)]
+    pub flamenco_twoway_local: String,
+    /// Flamenco two-way variable name (default `shared_storage_path`).
+    #[serde(default = "default_flamenco_twoway_var")]
+    pub flamenco_twoway_var: String,
+}
+
+fn default_flamenco_twoway_var() -> String {
+    "shared_storage_path".into()
 }
 
 fn default_flamenco_chunks() -> u32 {
@@ -189,6 +199,8 @@ impl Default for Prefs {
             flamenco_chunking: false,
             flamenco_chunks: 4,
             flamenco_only_chunk_software: true,
+            flamenco_twoway_local: String::new(),
+            flamenco_twoway_var: "shared_storage_path".into(),
         }
     }
 }

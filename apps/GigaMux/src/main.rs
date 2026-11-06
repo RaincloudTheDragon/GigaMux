@@ -27,7 +27,8 @@ use gigamux_core::encode::{
 };
 use gigamux_core::flamenco::{
     deploy_gigamux_js, discover_manager, ensure_worker_tags, make_gigamux_chunked_job,
-    make_gigamux_encode_job, scripts_dir_from_manager_install, submit_job, REQUIRED_WORKER_TAGS,
+    infer_twoway_local_prefix, make_gigamux_encode_job, scripts_dir_from_manager_install, submit_job,
+    FlamencoTwoway, REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::active_ffmpeg_pid;
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
@@ -1861,6 +1862,8 @@ impl GigaMuxApp {
             self.prefs.flamenco_chunking = d.flamenco_chunking;
             self.prefs.flamenco_chunks = d.flamenco_chunks;
             self.prefs.flamenco_only_chunk_software = d.flamenco_only_chunk_software;
+            self.prefs.flamenco_twoway_local = d.flamenco_twoway_local;
+            self.prefs.flamenco_twoway_var = d.flamenco_twoway_var;
             touched_prefs = true;
             parts.push("misc".into());
         }
@@ -2018,6 +2021,38 @@ impl GigaMuxApp {
         let want_chunk = self.prefs.flamenco_chunking;
         let chunk_n = self.prefs.flamenco_chunks.clamp(2, 32);
         let only_soft = self.prefs.flamenco_only_chunk_software;
+        // Flamenco only HasPrefix-rewrites whole setting strings; brace paths inside argv JSON ourselves.
+        let mut twoway_local = self.prefs.flamenco_twoway_local.trim().to_string();
+        if twoway_local.is_empty() {
+            // Match Manager drive-root two-way (e.g. `Z:\`) without requiring the Settings field every time.
+            if let Some(inferred) = infer_twoway_local_prefix(&self.prefs.input_dir) {
+                self.push_session(format!(
+                    "Flamenco: using inferred shared path prefix {inferred} (set Settings → Files to override)"
+                ));
+                twoway_local = inferred;
+            }
+        }
+        let twoway_var = {
+            let t = self.prefs.flamenco_twoway_var.trim();
+            if t.is_empty() {
+                "shared_storage_path".to_string()
+            } else {
+                t.to_string()
+            }
+        };
+        let twoway = if twoway_local.is_empty() {
+            None
+        } else {
+            Some(FlamencoTwoway {
+                local_prefix: twoway_local.as_str(),
+                var_name: twoway_var.as_str(),
+            })
+        };
+        if twoway.is_none() {
+            self.push_session(
+                "Flamenco: shared path prefix empty — Linux workers will see Windows paths; set Settings → Files → Shared path prefix",
+            );
+        }
         let mut ok = 0usize;
         let mut skipped = 0usize;
         let mut failed = 0usize;
@@ -2073,6 +2108,7 @@ impl GigaMuxApp {
                     &job_built.concat_argv,
                     &job_built.mux_argv,
                     tag,
+                    twoway,
                 ) {
                     Ok(j) => j,
                     Err(e) => {
@@ -2126,6 +2162,7 @@ impl GigaMuxApp {
                 exe,
                 &cmd.argv,
                 tag,
+                twoway,
             ) {
                 Ok(j) => j,
                 Err(e) => {
@@ -6064,6 +6101,34 @@ impl GigaMuxApp {
                 .on_hover_text(
                     "Absolute path on workers, or leave empty for `ffmpeg` (PATH / Manager tools/).",
                 )
+                .changed()
+            {
+                let _ = prefs::save(&self.prefs);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Shared path prefix");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.prefs.flamenco_twoway_local)
+                        .desired_width(180.0)
+                        .hint_text(r"Z:\  or  /mnt/shared"),
+                )
+                .on_hover_text(
+                    "Must match the Manager two-way Windows/Linux value for shared storage (e.g. Z:\\ ↔ /mnt/shared). GigaMux braces argv paths to {var} because Flamenco cannot rewrite inside encode_argvs_json.",
+                )
+                .changed()
+            {
+                let _ = prefs::save(&self.prefs);
+            }
+            ui.label("var");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.prefs.flamenco_twoway_var)
+                        .desired_width(160.0)
+                        .hint_text("shared_storage_path"),
+                )
+                .on_hover_text("Flamenco two-way variable name (default shared_storage_path).")
                 .changed()
             {
                 let _ = prefs::save(&self.prefs);

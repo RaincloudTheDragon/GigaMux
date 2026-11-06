@@ -28,8 +28,9 @@ pub use encode::{
 pub use ffmpeg_active::{active_ffmpeg_pid, ActiveFfmpegGuard};
 pub use flamenco::{
     deploy_gigamux_js, discover_manager, ensure_worker_tags, fetch_worker_tags,
-    make_gigamux_chunked_job, make_gigamux_encode_job, ping_manager,
-    scripts_dir_from_manager_install, submit_job, SubmittedJob, GIGAMUX_JS, REQUIRED_WORKER_TAGS,
+    infer_twoway_local_prefix, make_gigamux_chunked_job, make_gigamux_encode_job, ping_manager,
+    rewrite_flamenco_twoway_path, scripts_dir_from_manager_install, submit_job, FlamencoTwoway,
+    SubmittedJob, GIGAMUX_JS, REQUIRED_WORKER_TAGS,
 };
 pub use job_log::{
     encode_event_line, encode_logs_dir, job_logs_dir, vmaf_event_line, EncodeJobLog, JobLog,

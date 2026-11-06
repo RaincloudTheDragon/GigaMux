@@ -52,23 +52,87 @@ fn flamenco_exe_and_tag(
     (exe, tag)
 }
 
+/// Optional two-way path rewrite for argv (Flamenco only HasPrefix-replaces whole setting strings).
+#[derive(Debug, Clone, Copy)]
+pub struct FlamencoTwoway<'a> {
+    /// Local shared root matching Manager's Windows/Linux two-way value (e.g. `Z:\` or `/mnt/shared`).
+    pub local_prefix: &'a str,
+    /// Variable name on the Manager (usually `shared_storage_path`).
+    pub var_name: &'a str,
+}
+
+/// Infer a Windows drive-root prefix (`Z:\`) from a path when prefs left the shared prefix empty.
+pub fn infer_twoway_local_prefix(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy();
+    let b = s.as_bytes();
+    // `X:\` or `X:/…`
+    if b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        let drive = (b[0] as char).to_ascii_uppercase();
+        if drive.is_ascii_alphabetic() {
+            return Some(format!("{drive}:\\"));
+        }
+    }
+    None
+}
+
+/// Rewrite an absolute path under `local_prefix` to `{var_name}/rest` (forward slashes).
+/// Flamenco Manager only auto-rewrites settings whose *entire* value is a path prefix; GigaMux argv JSON must brace paths itself so workers get OS-native roots on expand.
+pub fn rewrite_flamenco_twoway_path(arg: &str, tw: FlamencoTwoway<'_>) -> String {
+    let prefix = tw.local_prefix.trim();
+    let var = tw.var_name.trim();
+    if prefix.is_empty() || var.is_empty() || arg.is_empty() {
+        return arg.to_string();
+    }
+    let norm_arg = arg.replace('\\', "/");
+    let norm_prefix = prefix.replace('\\', "/");
+    let norm_prefix = norm_prefix.trim_end_matches('/');
+    if norm_prefix.is_empty() {
+        return arg.to_string();
+    }
+    let (arg_cmp, pref_cmp) = if cfg!(windows) {
+        (norm_arg.to_ascii_lowercase(), norm_prefix.to_ascii_lowercase())
+    } else {
+        (norm_arg.clone(), norm_prefix.to_string())
+    };
+    if !arg_cmp.starts_with(&pref_cmp) {
+        return arg.to_string();
+    }
+    let rest = &norm_arg[norm_prefix.len()..];
+    // Require a path boundary so `W:` does not match `Weird\file`.
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return arg.to_string();
+    }
+    format!("{{{var}}}{rest}")
+}
+
+fn rewrite_argv_twoway(argv: &[String], tw: Option<FlamencoTwoway<'_>>) -> Vec<String> {
+    let Some(tw) = tw else {
+        return argv.to_vec();
+    };
+    argv.iter()
+        .map(|a| rewrite_flamenco_twoway_path(a, tw))
+        .collect()
+}
+
 /// One-file encode job for Flamenco (`GigaMux.js` → worker `exec` ffmpeg).
 pub fn make_gigamux_encode_job(
     name: impl Into<String>,
     ffmpeg_exe: Option<&str>,
     ffmpeg_argv: &[String],
     worker_tag: Option<&str>,
+    twoway: Option<FlamencoTwoway<'_>>,
 ) -> Result<SubmittedJob, String> {
     if ffmpeg_argv.is_empty() {
         return Err("ffmpeg argv is empty".into());
     }
     // argv[0] is the logical program name; worker uses settings.ffmpeg_exe (or "ffmpeg").
     let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
+    let argv = rewrite_argv_twoway(ffmpeg_argv, twoway);
     let argv_json =
-        serde_json::to_string(&ffmpeg_argv).map_err(|e| format!("serialize ffmpeg argv: {e}"))?;
+        serde_json::to_string(&argv).map_err(|e| format!("serialize ffmpeg argv: {e}"))?;
     // Also set encode_argvs_json (length 1) so newer GigaMux.js prefers the array form.
-    let encode_argvs_json = serde_json::to_string(&vec![ffmpeg_argv])
-        .map_err(|e| format!("serialize encode_argvs: {e}"))?;
+    let encode_argvs_json =
+        serde_json::to_string(&vec![&argv]).map_err(|e| format!("serialize encode_argvs: {e}"))?;
     let settings = json!({
         "ffmpeg_exe": exe,
         "ffmpeg_argv_json": argv_json,
@@ -94,6 +158,7 @@ pub fn make_gigamux_chunked_job(
     concat_argv: &[String],
     mux_argv: &[String],
     worker_tag: Option<&str>,
+    twoway: Option<FlamencoTwoway<'_>>,
 ) -> Result<SubmittedJob, String> {
     if encode_argvs.is_empty() {
         return Err("encode_argvs is empty".into());
@@ -102,12 +167,18 @@ pub fn make_gigamux_chunked_job(
         return Err("chunked job requires concat_argv and mux_argv".into());
     }
     let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
-    let encode_argvs_json = serde_json::to_string(encode_argvs)
+    let encode_rewritten: Vec<Vec<String>> = encode_argvs
+        .iter()
+        .map(|a| rewrite_argv_twoway(a, twoway))
+        .collect();
+    let concat_rewritten = rewrite_argv_twoway(concat_argv, twoway);
+    let mux_rewritten = rewrite_argv_twoway(mux_argv, twoway);
+    let encode_argvs_json = serde_json::to_string(&encode_rewritten)
         .map_err(|e| format!("serialize encode_argvs: {e}"))?;
-    let concat_argv_json =
-        serde_json::to_string(concat_argv).map_err(|e| format!("serialize concat_argv: {e}"))?;
-    let mux_argv_json =
-        serde_json::to_string(mux_argv).map_err(|e| format!("serialize mux_argv: {e}"))?;
+    let concat_argv_json = serde_json::to_string(&concat_rewritten)
+        .map_err(|e| format!("serialize concat_argv: {e}"))?;
+    let mux_argv_json = serde_json::to_string(&mux_rewritten)
+        .map_err(|e| format!("serialize mux_argv: {e}"))?;
     let settings = json!({
         "ffmpeg_exe": exe,
         "encode_argvs_json": encode_argvs_json,
@@ -385,4 +456,64 @@ pub fn ensure_worker_tags(manager_url: &str) -> Result<Vec<String>, String> {
         created.push(name.to_string());
     }
     Ok(created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_drive_root_prefix() {
+        assert_eq!(
+            infer_twoway_local_prefix(Path::new(r"Z:\GigaMux\input")),
+            Some(r"Z:\".into())
+        );
+        assert_eq!(infer_twoway_local_prefix(Path::new("/mnt/shared/media")), None);
+    }
+
+    #[test]
+    fn twoway_rewrites_windows_prefix() {
+        let tw = FlamencoTwoway {
+            local_prefix: r"Z:\",
+            var_name: "shared_storage_path",
+        };
+        assert_eq!(
+            rewrite_flamenco_twoway_path(r"Z:\GigaMux\input\a.mp4", tw),
+            "{shared_storage_path}/GigaMux/input/a.mp4"
+        );
+        assert_eq!(
+            rewrite_flamenco_twoway_path(r"Z:/GigaMux/x.mp4", tw),
+            "{shared_storage_path}/GigaMux/x.mp4"
+        );
+        // Non-matching path unchanged.
+        assert_eq!(
+            rewrite_flamenco_twoway_path(r"D:\other\a.mp4", tw),
+            r"D:\other\a.mp4"
+        );
+    }
+
+    #[test]
+    fn twoway_encode_job_braces_paths_inside_json() {
+        let argv = vec![
+            "ffmpeg".into(),
+            "-i".into(),
+            r"Z:\GigaMux\in.mp4".into(),
+            r"Z:\GigaMux\out.mp4".into(),
+        ];
+        let job = make_gigamux_encode_job(
+            "t",
+            None,
+            &argv,
+            None,
+            Some(FlamencoTwoway {
+                local_prefix: r"Z:\",
+                var_name: "shared_storage_path",
+            }),
+        )
+        .unwrap();
+        let enc = job.settings["encode_argvs_json"].as_str().unwrap();
+        assert!(enc.contains("{shared_storage_path}/GigaMux/in.mp4"));
+        assert!(enc.contains("{shared_storage_path}/GigaMux/out.mp4"));
+        assert!(!enc.contains(r"Z:\\GigaMux"));
+    }
 }
