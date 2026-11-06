@@ -292,6 +292,10 @@ struct GigaMuxApp {
     gpu_warn: Option<String>,
     input_files: Vec<PathBuf>,
     output_files: Vec<PathBuf>,
+    /// Sum of listed Input file sizes (updated in `refresh_lists`).
+    input_listed_bytes: u64,
+    /// Sum of listed Output file sizes (updated in `refresh_lists`).
+    output_listed_bytes: u64,
     /// Primary selection (preview / log focus): side + basename.
     active: Option<(FileSide, String)>,
     /// Multi-select set on the same side as `active` (always includes the primary name).
@@ -674,6 +678,8 @@ impl GigaMuxApp {
             gpu_warn: warn,
             input_files: Vec::new(),
             output_files: Vec::new(),
+            input_listed_bytes: 0,
+            output_listed_bytes: 0,
             active: None,
             selected: HashSet::new(),
             selection_anchor: None,
@@ -1701,6 +1707,8 @@ impl GigaMuxApp {
         } else {
             Vec::new()
         };
+        self.input_listed_bytes = Self::sum_file_bytes(&self.input_files);
+        self.output_listed_bytes = Self::sum_file_bytes(&self.output_files);
         // Prune multi-select / primary if files vanished from disk.
         if let Some((side, name)) = self.active.clone() {
             let alive: HashSet<String> = self.names_for(side).into_iter().collect();
@@ -1733,6 +1741,20 @@ impl GigaMuxApp {
         if self.scrub_stale_vmaf() {
             self.save_preview_cache_to_disk();
         }
+    }
+
+    fn sum_file_bytes(files: &[PathBuf]) -> u64 {
+        files
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Pane footer: listed count + total size (e.g. `15 items · 129.83 GB`).
+    fn folder_size_footer(count: usize, bytes: u64) -> String {
+        let noun = if count == 1 { "item" } else { "items" };
+        format!("{count} {noun} · {}", format_bytes(bytes))
     }
 
     /// Once a minute while idle: re-list folders and top up preview cache (e.g. farm delivers).
@@ -7397,8 +7419,16 @@ impl eframe::App for GigaMuxApp {
                 let in_size = egui::vec2(in_w, total.y);
                 let in_resp = ui.allocate_ui_with_layout(
                     in_size,
-                    egui::Layout::top_down(egui::Align::Min),
+                    egui::Layout::bottom_up(egui::Align::Min),
                     |ui| {
+                        // Size footer stays under the Input list (full side width).
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(Self::folder_size_footer(
+                                self.input_files.len(),
+                                self.input_listed_bytes,
+                            )).small())
+                            .truncate(),
+                        );
                         let files = self.input_files.clone();
                         let dir = self.prefs.input_dir.clone();
                         self.ui_folder_pane(ui, "Input", &dir, true, &files);
@@ -7417,8 +7447,15 @@ impl eframe::App for GigaMuxApp {
                 let out_size = egui::vec2(out_w, total.y);
                 let out_resp = ui.allocate_ui_with_layout(
                     out_size,
-                    egui::Layout::top_down(egui::Align::Min),
+                    egui::Layout::bottom_up(egui::Align::Min),
                     |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(Self::folder_size_footer(
+                                self.output_files.len(),
+                                self.output_listed_bytes,
+                            )).small())
+                            .truncate(),
+                        );
                         let files = self.output_files.clone();
                         let dir = self.prefs.output_dir.clone();
                         self.ui_folder_pane(ui, "Output", &dir, false, &files);
