@@ -1860,7 +1860,8 @@ impl GigaMuxApp {
         }
     }
 
-    /// Submit one input to Flamenco (stock worker `exec` ffmpeg via `GigaMux.js`).
+    /// Submit selected inputs to Flamenco (one job each; stock worker `exec` via `GigaMux.js`).
+    /// `only_name`: force a single file; otherwise every selected Input basename (list order).
     fn submit_flamenco_encode(&mut self, only_name: Option<String>) {
         let url = self.prefs.flamenco_manager_url.trim().to_string();
         if url.is_empty() {
@@ -1878,79 +1879,107 @@ impl GigaMuxApp {
         }
         self.commit_maxrate_override_edit(TestBatch::One);
         self.commit_cq_override_edit(TestBatch::One);
-        let name = only_name.or_else(|| {
-            self.active
-                .as_ref()
-                .filter(|(s, _)| *s == FileSide::Input)
-                .map(|(_, n)| n.clone())
-        });
-        let Some(name) = name else {
-            self.push_session("select an input file (or use context menu) for Flamenco submit");
-            self.log_open = true;
-            return;
+        let names: Vec<String> = if let Some(n) = only_name {
+            vec![n]
+        } else if self.active.as_ref().is_some_and(|(s, _)| *s == FileSide::Input) {
+            self.selected_names_ordered()
+        } else {
+            Vec::new()
         };
-        let input = self.prefs.input_dir.join(&name);
-        if !input.is_file() {
-            self.push_session(format!("Flamenco: input not found: {name}"));
+        if names.is_empty() {
+            self.push_session("select input file(s) (or use context menu) for Flamenco submit");
             self.log_open = true;
             return;
         }
-        // Effective HW for this machine (same as local encode mute).
+        // Effective HW for this machine (same as local encode mute); shared across the batch.
         let mut slot = self.prefs.slot1.clone();
         slot.use_hardware = self.effective_use_hardware_for(&slot);
-        let farm = FarmEncodeRequest {
-            input,
-            output_dir: self.prefs.output_dir.clone(),
-            gpu: self.prefs.gpu,
-            preserve_obs_metadata: self.prefs.preserve_obs_metadata,
-            use_peak_bitrate: self.prefs.use_peak_bitrate,
-            slot,
-            // Farm v0: one full deliver (not testN_ multi-slot).
-            test_batch: None,
-        };
-        let cmd = match build_farm_ffmpeg_argv(&farm) {
-            Ok(c) => c,
-            Err(e) => {
-                self.push_session(format!("Flamenco argv: {e}"));
-                self.log_open = true;
-                return;
+        let exe_owned = {
+            let t = self.prefs.flamenco_ffmpeg_exe.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
             }
         };
-        let exe = self.prefs.flamenco_ffmpeg_exe.trim();
-        let exe = if exe.is_empty() { None } else { Some(exe) };
-        let tag = self.prefs.flamenco_worker_tag.trim();
-        let tag = if tag.is_empty() { None } else { Some(tag) };
-        let job = match make_gigamux_encode_job(
-            format!("GigaMux {name}"),
-            exe,
-            &cmd.argv,
-            tag,
-        ) {
-            Ok(j) => j,
-            Err(e) => {
-                self.push_session(format!("Flamenco job: {e}"));
-                self.log_open = true;
-                return;
+        let tag_owned = {
+            let t = self.prefs.flamenco_worker_tag.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
             }
         };
-        let out_name = cmd
-            .output
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| cmd.output.display().to_string());
-        match submit_job(&url, &job) {
-            Ok(id) => {
-                self.push_session(format!(
-                    "Flamenco submitted: job {id}; {name} → {out_name} ({}k / {})",
-                    cmd.bitrate_k, cmd.bitrate_label
-                ));
-                self.log_open = true;
-                let _ = prefs::save(&self.prefs);
+        let exe = exe_owned.as_deref();
+        let tag = tag_owned.as_deref();
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        for name in &names {
+            let input = self.prefs.input_dir.join(name);
+            if !input.is_file() {
+                self.push_session(format!("Flamenco: input not found: {name}"));
+                failed += 1;
+                continue;
             }
-            Err(e) => {
-                self.push_session(format!("Flamenco submit failed: {e}"));
-                self.log_open = true;
+            let farm = FarmEncodeRequest {
+                input,
+                output_dir: self.prefs.output_dir.clone(),
+                gpu: self.prefs.gpu,
+                preserve_obs_metadata: self.prefs.preserve_obs_metadata,
+                use_peak_bitrate: self.prefs.use_peak_bitrate,
+                slot: slot.clone(),
+                // Farm v0: one full deliver (not testN_ multi-slot).
+                test_batch: None,
+            };
+            let cmd = match build_farm_ffmpeg_argv(&farm) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.push_session(format!("Flamenco argv: {e}"));
+                    failed += 1;
+                    continue;
+                }
+            };
+            let job = match make_gigamux_encode_job(
+                format!("GigaMux {name}"),
+                exe,
+                &cmd.argv,
+                tag,
+            ) {
+                Ok(j) => j,
+                Err(e) => {
+                    self.push_session(format!("Flamenco job: {e}"));
+                    failed += 1;
+                    continue;
+                }
+            };
+            let out_name = cmd
+                .output
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cmd.output.display().to_string());
+            match submit_job(&url, &job) {
+                Ok(id) => {
+                    self.push_session(format!(
+                        "Flamenco submitted: job {id}; {name} → {out_name} ({}k / {})",
+                        cmd.bitrate_k, cmd.bitrate_label
+                    ));
+                    ok += 1;
+                }
+                Err(e) => {
+                    self.push_session(format!("Flamenco submit failed ({name}): {e}"));
+                    failed += 1;
+                }
             }
+        }
+        self.log_open = true;
+        if names.len() > 1 {
+            self.push_session(format!(
+                "Flamenco batch: submitted={ok} failed={failed} (of {})",
+                names.len()
+            ));
+        }
+        if ok > 0 {
+            let _ = prefs::save(&self.prefs);
         }
     }
 
@@ -4684,21 +4713,31 @@ impl GigaMuxApp {
                             }
                             if is_input {
                                 let farm_ok = !self.prefs.flamenco_manager_url.trim().is_empty();
+                                let farm_sel_n = if self.is_selected(FileSide::Input, &name) {
+                                    self.selected.len().max(1)
+                                } else {
+                                    1
+                                };
+                                let farm_label = if farm_sel_n > 1 {
+                                    format!("Send {farm_sel_n} to Flamenco")
+                                } else {
+                                    "Send to Flamenco".into()
+                                };
                                 if ui
-                                    .add_enabled(
-                                        farm_ok,
-                                        egui::Button::new("Send to Flamenco"),
-                                    )
+                                    .add_enabled(farm_ok, egui::Button::new(farm_label))
                                     .on_hover_text(
-                                        "Submit this file to Flamenco Manager (GigaMux.js → worker ffmpeg)",
+                                        "Submit selected input(s) to Flamenco Manager (one job each via GigaMux.js)",
                                     )
                                     .on_disabled_hover_text(
                                         "Set Flamenco Manager URL in Settings → Files",
                                     )
                                     .clicked()
                                 {
-                                    self.select_file(FileSide::Input, name.clone());
-                                    self.submit_flamenco_encode(Some(name.clone()));
+                                    // Keep multi-select: only collapse when the row was not already selected.
+                                    if !self.is_selected(FileSide::Input, &name) {
+                                        self.select_file(FileSide::Input, name.clone());
+                                    }
+                                    self.submit_flamenco_encode(None);
                                     ui.close();
                                 }
                             }
@@ -4976,7 +5015,7 @@ impl GigaMuxApp {
                             egui::Button::new("Flamenco").min_size(egui::vec2(120.0, 28.0)),
                         )
                         .on_hover_text(
-                            "Send the selected input to Flamenco (worker ffmpeg via GigaMux.js). Use Settings → Files to Find Manager, Deploy JS, Ensure tags.",
+                            "Send every selected input to Flamenco (one job each via GigaMux.js). Use Settings → Files to Find Manager, Deploy JS, Ensure tags.",
                         )
                         .on_disabled_hover_text(
                             "Set Flamenco Manager URL (or Find) in Settings → Files",
