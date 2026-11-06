@@ -42,6 +42,13 @@ const JOB_TYPE = {
             default: "",
             description: "Legacy single argv JSON (used when encode_argvs_json is empty)",
         },
+        {
+            key: "cancel_exec",
+            type: "string",
+            required: false,
+            default: "direct",
+            description: "direct = ffmpeg exec (Worker kill PR / 3.10-beta); legacy_stub = ≤3.9 placeholder until cancel helper exists",
+        },
     ],
 };
 
@@ -61,9 +68,29 @@ function execArgsFromArgv(argv) {
     return argv.slice(1);
 }
 
+function cancelExecMode(settings) {
+    const raw = settings.cancel_exec;
+    if (typeof raw === "string" && raw.trim() === "legacy_stub") {
+        return "legacy_stub";
+    }
+    return "direct";
+}
+
+function addFfmpegExec(task, exe, argv) {
+    // Direct ffmpeg exe (no shell): Flamenco CommandContext / Worker kill PR can stop it on Cancel (~10s poll).
+    // legacy_stub uses the same path until a cancel helper ships (submitter warns on ≤3.9).
+    task.addCommand(
+        author.Command("exec", {
+            exe: exe,
+            args: execArgsFromArgv(argv),
+        })
+    );
+}
+
 function compileJob(job) {
     const settings = job.settings;
     const exe = settings.ffmpeg_exe || "ffmpeg";
+    const cancelMode = cancelExecMode(settings);
 
     let encodeArgvs = null;
     const encRaw = settings.encode_argvs_json;
@@ -92,8 +119,13 @@ function compileJob(job) {
         " encodes=",
         encodeArgvs.length,
         " chunked=",
-        chunked
+        chunked,
+        " cancel_exec=",
+        cancelMode
     );
+    if (cancelMode === "legacy_stub") {
+        print("GigaMux: cancel_exec=legacy_stub — Windows cancel helper not shipped; using direct ffmpeg exec");
+    }
 
     const encodeTasks = [];
     for (let i = 0; i < encodeArgvs.length; i++) {
@@ -103,30 +135,15 @@ function compileJob(job) {
         }
         const name = encodeArgvs.length === 1 ? "encode" : "encode-c" + i;
         const task = author.Task(name, "misc");
-        task.addCommand(
-            author.Command("exec", {
-                exe: exe,
-                args: execArgsFromArgv(argv),
-            })
-        );
+        addFfmpegExec(task, exe, argv);
         job.addTask(task);
         encodeTasks.push(task);
     }
 
     if (chunked) {
         const concatTask = author.Task("concat", "misc");
-        concatTask.addCommand(
-            author.Command("exec", {
-                exe: exe,
-                args: execArgsFromArgv(concatArgv),
-            })
-        );
-        concatTask.addCommand(
-            author.Command("exec", {
-                exe: exe,
-                args: execArgsFromArgv(muxArgv),
-            })
-        );
+        addFfmpegExec(concatTask, exe, concatArgv);
+        addFfmpegExec(concatTask, exe, muxArgv);
         for (const t of encodeTasks) {
             concatTask.addDependency(t);
         }

@@ -26,8 +26,9 @@ use gigamux_core::encode::{
     EncodeOptions, FarmEncodeRequest,
 };
 use gigamux_core::flamenco::{
-    deploy_gigamux_js, discover_manager, ensure_worker_tags, make_gigamux_chunked_job,
-    infer_twoway_local_prefix, make_gigamux_encode_job, scripts_dir_from_manager_install, submit_job,
+    cancel_exec_mode_for_manager_version, deploy_gigamux_js, discover_manager, ensure_worker_tags,
+    infer_twoway_local_prefix, make_gigamux_chunked_job, make_gigamux_encode_job, ping_manager,
+    scripts_dir_from_manager_install, submit_job, CancelExecMode,
     FlamencoTwoway, REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::active_ffmpeg_pid;
@@ -2053,6 +2054,14 @@ impl GigaMuxApp {
                 "Flamenco: shared path prefix empty — Linux workers will see Windows paths; set Settings → Files → Shared path prefix",
             );
         }
+        // ≤3.9: stub cancel helper (warn). 3.10-beta+: direct ffmpeg exec (Worker kill PR).
+        let manager_ver = ping_manager(&url).unwrap_or_else(|_| "unknown".into());
+        let cancel_exec = cancel_exec_mode_for_manager_version(&manager_ver);
+        if cancel_exec == CancelExecMode::LegacyStub {
+            self.push_session(format!(
+                "Flamenco: Manager {manager_ver} ≤3.9 — Windows Cancel may leave ffmpeg running until a cancel helper ships; prefer 3.10-beta Workers with the kill PR"
+            ));
+        }
         let mut ok = 0usize;
         let mut skipped = 0usize;
         let mut failed = 0usize;
@@ -2109,6 +2118,7 @@ impl GigaMuxApp {
                     &job_built.mux_argv,
                     tag,
                     twoway,
+                    cancel_exec,
                 ) {
                     Ok(j) => j,
                     Err(e) => {
@@ -2163,6 +2173,7 @@ impl GigaMuxApp {
                 &cmd.argv,
                 tag,
                 twoway,
+                cancel_exec,
             ) {
                 Ok(j) => j,
                 Err(e) => {

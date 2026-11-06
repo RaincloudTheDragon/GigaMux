@@ -52,6 +52,51 @@ fn flamenco_exe_and_tag(
     (exe, tag)
 }
 
+/// How `GigaMux.js` should author `exec` for Cancel (Windows orphan workaround).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelExecMode {
+    /// Direct `ffmpeg` exec — needs Worker kill PR (3.10-beta+ / matched Workers).
+    Direct,
+    /// Manager ≤3.9: helper wrap not shipped yet; same exec + submitter/JS warn.
+    LegacyStub,
+}
+
+impl CancelExecMode {
+    /// Setting value written into the Flamenco job (`cancel_exec`).
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::LegacyStub => "legacy_stub",
+        }
+    }
+}
+
+/// Pick cancel_exec from Manager `/api/v3/version` (or shortversion) text.
+/// `3.10-beta*` and ≥3.10 → Direct; ≤3.9 → LegacyStub; unparseable → LegacyStub (warn path).
+pub fn cancel_exec_mode_for_manager_version(version: &str) -> CancelExecMode {
+    let lower = version.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return CancelExecMode::LegacyStub;
+    }
+    // Explicit beta builds ship (or expect) the Worker process-tree kill PR.
+    if lower.contains("beta") {
+        return CancelExecMode::Direct;
+    }
+    let parts: Vec<u32> = lower
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .take(2)
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    match parts.as_slice() {
+        [maj, min, ..] if *maj > 3 || (*maj == 3 && *min >= 10) => CancelExecMode::Direct,
+        [maj, min, ..] if *maj < 3 || (*maj == 3 && *min <= 9) => CancelExecMode::LegacyStub,
+        [maj] if *maj > 3 => CancelExecMode::Direct,
+        [maj] if *maj <= 3 => CancelExecMode::LegacyStub,
+        _ => CancelExecMode::LegacyStub,
+    }
+}
+
 /// Optional two-way path rewrite for argv (Flamenco only HasPrefix-replaces whole setting strings).
 #[derive(Debug, Clone, Copy)]
 pub struct FlamencoTwoway<'a> {
@@ -121,6 +166,7 @@ pub fn make_gigamux_encode_job(
     ffmpeg_argv: &[String],
     worker_tag: Option<&str>,
     twoway: Option<FlamencoTwoway<'_>>,
+    cancel_exec: CancelExecMode,
 ) -> Result<SubmittedJob, String> {
     if ffmpeg_argv.is_empty() {
         return Err("ffmpeg argv is empty".into());
@@ -139,6 +185,7 @@ pub fn make_gigamux_encode_job(
         "encode_argvs_json": encode_argvs_json,
         "concat_argv_json": "",
         "mux_argv_json": "",
+        "cancel_exec": cancel_exec.as_setting(),
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -159,6 +206,7 @@ pub fn make_gigamux_chunked_job(
     mux_argv: &[String],
     worker_tag: Option<&str>,
     twoway: Option<FlamencoTwoway<'_>>,
+    cancel_exec: CancelExecMode,
 ) -> Result<SubmittedJob, String> {
     if encode_argvs.is_empty() {
         return Err("encode_argvs is empty".into());
@@ -185,6 +233,7 @@ pub fn make_gigamux_chunked_job(
         "concat_argv_json": concat_argv_json,
         "mux_argv_json": mux_argv_json,
         "ffmpeg_argv_json": "",
+        "cancel_exec": cancel_exec.as_setting(),
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -509,11 +558,41 @@ mod tests {
                 local_prefix: r"Z:\",
                 var_name: "shared_storage_path",
             }),
+            CancelExecMode::Direct,
         )
         .unwrap();
         let enc = job.settings["encode_argvs_json"].as_str().unwrap();
         assert!(enc.contains("{shared_storage_path}/GigaMux/in.mp4"));
         assert!(enc.contains("{shared_storage_path}/GigaMux/out.mp4"));
         assert!(!enc.contains(r"Z:\\GigaMux"));
+        assert_eq!(job.settings["cancel_exec"], "direct");
+    }
+
+    #[test]
+    fn cancel_exec_mode_from_manager_version() {
+        assert_eq!(
+            cancel_exec_mode_for_manager_version("3.10-beta2 (aa2f2039)"),
+            CancelExecMode::Direct
+        );
+        assert_eq!(
+            cancel_exec_mode_for_manager_version("3.10-beta2"),
+            CancelExecMode::Direct
+        );
+        assert_eq!(
+            cancel_exec_mode_for_manager_version("3.9.3"),
+            CancelExecMode::LegacyStub
+        );
+        assert_eq!(
+            cancel_exec_mode_for_manager_version("3.9"),
+            CancelExecMode::LegacyStub
+        );
+        assert_eq!(
+            cancel_exec_mode_for_manager_version("3.10.0"),
+            CancelExecMode::Direct
+        );
+        assert_eq!(
+            cancel_exec_mode_for_manager_version(""),
+            CancelExecMode::LegacyStub
+        );
     }
 }

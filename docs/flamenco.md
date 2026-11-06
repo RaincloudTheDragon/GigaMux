@@ -5,7 +5,7 @@ GigaMux submits jobs to a stock Flamenco Manager/Worker. `GigaMux.js` authors `m
 ## Connector (Settings → Files)
 
 | Action | What it does |
-|--------|----------------|
+| --- | --- |
 | **Find** | UPnP/SSDP discovery (`urn:flamenco:manager:0`), same idea as Flamenco workers. Manager needs `autodiscoverable` enabled. |
 | **Deploy GigaMux.js…** | File browser: pick Manager install (folder with `flamenco-manager.yaml`) or `scripts/` directly; writes bundled `GigaMux.js`. |
 | **Ensure tags** | `POST /api/v3/worker-mgt/tags` for missing `nvenc`, `qsv`, `vmaf`. Does not assign workers to tags; do that in Flamenco's worker UI. |
@@ -13,7 +13,7 @@ GigaMux submits jobs to a stock Flamenco Manager/Worker. `GigaMux.js` authors `m
 
 Manual Manager URL still works if SSDP is off or blocked.
 
-## How Flamenco resolves `ffmpeg`
+## How Flamenco resolves ffmpeg
 
 1. Prefer a binary next to the worker executable under `tools/` (`ffmpeg.exe`, `ffmpeg-windows.exe`, ...). See Flamenco `internal/find_ffmpeg`.
 2. Otherwise `$PATH` (`exec.LookPath("ffmpeg")`).
@@ -38,7 +38,7 @@ Flamenco: jobs with a `worker_tag` only run on workers in that tag; tagless jobs
 GigaMux **Ensure tags** creates:
 
 | Name | Intended use |
-|------|----------------|
+| --- | --- |
 | `nvenc` | Opaque HW encode |
 | `qsv` | VP9 QSV opaque |
 | `vmaf` | Farm VMAF (later) |
@@ -47,7 +47,7 @@ Assign workers to those tags in Flamenco after probing. Submit with **Worker tag
 
 ## Job type
 
-- Script: [`flamenco/GigaMux.js`](../flamenco/GigaMux.js) (also embedded in the app for Deploy)
+- Script: [CODE0](../flamenco/GigaMux.js) (also embedded in the app for Deploy)
 - Single encode: one `misc`/`exec` task (`encode_argvs_json` length 1, or legacy `ffmpeg_argv_json`)
 - Chunked encode (sender option): `encode-c0`…`encode-cN` (video-only frame slices) → `concat` task (ffconcat join + mux source audio). Chunk files are named `{stem}.c000of004.{ext}` (Check already ignores these). The submitter writes the `.ffconcat` onto shared storage before POST so workers need no probe.
 
@@ -62,11 +62,17 @@ Farm `.ffconcat` lists use **basenames** (chunks next to the list) so Linux work
 ### Sender chunk options
 
 | Control | Default | Behavior |
-|---------|---------|----------|
+| --- | --- | --- |
 | Chunk encode | off | N equal frame ranges (`2`–`32`), then concat/mux |
 | Only chunk software | on | HW opaque paths stay single-task; software/alpha still chunk |
 
 Skip if the final deliver already exists. Chunk encodes and mux use ffmpeg `-n` (never overwrite).
+
+## Cancel
+
+Workers poll ~10s, then kill the `exec` child. A few seconds of continued encode after Cancel is normal.
+
+Upstream Flamenco currently has a bug where the Windows workers are not killed upon task/job cancel (Linux was usually fine). Windows workers need to be fixed upstream for this. Thus, GigaMux warns when working with Flamenco while the Manager is not in beta. This will be the remaining behavior until it's either fixed upstream, or until I wish to integreate a workaround that doesn't depend on an upstream fix, and/or that will work with Flamenco 3.9 and below.
 
 ## Limitations
 
@@ -75,3 +81,4 @@ Skip if the final deliver already exists. Chunk encodes and mux use ffmpeg `-n` 
 - No seam-scan on the farm (Python-only locally today).
 - Farm VMAF only after workers with `libvmaf` are tagged and confirmed.
 - SSDP Find does not configure Manager; URL is written to prefs when a Manager answers `/api/v3/version`.
+- Whether or not cancellation works depends on Worker build and (for ≤3.9) GigaMux’s legacy circumvention path.
