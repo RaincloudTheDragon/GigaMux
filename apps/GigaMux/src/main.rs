@@ -1083,6 +1083,18 @@ impl GigaMuxApp {
         }
     }
 
+    /// Select every file on `side` (Ctrl+A while hovering over that pane).
+    fn select_all_on_side(&mut self, side: FileSide) {
+        let names = self.names_for(side);
+        let Some(first) = names.first().cloned() else {
+            return;
+        };
+        let set = names.into_iter().collect();
+        self.select_set(side, set, Some(first.clone()));
+        // Keep primary at the top of the list (not the last row).
+        self.set_primary(side, first);
+    }
+
     /// Basename after a multi-delete (first survivor below the block, else above).
     fn next_name_after_delete(side_names: &[String], deleting: &HashSet<String>) -> Option<String> {
         let indices: Vec<usize> = side_names
@@ -3072,6 +3084,7 @@ impl GigaMuxApp {
             f2,
             ctrl,
             shift,
+            ctrl_a,
         ) = ctx.input(|i| {
             let z = i.key_pressed(egui::Key::Z);
             let f5_pressed = i.key_pressed(egui::Key::F5);
@@ -3095,6 +3108,7 @@ impl GigaMuxApp {
                 i.key_pressed(egui::Key::F2),
                 i.modifiers.command,
                 i.modifiers.shift,
+                i.modifiers.command && i.key_pressed(egui::Key::A),
             )
         });
         // Ctrl+J toggles log even while typing in a field.
@@ -3112,6 +3126,14 @@ impl GigaMuxApp {
         }
         if f2 {
             self.begin_rename_active();
+        }
+        // Ctrl+A: select all in the Input/Output pane while hovering over one or the other.
+        if ctrl_a {
+            if let Some(p) = Self::dnd_pointer(ctx).or_else(|| ctx.pointer_latest_pos()) {
+                if let Some(side) = self.pane_at(p) {
+                    self.select_all_on_side(side);
+                }
+            }
         }
         if ctrl_shift_z {
             self.redo_last_delete();
