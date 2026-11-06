@@ -1757,6 +1757,33 @@ impl GigaMuxApp {
         format!("{count} {noun} · {}", format_bytes(bytes))
     }
 
+    /// ↓/% green or ↑/% red — same markers as center Size row / test compare strip.
+    /// `small` matches pane footer text size when true.
+    fn ui_size_delta_labels(ui: &mut egui::Ui, delta: SizeDelta, small: bool) {
+        let green = egui::Color32::from_rgb(80, 180, 100);
+        let red = egui::Color32::from_rgb(220, 90, 80);
+        let label = |ui: &mut egui::Ui, color: egui::Color32, text: String| {
+            let mut rt = egui::RichText::new(text).color(color);
+            if small {
+                rt = rt.small();
+            }
+            ui.label(rt);
+        };
+        match delta {
+            SizeDelta::Smaller { pct, bytes } => {
+                label(ui, green, format!("↓{pct}%"));
+                ui.add_space(2.0);
+                label(ui, green, format!("↓{}", format_bytes(bytes)));
+            }
+            SizeDelta::Larger { pct, bytes } => {
+                label(ui, red, format!("↑{pct}%"));
+                ui.add_space(2.0);
+                label(ui, red, format!("↑{}", format_bytes(bytes)));
+            }
+            SizeDelta::Same => {}
+        }
+    }
+
     /// Once a minute while idle: re-list folders and top up preview cache (e.g. farm delivers).
     fn tick_idle_list_refresh(&mut self, ctx: &egui::Context) {
         if !(self.history_idle() && self.rename_edit.is_none()) {
@@ -4568,7 +4595,7 @@ impl GigaMuxApp {
                 .filter(|&b| b > 0)
         };
 
-        // Same greens/reds as the center Size row.
+        // Same greens/reds as the center Size row (VMAF Δ uses these too).
         let green = egui::Color32::from_rgb(80, 180, 100);
         let red = egui::Color32::from_rgb(220, 90, 80);
         let input_name = self
@@ -4620,19 +4647,10 @@ impl GigaMuxApp {
                             Some(n) => format_bytes(n),
                             None => "-".into(),
                         });
-                        match (in_bytes, b) {
-                            (Some(a), Some(c)) => match size_delta(a, c) {
-                                Some(SizeDelta::Smaller { pct, bytes }) => {
-                                    ui.colored_label(green, format!("↓{pct}%"));
-                                    ui.colored_label(green, format!("↓{}", format_bytes(bytes)));
-                                }
-                                Some(SizeDelta::Larger { pct, bytes }) => {
-                                    ui.colored_label(red, format!("↑{pct}%"));
-                                    ui.colored_label(red, format!("↑{}", format_bytes(bytes)));
-                                }
-                                Some(SizeDelta::Same) | None => {}
-                            },
-                            _ => {}
+                        if let (Some(a), Some(c)) = (in_bytes, b) {
+                            if let Some(d) = size_delta(a, c) {
+                                Self::ui_size_delta_labels(ui, d, false);
+                            }
                         }
                     });
                     // Absolute VMAF is vs the input; ↑/↓ vs Test1 is the slot A/B heuristic.
@@ -5649,20 +5667,8 @@ impl GigaMuxApp {
                 ui.label(egui::RichText::new("Size").weak().small());
                 ui.horizontal(|ui| {
                     ui.monospace(format_bytes(s.file_size_bytes));
-                    match size_vs_input {
-                        Some(SizeDelta::Smaller { pct, bytes }) => {
-                            let green = egui::Color32::from_rgb(80, 180, 100);
-                            ui.colored_label(green, format!("↓{pct}%"));
-                            ui.add_space(2.0);
-                            ui.colored_label(green, format!("↓{}", format_bytes(bytes)));
-                        }
-                        Some(SizeDelta::Larger { pct, bytes }) => {
-                            let red = egui::Color32::from_rgb(220, 90, 80);
-                            ui.colored_label(red, format!("↑{pct}%"));
-                            ui.add_space(2.0);
-                            ui.colored_label(red, format!("↑{}", format_bytes(bytes)));
-                        }
-                        Some(SizeDelta::Same) | None => {}
+                    if let Some(d) = size_vs_input {
+                        Self::ui_size_delta_labels(ui, d, false);
                     }
                 });
                 ui.end_row();
@@ -7449,13 +7455,21 @@ impl eframe::App for GigaMuxApp {
                     out_size,
                     egui::Layout::bottom_up(egui::Align::Min),
                     |ui| {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(Self::folder_size_footer(
-                                self.output_files.len(),
-                                self.output_listed_bytes,
-                            )).small())
-                            .truncate(),
-                        );
+                        // Folder total vs Input: same ↓/% green · ↑/% red as center Size.
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(Self::folder_size_footer(
+                                    self.output_files.len(),
+                                    self.output_listed_bytes,
+                                )).small())
+                                .truncate(),
+                            );
+                            if let Some(d) =
+                                size_delta(self.input_listed_bytes, self.output_listed_bytes)
+                            {
+                                Self::ui_size_delta_labels(ui, d, true);
+                            }
+                        });
                         let files = self.output_files.clone();
                         let dir = self.prefs.output_dir.clone();
                         self.ui_folder_pane(ui, "Output", &dir, false, &files);
