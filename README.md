@@ -49,23 +49,22 @@ Your codec choices in GigaMux:
 
 ### Test mode
 
-Enable **Test mode** on the Output path row (next to Change…). Each selected input encodes twice, sequentially, into the same folder:
+Enable **Test mode** on the Output path row (next to Change…). Choose **2–4 Target Slots** (default 2). Each selected input encodes once per slot, sequentially, into the same folder:
 
-- `test1_{stem}.{ext}` — Test1 targets
-- `test2_{stem}.{ext}` — Test2 targets
+- `test1_{stem}.{ext}` … `test4_{stem}.{ext}` for the active slot count
 
-The Output column splits top/bottom with independent codec, container, hardware, and Maxrate per slot. A mid strip shows Size Δ and VMAF when both files exist. Use this to A/B Maxrate caps (e.g. HEVC Target vs AV1 + ~18000 kbps) before a full batch; see [Comparing NVENC AV1 and HEVC](docs/codec-efficiency.md).
+The Output column shows a compare strip (size Δ vs the original input; VMAF score vs input with ↑/↓ vs Test1) and a scrollable list of collapsing panels per slot, each with independent codec, container, hardware, and Maxrate. Use this to A/B Maxrate caps (e.g. HEVC on Test1 vs AV1 + ~18000 kbps on Test2) before a full batch; see [Comparing NVENC AV1 and HEVC](docs/codec-efficiency.md).
 
 Navigation while Test mode is on (Output list):
 
-- `←` / `→` — jump by stem, prefer Test1
-- `Shift+←` / `Shift+→` — same, prefer Test2
-- `Shift+↑` / `Shift+↓` — swap to the sibling test file
+- `←` / `→` - jump by stem, prefer Test1
+- `Shift+←` / `Shift+→` - cycle prefer among active slots, then pair-jump
+- `Shift+↑` / `Shift+↓` - cycle sibling test files for the same stem
 
 ### Check & VMAF
 
 - **Check** probes each selected pair and opens a severity tree (High / Medium / Low). Medium findings stay listed with the checkbox off by default.
-- **VMAF** scores input → output via `libvmaf`. In Test mode it scores both `test1_*` and `test2_*` against the source so you can compare slots.
+- **VMAF** scores input → output via `libvmaf`. In Test mode it scores each active `testN_*` against the source so you can compare slots.
 
 ### Shortcuts
 
@@ -75,8 +74,8 @@ Navigation while Test mode is on (Output list):
 | `F5` | Reload / re-index folders |
 | `Ctrl+F5` | Wipe preview cache, then re-index (can be heavy; wipes expensive VMAF results) |
 | `←` / `→` | Jump to paired file (Input ↔ Output; Test mode prefers Test1) |
-| `Shift+←` / `Shift+→` | Test mode: pair jump preferring Test2 |
-| `Shift+↑` / `Shift+↓` | Test mode Output: sibling test1 ↔ test2 |
+| `Shift+←` / `Shift+→` | Test mode: cycle prefer among active slots, then pair-jump |
+| `Shift+↑` / `Shift+↓` | Test mode Output: cycle sibling among active `testN_*` |
 | `Ctrl+Z` | Undo delete / rename |
 | `Ctrl+J` | Expand/toggle log |
 

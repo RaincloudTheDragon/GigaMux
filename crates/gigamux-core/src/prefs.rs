@@ -16,6 +16,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_test_slot_count() -> u8 {
+    2
+}
+
 /// One encode target slot (codec/container + HW/maxrate/CQ).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncodeSlot {
@@ -95,15 +99,24 @@ pub struct Prefs {
     /// When true, encode ceiling uses 1s video peak; default is average rate (CBR-oriented).
     #[serde(default)]
     pub use_peak_bitrate: bool,
-    /// Dual full-frame A/B encodes (`test1_*` / `test2_*`).
+    /// Multi full-frame A/B encodes (`test1_*`…`testN_*`, N = `test_slot_count`).
     #[serde(default)]
     pub test_mode: bool,
+    /// How many test slots are active when `test_mode` is on (clamped 2..=4). Default 2.
+    #[serde(default = "default_test_slot_count")]
+    pub test_slot_count: u8,
     /// Primary encode slot — flattened so older prefs.json keeps working.
     #[serde(flatten)]
     pub slot1: EncodeSlot,
     /// Secondary encode slot (used when `test_mode` is on).
     #[serde(default = "EncodeSlot::default_slot2")]
     pub slot2: EncodeSlot,
+    /// Third encode slot (test mode, count >= 3).
+    #[serde(default)]
+    pub slot3: EncodeSlot,
+    /// Fourth encode slot (test mode, count >= 4).
+    #[serde(default)]
+    pub slot4: EncodeSlot,
     /// Confirm before moving a file to the Recycle Bin. Default on.
     #[serde(default = "default_true")]
     pub warn_recycle_delete: bool,
@@ -142,8 +155,11 @@ impl Default for Prefs {
             preserve_obs_metadata: false,
             use_peak_bitrate: false,
             test_mode: false,
+            test_slot_count: 2,
             slot1: EncodeSlot::default(),
             slot2: EncodeSlot::default_slot2(),
+            slot3: EncodeSlot::default(),
+            slot4: EncodeSlot::default(),
             warn_recycle_delete: true,
             warn_permanent_delete: true,
             job_done_chime: true,
@@ -158,17 +174,31 @@ impl Default for Prefs {
 }
 
 impl Prefs {
-    /// Clamp illegal codec×container pairs (load / import / toggle).
+    /// Clamp illegal codec×container pairs (load / import / toggle) and test slot count.
     pub fn sanitize_targets(&mut self) {
+        self.test_slot_count = self.test_slot_count.clamp(2, 4);
         self.slot1.sanitize();
         self.slot2.sanitize();
+        self.slot3.sanitize();
+        self.slot4.sanitize();
     }
 
-    /// Mutable slot by test batch (Test1 = slot1, Test2 = slot2).
+    /// Active test batches when test mode is on (`TestBatch::ALL[..count]`); empty otherwise.
+    pub fn active_batches(&self) -> &'static [TestBatch] {
+        if !self.test_mode {
+            return &[];
+        }
+        let n = self.test_slot_count.clamp(2, 4) as usize;
+        &TestBatch::ALL[..n]
+    }
+
+    /// Mutable slot by test batch.
     pub fn slot_mut(&mut self, batch: TestBatch) -> &mut EncodeSlot {
         match batch {
             TestBatch::One => &mut self.slot1,
             TestBatch::Two => &mut self.slot2,
+            TestBatch::Three => &mut self.slot3,
+            TestBatch::Four => &mut self.slot4,
         }
     }
 
@@ -176,7 +206,20 @@ impl Prefs {
         match batch {
             TestBatch::One => &self.slot1,
             TestBatch::Two => &self.slot2,
+            TestBatch::Three => &self.slot3,
+            TestBatch::Four => &self.slot4,
         }
+    }
+
+    /// Check/VMAF slot list: single deliver when test mode off; else one entry per active batch.
+    pub fn check_vmaf_slots(&self) -> Vec<(Option<TestBatch>, OutputTargets)> {
+        if !self.test_mode {
+            return vec![(None, self.slot1.output_targets())];
+        }
+        self.active_batches()
+            .iter()
+            .map(|&b| (Some(b), self.slot(b).output_targets()))
+            .collect()
     }
 
     /// Container for a given alpha flag (primary slot).

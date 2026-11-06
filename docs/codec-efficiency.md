@@ -28,7 +28,7 @@ This is auto-CQ behavior under a shared ceiling, not an effect of the source cod
 - Diagnostics: Xiph `crowd_run` / `FourPeople` (pre-capped ~40 mbps HEVC), plus synthetic hard noise and easy soft; HEVC vs AV1 both at the GigaMux Target.
 - Scores: libvmaf pooled mean, host `n_threads`, `n_subsample=4`. Awkward AV1 levels used `av1_cuvid` for decode while scoring. GigaMux’s in-app VMAF runs full-frame `libvmaf` (no `n_subsample`); absolute scores may differ slightly from the tables below—use rankings and deltas for A/B.
 
-Guidance for these clips and GPU only; smoke-test your own footage. In the app, enable **Test mode** (Output path row): put HEVC (or your baseline) on Test1 and AV1 + a Maxrate override on Test2, encode, then read Size Δ / VMAF on the mid strip. CQ stays prefs-only; Maxrate is the product lever.
+Guidance for these clips and GPU only; smoke-test your own footage. In the app, enable **Test mode** (Output path row; 2–4 Target Slots): put HEVC (or your baseline) on Test1 and AV1 + a Maxrate override on Test2 (add more slots if needed), encode, then read the compare strip: size Δ vs the original input, VMAF ↑/↓ vs Test1. CQ stays prefs-only; Maxrate is the product lever.
 
 HEVC GigaMux Target (auto) baseline (Replay): VMAF 97.26, 349.5 MB, ~20 mbps avg.
 

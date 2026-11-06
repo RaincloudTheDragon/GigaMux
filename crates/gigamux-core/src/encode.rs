@@ -63,14 +63,31 @@ pub struct EncodeOptions {
     pub preserve_obs_metadata: bool,
     /// Ceiling from 1s video peak when true; otherwise average rate.
     pub use_peak_bitrate: bool,
-    /// Dual full-frame A/B: write `test1_*` then `test2_*` with `slot1` / `slot2`.
+    /// Multi full-frame A/B: write `test1_*`…`testN_*` with `slot1`… matching `test_slot_count`.
     pub test_mode: bool,
+    /// Active test slot count when `test_mode` (clamped 2..=4). Ignored when test mode off.
+    pub test_slot_count: u8,
     /// Primary encode settings (also used when `test_mode` is off).
     pub slot1: EncodeSlot,
     /// Secondary encode settings (test mode only).
     pub slot2: EncodeSlot,
+    /// Third encode settings (test mode, count >= 3).
+    pub slot3: EncodeSlot,
+    /// Fourth encode settings (test mode, count >= 4).
+    pub slot4: EncodeSlot,
     /// When set, only encode these basenames (right-click selection). `None` = all inputs.
     pub only_names: Option<Vec<String>>,
+}
+
+impl EncodeOptions {
+    fn slot_for(&self, batch: TestBatch) -> &EncodeSlot {
+        match batch {
+            TestBatch::One => &self.slot1,
+            TestBatch::Two => &self.slot2,
+            TestBatch::Three => &self.slot3,
+            TestBatch::Four => &self.slot4,
+        }
+    }
 }
 
 /// One-file encode request for Flamenco (stock worker `exec` ffmpeg).
@@ -948,16 +965,17 @@ pub fn run_batch(
         output: PathBuf,
         duration_s: f64,
         slot: EncodeSlot,
-        /// Display label when test mode (`Test1` / `Test2`); empty otherwise.
+        /// Display label when test mode (`Test1`…`TestN`); empty otherwise.
         pass_label: String,
     }
 
-    // One or two passes per input depending on test_mode.
+    // One pass, or N test passes per input depending on test_mode + test_slot_count.
     let passes: Vec<(Option<TestBatch>, EncodeSlot)> = if opts.test_mode {
-        vec![
-            (Some(TestBatch::One), opts.slot1.clone()),
-            (Some(TestBatch::Two), opts.slot2.clone()),
-        ]
+        let n = opts.test_slot_count.clamp(2, 4) as usize;
+        TestBatch::ALL[..n]
+            .iter()
+            .map(|&b| (Some(b), opts.slot_for(b).clone()))
+            .collect()
     } else {
         vec![(None, opts.slot1.clone())]
     };

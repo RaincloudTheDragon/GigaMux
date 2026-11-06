@@ -281,8 +281,7 @@ pub fn run_vmaf_pair(
 fn resolve_pairs(
     input_dir: &Path,
     output_dir: &Path,
-    targets: OutputTargets,
-    test_slot2: Option<OutputTargets>,
+    slots: &[(Option<TestBatch>, OutputTargets)],
     only_basename: Option<&str>,
     only_outputs: Option<&HashSet<String>>,
 ) -> Result<Vec<(String, String, PathBuf, PathBuf, f64)>, String> {
@@ -292,14 +291,6 @@ fn resolve_pairs(
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
-
-    let slots: Vec<(Option<TestBatch>, OutputTargets)> = match test_slot2 {
-        Some(slot2) => vec![
-            (Some(TestBatch::One), targets),
-            (Some(TestBatch::Two), slot2),
-        ],
-        None => vec![(None, targets)],
-    };
 
     let mut pairs = Vec::new();
     for inp in &inputs {
@@ -328,7 +319,7 @@ fn resolve_pairs(
         let has_alpha = video_has_alpha(&info);
         let duration_s = format_duration_s(&info);
         let mut any_for_input = false;
-        for &(batch, slot) in &slots {
+        for &(batch, slot) in slots {
             let out_name = slot.expected_name_for(&in_name, has_alpha, batch);
             if !output_set.contains(&out_name) {
                 continue;
@@ -375,12 +366,11 @@ fn resolve_pairs(
 
 /// Score one pair (`only_basename`), an output-name allowlist, or every matched pair.
 /// Also writes a gzipped per-job log under `%APPDATA%\GigaMux\config\logs\`.
-/// When `test_slot2` is set, scores input→test1 and input→test2 for each input.
+/// `slots` is non-test `(None, …)` or one entry per active test batch.
 pub fn run_vmaf(
     input_dir: &Path,
     output_dir: &Path,
-    targets: OutputTargets,
-    test_slot2: Option<OutputTargets>,
+    slots: &[(Option<TestBatch>, OutputTargets)],
     only_basename: Option<String>,
     only_outputs: Option<HashSet<String>>,
     cancel: &AtomicBool,
@@ -419,8 +409,7 @@ pub fn run_vmaf(
     let pairs = match resolve_pairs(
         input_dir,
         output_dir,
-        targets,
-        test_slot2,
+        slots,
         only_basename.as_deref(),
         only_outputs.as_ref(),
     ) {

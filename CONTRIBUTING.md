@@ -39,7 +39,7 @@ Before asking for review, locally:
 - Prefer `Result` and logged / surfaced errors for ffmpeg, filesystem paths, and other external or user input. Do not add panics on hostile input.
 - Existing `unwrap` / `expect` on internal UI invariants is fine to leave; do not spread that pattern to fallible I/O or parse paths.
 - Do not commit media fixtures, secrets, credentials, or large binaries.
-- Call out in the PR if you change skip-if-exists, Test mode `test1_` / `test2_` naming, or Check/VMAF pairing behavior.
+- Call out in the PR if you change skip-if-exists, Test mode `test1_`…`test4_` naming / slot count, or Check/VMAF pairing behavior.
 
 ## Pull requests
 

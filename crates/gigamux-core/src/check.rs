@@ -352,16 +352,18 @@ fn check_pair_inner(
     None
 }
 
-/// Check all input/output pairs under the two folders against `targets`.
-/// When `test_slot2` is `Some`, expects `test1_*` / `test2_*` for both slots.
+/// Check all input/output pairs under the two folders against `slots`.
+/// Non-test: one `(None, targets)` entry. Test mode: `(Some(TestN), targets)` per active batch.
 pub fn run_check(
     input_dir: &Path,
     output_dir: &Path,
-    targets: OutputTargets,
-    test_slot2: Option<OutputTargets>,
+    slots: &[(Option<TestBatch>, OutputTargets)],
 ) -> Result<CheckReport, String> {
     if !input_dir.is_dir() || !output_dir.is_dir() {
         return Err("input and output directories must both exist".into());
+    }
+    if slots.is_empty() {
+        return Err("check slots must not be empty".into());
     }
 
     let input_files = list_named(input_dir, INPUT_EXTS)?;
@@ -392,20 +394,13 @@ pub fn run_check(
 
     // (input, output, input_info, targets for this pair)
     let mut pairs: Vec<(String, String, Value, OutputTargets)> = Vec::new();
-    let slots: Vec<(Option<TestBatch>, OutputTargets)> = match test_slot2 {
-        Some(slot2) => vec![
-            (Some(TestBatch::One), targets),
-            (Some(TestBatch::Two), slot2),
-        ],
-        None => vec![(None, targets)],
-    };
 
     for inf in &input_files {
         let Some(info) = input_meta.get(inf) else {
             continue;
         };
         let has_alpha = video_has_alpha(info);
-        for &(batch, slot) in &slots {
+        for &(batch, slot) in slots {
             let outp = slot.expected_name_for(inf, has_alpha, batch);
             let sibling = slot.expected_name_for(inf, !has_alpha, batch);
             if output_set.contains(&outp) {
@@ -437,7 +432,7 @@ pub fn run_check(
     }
 
     for outf in &output_files {
-        // Strip test1_/test2_ so dual-mode outputs still pair to input stems.
+        // Strip testN_ so multi-slot outputs still pair to input stems.
         let stem = pair_stem(outf);
         if !input_stems.contains(&stem) && !is_chunk_filename(outf) {
             report.issues.push(CheckIssue {

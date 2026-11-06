@@ -20,8 +20,11 @@ fn main() {
         preserve_obs_metadata: false,
         use_peak_bitrate: false,
         test_mode: false,
+        test_slot_count: 2,
         slot1: EncodeSlot::default(),
         slot2: EncodeSlot::default_slot2(),
+        slot3: EncodeSlot::default(),
+        slot4: EncodeSlot::default(),
         only_names: None,
     };
     run_batch(opts, Arc::new(AtomicBool::new(false)), |ev| match ev {

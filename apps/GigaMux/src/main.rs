@@ -268,10 +268,14 @@ enum FileSide {
 
 struct GigaMuxApp {
     prefs: Prefs,
-    /// Draft maxrate text per slot (index 0 = Test1/slot1, 1 = Test2/slot2).
-    maxrate_override_edit: [String; 2],
+    /// Draft maxrate text per slot (index 0..=3 = Test1…Test4).
+    maxrate_override_edit: [String; 4],
     /// Draft CQ/CRF text per slot (empty = default 0).
-    cq_override_edit: [String; 2],
+    cq_override_edit: [String; 4],
+    /// Pair-jump prefer batch in test mode (cycled by Shift+←/→).
+    test_nav_prefer: TestBatch,
+    /// After Shift sibling/pair jump: scroll this Output test-slot header into view once.
+    focus_out_test_slot: Option<TestBatch>,
     devices: Vec<NvencDevice>,
     /// GPUs that can open `av1_nvenc` (empty on pre-Ada / no AV1 NVENC).
     av1_devices: Vec<NvencDevice>,
@@ -613,34 +617,13 @@ impl GigaMuxApp {
         let (gpu, warn) = prefs.gpu.sanitize(&devices);
         prefs.gpu = gpu;
         // Opaque VP8 has no HW path: UI greys the checkbox but keeps the prefs flag.
-        let maxrate_override_edit = [
-            prefs
-                .slot1
-                .maxrate_override_k
-                .map(|k| k.to_string())
-                .unwrap_or_default(),
-            prefs
-                .slot2
-                .maxrate_override_k
-                .map(|k| k.to_string())
-                .unwrap_or_default(),
-        ];
-        let cq_override_edit = [
-            prefs
-                .slot1
-                .cq_override
-                .map(|q| q.to_string())
-                .unwrap_or_default(),
-            prefs
-                .slot2
-                .cq_override
-                .map(|q| q.to_string())
-                .unwrap_or_default(),
-        ];
+        let (maxrate_override_edit, cq_override_edit) = Self::draft_edits_from_prefs(&prefs);
         let mut app = Self {
             prefs,
             maxrate_override_edit,
             cq_override_edit,
+            test_nav_prefer: TestBatch::One,
+            focus_out_test_slot: None,
             devices,
             av1_devices,
             qsv_available,
@@ -762,7 +745,34 @@ impl GigaMuxApp {
             .collect()
     }
 
-    /// Output files belonging to one test batch (`test1_*` / `test2_*`).
+    /// Draft maxrate/CQ text boxes from persisted slot overrides.
+    fn draft_edits_from_prefs(prefs: &Prefs) -> ([String; 4], [String; 4]) {
+        let maxrate = TestBatch::ALL.map(|b| {
+            prefs
+                .slot(b)
+                .maxrate_override_k
+                .map(|k| k.to_string())
+                .unwrap_or_default()
+        });
+        let cq = TestBatch::ALL.map(|b| {
+            prefs
+                .slot(b)
+                .cq_override
+                .map(|q| q.to_string())
+                .unwrap_or_default()
+        });
+        (maxrate, cq)
+    }
+
+    /// Commit maxrate + CQ drafts for every slot.
+    fn commit_all_slot_edits(&mut self) {
+        for &b in &TestBatch::ALL {
+            self.commit_maxrate_override_edit(b);
+            self.commit_cq_override_edit(b);
+        }
+    }
+
+    /// Output files belonging to one test batch (`test1_*`…`test4_*`).
     fn output_files_for_batch(files: &[PathBuf], batch: TestBatch) -> Vec<PathBuf> {
         files
             .iter()
@@ -775,13 +785,13 @@ impl GigaMuxApp {
             .collect()
     }
 
-    /// Pair stem for input↔output jumps (strips `test1_` / `test2_` on outputs).
+    /// Pair stem for input↔output jumps (strips `testN_` on outputs).
     fn pair_stem_of(name: &str) -> String {
         pair_stem(name)
     }
 
     /// Same-stem counterpart on the other side.
-    /// In test mode, `prefer` picks Test1 vs Test2 when jumping toward Output.
+    /// In test mode, `prefer` picks which test batch when jumping toward Output.
     fn counterpart_name(&self, side: FileSide, name: &str) -> Option<String> {
         self.counterpart_name_prefer(side, name, TestBatch::One)
     }
@@ -824,15 +834,43 @@ impl GigaMuxApp {
         }
     }
 
-    /// Sibling test output for the same source stem (`test1_*` ↔ `test2_*`).
-    fn sibling_test_name(&self, name: &str) -> Option<String> {
+    /// Next/prev test output for the same source stem among active batches.
+    fn sibling_test_name(&self, name: &str, forward: bool) -> Option<String> {
         let (batch, stem) = strip_test_prefix(name);
         let batch = batch?;
-        let want = batch.sibling();
+        let active = self.prefs.active_batches();
+        let want = if forward {
+            batch.next_among(active)
+        } else {
+            batch.prev_among(active)
+        };
+        if want == batch {
+            return None;
+        }
         self.names_for(FileSide::Output).into_iter().find(|n| {
             let (b, rest) = strip_test_prefix(n);
             b == Some(want) && rest == stem
         })
+    }
+
+    /// Cycle `test_nav_prefer` through active batches; returns the new prefer.
+    fn cycle_test_nav_prefer(&mut self, forward: bool) -> TestBatch {
+        let active = self.prefs.active_batches();
+        if active.is_empty() {
+            return TestBatch::One;
+        }
+        let cur = if active.contains(&self.test_nav_prefer) {
+            self.test_nav_prefer
+        } else {
+            active[0]
+        };
+        let next = if forward {
+            cur.next_among(active)
+        } else {
+            cur.prev_among(active)
+        };
+        self.test_nav_prefer = next;
+        next
     }
 
     fn other_side(side: FileSide) -> FileSide {
@@ -1689,30 +1727,9 @@ impl GigaMuxApp {
                     p.sanitize_targets();
                     let (gpu, warn) = p.gpu.sanitize(&self.devices);
                     self.prefs = Prefs { gpu, ..p };
-                    self.maxrate_override_edit = [
-                        self.prefs
-                            .slot1
-                            .maxrate_override_k
-                            .map(|k| k.to_string())
-                            .unwrap_or_default(),
-                        self.prefs
-                            .slot2
-                            .maxrate_override_k
-                            .map(|k| k.to_string())
-                            .unwrap_or_default(),
-                    ];
-                    self.cq_override_edit = [
-                        self.prefs
-                            .slot1
-                            .cq_override
-                            .map(|q| q.to_string())
-                            .unwrap_or_default(),
-                        self.prefs
-                            .slot2
-                            .cq_override
-                            .map(|q| q.to_string())
-                            .unwrap_or_default(),
-                    ];
+                    let (maxrate, cq) = Self::draft_edits_from_prefs(&self.prefs);
+                    self.maxrate_override_edit = maxrate;
+                    self.cq_override_edit = cq;
                     self.gpu_warn = warn;
                     let _ = prefs::save(&self.prefs);
                     self.refresh_lists();
@@ -1742,25 +1759,30 @@ impl GigaMuxApp {
             self.prefs.slot1.alpha_video = d.slot1.alpha_video;
             self.prefs.slot1.alpha_container = d.slot1.alpha_container;
             self.prefs.slot2 = EncodeSlot::default_slot2();
+            self.prefs.slot3 = EncodeSlot::default();
+            self.prefs.slot4 = EncodeSlot::default();
             self.prefs.test_mode = false;
+            self.prefs.test_slot_count = 2;
             touched_prefs = true;
             parts.push("targets".into());
         }
         if p.hardware {
             self.prefs.slot1.use_hardware = d.slot1.use_hardware;
             self.prefs.slot2.use_hardware = d.slot2.use_hardware;
+            self.prefs.slot3.use_hardware = d.slot3.use_hardware;
+            self.prefs.slot4.use_hardware = d.slot4.use_hardware;
             self.prefs.gpu = d.gpu;
             touched_prefs = true;
             parts.push("hardware".into());
         }
         if p.bitrate {
             self.prefs.use_peak_bitrate = d.use_peak_bitrate;
-            self.prefs.slot1.maxrate_override_k = d.slot1.maxrate_override_k;
-            self.prefs.slot1.cq_override = d.slot1.cq_override;
-            self.prefs.slot2.maxrate_override_k = d.slot2.maxrate_override_k;
-            self.prefs.slot2.cq_override = d.slot2.cq_override;
-            self.maxrate_override_edit = [String::new(), String::new()];
-            self.cq_override_edit = [String::new(), String::new()];
+            for &b in &TestBatch::ALL {
+                self.prefs.slot_mut(b).maxrate_override_k = d.slot(b).maxrate_override_k;
+                self.prefs.slot_mut(b).cq_override = d.slot(b).cq_override;
+            }
+            self.maxrate_override_edit = Default::default();
+            self.cq_override_edit = Default::default();
             touched_prefs = true;
             parts.push("bitrate".into());
         }
@@ -1860,7 +1882,7 @@ impl GigaMuxApp {
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
             slot,
-            // Farm v0: one full deliver (not test1_/test2_ dual).
+            // Farm v0: one full deliver (not testN_ multi-slot).
             test_batch: None,
         };
         let cmd = match build_farm_ffmpeg_argv(&farm) {
@@ -1919,10 +1941,7 @@ impl GigaMuxApp {
             self.log_open = true;
             return;
         }
-        self.commit_maxrate_override_edit(TestBatch::One);
-        self.commit_maxrate_override_edit(TestBatch::Two);
-        self.commit_cq_override_edit(TestBatch::One);
-        self.commit_cq_override_edit(TestBatch::Two);
+        self.commit_all_slot_edits();
         // Missing AV1 NVENC / QSV: checkbox is greyed; encode falls back to CPU without clearing prefs.
         self.start_encode_now(only_name);
     }
@@ -1937,6 +1956,10 @@ impl GigaMuxApp {
         slot1.use_hardware = self.effective_use_hardware_for(&slot1);
         let mut slot2 = self.prefs.slot2.clone();
         slot2.use_hardware = self.effective_use_hardware_for(&slot2);
+        let mut slot3 = self.prefs.slot3.clone();
+        slot3.use_hardware = self.effective_use_hardware_for(&slot3);
+        let mut slot4 = self.prefs.slot4.clone();
+        slot4.use_hardware = self.effective_use_hardware_for(&slot4);
         let opts = EncodeOptions {
             input_dir: self.prefs.input_dir.clone(),
             output_dir: self.prefs.output_dir.clone(),
@@ -1944,8 +1967,11 @@ impl GigaMuxApp {
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
             test_mode: self.prefs.test_mode,
+            test_slot_count: self.prefs.test_slot_count,
             slot1,
             slot2,
+            slot3,
+            slot4,
             only_names: only_name.clone().map(|n| vec![n]),
         };
         let cancel = Arc::clone(&self.cancel);
@@ -2052,9 +2078,39 @@ impl GigaMuxApp {
         self.scroll_sel_into_view = true;
     }
 
+    /// Stable id for Output-column test slot collapsing headers (keyboard can force-open).
+    fn out_test_slot_id(batch: TestBatch) -> egui::Id {
+        egui::Id::unique(("gigamux_out_test_slot", batch.index() as u8))
+    }
+
+    fn set_out_test_slot_open(ctx: &egui::Context, batch: TestBatch, open: bool) {
+        let mut st = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ctx,
+            Self::out_test_slot_id(batch),
+            open,
+        );
+        st.set_open(open);
+        st.store(ctx);
+    }
+
+    /// Expand the Output test-slot panel that owns `name` and request its header into view.
+    fn focus_out_test_slot_for(&mut self, ctx: &egui::Context, name: &str) {
+        if !self.prefs.test_mode {
+            return;
+        }
+        let (Some(batch), _) = strip_test_prefix(name) else {
+            return;
+        };
+        if self.prefs.active_batches().contains(&batch) {
+            Self::set_out_test_slot_open(ctx, batch, true);
+            self.focus_out_test_slot = Some(batch);
+            ctx.request_repaint();
+        }
+    }
+
     /// ← input / → output: jump to the same-stem file on that side.
-    /// `prefer` selects Test1 vs Test2 when landing on Output in test mode.
-    fn jump_to_side_prefer(&mut self, target: FileSide, prefer: TestBatch) {
+    /// `prefer` selects which test batch when landing on Output in test mode.
+    fn jump_to_side_prefer(&mut self, ctx: &egui::Context, target: FileSide, prefer: TestBatch) {
         let Some((side, name)) = self.active.clone() else {
             return;
         };
@@ -2062,21 +2118,25 @@ impl GigaMuxApp {
             return;
         }
         if let Some(other) = self.counterpart_name_prefer(side, &name, prefer) {
+            if target == FileSide::Output {
+                self.focus_out_test_slot_for(ctx, &other);
+            }
             self.select_file(target, other);
             // Keep the landed row on-screen (same path as ↑/↓ / Home/End).
             self.scroll_sel_into_view = true;
         }
     }
 
-    /// Shift+↑/↓ on Output in test mode: jump to the sibling test encode.
-    fn jump_sibling_test(&mut self) {
+    /// Shift+↑/↓ on Output in test mode: cycle among active test encodes for this stem.
+    fn jump_sibling_test(&mut self, ctx: &egui::Context, forward: bool) {
         let Some((side, name)) = self.active.clone() else {
             return;
         };
         if side != FileSide::Output || !self.prefs.test_mode {
             return;
         }
-        if let Some(sib) = self.sibling_test_name(&name) {
+        if let Some(sib) = self.sibling_test_name(&name, forward) {
+            self.focus_out_test_slot_for(ctx, &sib);
             self.select_file(FileSide::Output, sib);
             self.scroll_sel_into_view = true;
         }
@@ -3029,10 +3089,7 @@ impl GigaMuxApp {
             } else if self.pending_check.is_some() {
                 self.pending_check = None;
             } else if self.show_settings {
-                self.commit_maxrate_override_edit(TestBatch::One);
-                self.commit_maxrate_override_edit(TestBatch::Two);
-                self.commit_cq_override_edit(TestBatch::One);
-                self.commit_cq_override_edit(TestBatch::Two);
+                self.commit_all_slot_edits();
                 let _ = prefs::save(&self.prefs);
                 self.show_settings = false;
             } else {
@@ -3071,7 +3128,7 @@ impl GigaMuxApp {
                 self.navigate_list(page);
             }
         } else if arrow_up {
-            // Test mode + Output: Shift+↑/↓ jumps to the sibling test file; else normal step.
+            // Test mode + Output: Shift+↑/↓ cycles active test siblings; else normal step.
             if shift
                 && self.prefs.test_mode
                 && self
@@ -3079,7 +3136,7 @@ impl GigaMuxApp {
                     .as_ref()
                     .is_some_and(|(s, _)| *s == FileSide::Output)
             {
-                self.jump_sibling_test();
+                self.jump_sibling_test(ctx, false);
             } else {
                 self.navigate_list(-1);
             }
@@ -3091,26 +3148,26 @@ impl GigaMuxApp {
                     .as_ref()
                     .is_some_and(|(s, _)| *s == FileSide::Output)
             {
-                self.jump_sibling_test();
+                self.jump_sibling_test(ctx, true);
             } else {
                 self.navigate_list(1);
             }
         }
         if arrow_left {
             let prefer = if shift && self.prefs.test_mode {
-                TestBatch::Two
+                self.cycle_test_nav_prefer(false)
             } else {
                 TestBatch::One
             };
-            self.jump_to_side_prefer(FileSide::Input, prefer);
+            self.jump_to_side_prefer(ctx, FileSide::Input, prefer);
         }
         if arrow_right {
             let prefer = if shift && self.prefs.test_mode {
-                TestBatch::Two
+                self.cycle_test_nav_prefer(true)
             } else {
                 TestBatch::One
             };
-            self.jump_to_side_prefer(FileSide::Output, prefer);
+            self.jump_to_side_prefer(ctx, FileSide::Output, prefer);
         }
         if delete {
             self.delete_active();
@@ -3128,11 +3185,7 @@ impl GigaMuxApp {
         }
         let input = self.prefs.input_dir.clone();
         let output = self.prefs.output_dir.clone();
-        let targets = self.prefs.slot1.output_targets();
-        let test_slot2 = self
-            .prefs
-            .test_mode
-            .then(|| self.prefs.slot2.output_targets());
+        let slots = self.prefs.check_vmaf_slots();
         let (tx, rx) = mpsc::channel();
         self.busy = true;
         self.job = Some(JobKind::Check);
@@ -3140,7 +3193,7 @@ impl GigaMuxApp {
         self.push_session("Check started…");
         self.log_open = true;
         thread::spawn(move || {
-            let result = run_check(&input, &output, targets, test_slot2);
+            let result = run_check(&input, &output, &slots);
             let _ = tx.send(AppEvent::CheckDone(result));
         });
     }
@@ -3164,11 +3217,7 @@ impl GigaMuxApp {
         }
         let input = self.prefs.input_dir.clone();
         let output = self.prefs.output_dir.clone();
-        let targets = self.prefs.slot1.output_targets();
-        let test_slot2 = self
-            .prefs
-            .test_mode
-            .then(|| self.prefs.slot2.output_targets());
+        let slots = self.prefs.check_vmaf_slots();
         self.cancel.store(false, Ordering::Relaxed);
         let cancel = Arc::clone(&self.cancel);
         let (tx, rx) = mpsc::channel();
@@ -3187,8 +3236,7 @@ impl GigaMuxApp {
             let result = run_vmaf(
                 &input,
                 &output,
-                targets,
-                test_slot2,
+                &slots,
                 only_name,
                 None,
                 &cancel,
@@ -3248,11 +3296,7 @@ impl GigaMuxApp {
     fn start_auto_vmaf(&mut self, unscored: HashSet<String>, already_scored: usize) {
         let input = self.prefs.input_dir.clone();
         let output = self.prefs.output_dir.clone();
-        let targets = self.prefs.slot1.output_targets();
-        let test_slot2 = self
-            .prefs
-            .test_mode
-            .then(|| self.prefs.slot2.output_targets());
+        let slots = self.prefs.check_vmaf_slots();
         self.cancel.store(false, Ordering::Relaxed);
         let cancel = Arc::clone(&self.cancel);
         let (tx, rx) = mpsc::channel();
@@ -3270,7 +3314,7 @@ impl GigaMuxApp {
             let send_log = |msg: String| {
                 let _ = tx_ev.send(AppEvent::Vmaf(VmafEvent::Log(msg)));
             };
-            let check = match run_check(&input, &output, targets, test_slot2) {
+            let check = match run_check(&input, &output, &slots) {
                 Ok(r) => r,
                 Err(e) => {
                     send_log(format!("auto VMAF: check failed — {e}"));
@@ -3302,8 +3346,7 @@ impl GigaMuxApp {
             let result = run_vmaf(
                 &input,
                 &output,
-                targets,
-                test_slot2,
+                &slots,
                 None,
                 Some(allow),
                 &cancel,
@@ -3540,7 +3583,7 @@ impl GigaMuxApp {
                 ok += 1;
                 let line = format!("VMAF {} → {}: {s:.4}", r.input, r.output);
                 self.push_file_log(&r.input, &line);
-                // Always store on the output. Mirror onto input only for non-test pairs so dual test1_/test2_ scores do not clobber each other on the input row.
+                // Always store on the output. Mirror onto input only for non-test pairs so multi testN_ scores do not clobber each other on the input row.
                 let out_key = Self::preview_key(FileSide::Output, &r.output);
                 if let Some(e) = self.preview_cache.get_mut(&out_key) {
                     e.vmaf_score = Some(s);
@@ -3710,10 +3753,7 @@ impl GigaMuxApp {
     }
 
     fn batch_edit_idx(batch: TestBatch) -> usize {
-        match batch {
-            TestBatch::One => 0,
-            TestBatch::Two => 1,
-        }
+        batch.index()
     }
 
     /// Whether opaque Use hardware can apply on this machine for `slot`'s codec.
@@ -3989,48 +4029,83 @@ impl GigaMuxApp {
     }
 
     fn ui_test_mode_checkbox(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .checkbox(&mut self.prefs.test_mode, "Test mode")
-            .on_hover_text(
-                "Encode each input twice as test1_* / test2_* with independent targets for size + VMAF comparison. ←/→ = Test1, Shift+←/→ = Test2, Shift+↑/↓ swaps siblings.",
-            )
-            .changed()
-        {
-            self.save_targets();
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.prefs.test_mode, "Test mode")
+                .on_hover_text(
+                    "Encode each input as test1_*…testN_* with independent targets for size + VMAF comparison. ←/→ = Test1, Shift+←/→ cycles prefer, Shift+↑/↓ cycles siblings.",
+                )
+                .changed()
+            {
+                self.prefs.test_slot_count = self.prefs.test_slot_count.clamp(2, 4);
+                self.save_targets();
+            }
+            if self.prefs.test_mode {
+                ui.add_space(6.0);
+                ui.label("Target Slots");
+                let mut count = self.prefs.test_slot_count.clamp(2, 4);
+                egui::ComboBox::from_id_salt("test_slot_count")
+                    .selected_text(count.to_string())
+                    .width(40.0)
+                    .show_ui(ui, |ui| {
+                        for n in 2u8..=4 {
+                            ui.selectable_value(&mut count, n, n.to_string());
+                        }
+                    });
+                if count != self.prefs.test_slot_count {
+                    self.prefs.test_slot_count = count;
+                    self.save_targets();
+                }
+            }
+        });
     }
 
     fn ui_output_targets(&mut self, ui: &mut egui::Ui) {
         self.ui_slot_targets(ui, TestBatch::One, "Targets");
     }
 
-    /// Mid-strip size Δ + VMAF between test1/test2 for the active pair stem.
-    /// Layout mirrors the center meta table: weak label + monospace values + color deltas.
+    /// Mid-strip: size Δ vs input; VMAF score (vs input) with ↑/↓ vs Test1 quality baseline.
     fn ui_test_compare_strip(&mut self, ui: &mut egui::Ui) {
         let stem = self.active.as_ref().map(|(_, n)| Self::pair_stem_of(n));
         let Some(stem) = stem else {
-            ui.label(egui::RichText::new("Select a file to compare Test1 ↔ Test2").weak().small());
-            return;
-        };
-        let t1 = self.names_for(FileSide::Output).into_iter().find(|n| {
-            let (b, rest) = strip_test_prefix(n);
-            b == Some(TestBatch::One) && rest == stem
-        });
-        let t2 = self.names_for(FileSide::Output).into_iter().find(|n| {
-            let (b, rest) = strip_test_prefix(n);
-            b == Some(TestBatch::Two) && rest == stem
-        });
-        let (Some(n1), Some(n2)) = (t1, t2) else {
             ui.label(
-                egui::RichText::new(format!("Waiting for test1_/test2_ outputs for “{stem}”"))
+                egui::RichText::new("Select a file to compare target slots")
                     .weak()
                     .small(),
             );
             return;
         };
+        let active = self.prefs.active_batches();
+        let out_names = self.names_for(FileSide::Output);
+        let present: Vec<(TestBatch, String)> = active
+            .iter()
+            .filter_map(|&b| {
+                out_names
+                    .iter()
+                    .find(|n| {
+                        let (batch, rest) = strip_test_prefix(n);
+                        batch == Some(b) && rest == stem
+                    })
+                    .cloned()
+                    .map(|n| (b, n))
+            })
+            .collect();
+        if present.is_empty() {
+            let expect = active
+                .iter()
+                .map(|b| b.prefix().trim_end_matches('_'))
+                .collect::<Vec<_>>()
+                .join("/");
+            ui.label(
+                egui::RichText::new(format!("Waiting for {expect}_ outputs for \"{stem}\""))
+                    .weak()
+                    .small(),
+            );
+            return;
+        }
 
-        let bytes = |name: &str| -> Option<u64> {
-            let key = Self::preview_key(FileSide::Output, name);
+        let bytes_for = |side: FileSide, name: &str| -> Option<u64> {
+            let key = Self::preview_key(side, name);
             let e = self.preview_cache.get(&key)?;
             if e.file_size > 0 {
                 return Some(e.file_size);
@@ -4041,80 +4116,95 @@ impl GigaMuxApp {
                 .map(|s| s.file_size_bytes)
                 .filter(|&b| b > 0)
         };
-        let b1 = bytes(&n1);
-        let b2 = bytes(&n2);
-        let delta = match (b1, b2) {
-            (Some(a), Some(b)) => size_delta(a, b),
-            _ => None,
-        };
-        let v1 = self.live_vmaf_score(FileSide::Output, &n1);
-        let v2 = self.live_vmaf_score(FileSide::Output, &n2);
 
         // Same greens/reds as the center Size row.
         let green = egui::Color32::from_rgb(80, 180, 100);
         let red = egui::Color32::from_rgb(220, 90, 80);
+        let input_name = self
+            .names_for(FileSide::Input)
+            .into_iter()
+            .find(|n| Self::file_stem_of(n) == stem.as_str());
+        let in_bytes = input_name
+            .as_deref()
+            .and_then(|n| bytes_for(FileSide::Input, n));
+
+        // Collect VMAF first so every row can Δ against Test1 (quality A/B heuristic).
+        let vmafs: Vec<(TestBatch, Option<f64>)> = present
+            .iter()
+            .map(|(b, n)| (*b, self.live_vmaf_score(FileSide::Output, n)))
+            .collect();
+        let vmaf_baseline = vmafs
+            .iter()
+            .find(|(b, v)| *b == TestBatch::One && v.is_some())
+            .and_then(|(_, v)| *v);
 
         egui::Grid::new("test_compare")
-            .num_columns(2)
+            .num_columns(3)
             .spacing([10.0, 3.0])
-            .min_col_width(48.0)
+            .min_col_width(40.0)
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("Compare").strong().small());
-                ui.label(egui::RichText::new(&stem).weak().small());
+                ui.label(
+                    egui::RichText::new(format!("{stem}  ·  size vs input"))
+                        .weak()
+                        .small(),
+                );
+                ui.label(egui::RichText::new("VMAF vs Test1").weak().small());
                 ui.end_row();
 
-                ui.label(egui::RichText::new("Size").weak().small());
-                ui.horizontal(|ui| {
-                    ui.monospace(match b1 {
-                        Some(b) => format_bytes(b),
-                        None => "—".into(),
-                    });
-                    ui.label(egui::RichText::new("→").weak());
-                    ui.monospace(match b2 {
-                        Some(b) => format_bytes(b),
-                        None => "—".into(),
-                    });
-                    match delta {
-                        Some(SizeDelta::Smaller { pct, bytes }) => {
-                            ui.add_space(6.0);
-                            ui.colored_label(green, format!("↓{pct}%"));
-                            ui.colored_label(green, format!("↓{}", format_bytes(bytes)));
-                        }
-                        Some(SizeDelta::Larger { pct, bytes }) => {
-                            ui.add_space(6.0);
-                            ui.colored_label(red, format!("↑{pct}%"));
-                            ui.colored_label(red, format!("↑{}", format_bytes(bytes)));
-                        }
-                        Some(SizeDelta::Same) | None => {}
-                    }
+                // Input baseline size (VMAF is N/A on the source).
+                ui.label(egui::RichText::new("Input").weak().small());
+                ui.monospace(match in_bytes {
+                    Some(n) => format_bytes(n),
+                    None => "-".into(),
                 });
+                ui.label(egui::RichText::new("-").weak().small());
                 ui.end_row();
 
-                ui.label(egui::RichText::new("VMAF").weak().small());
-                ui.horizontal(|ui| {
-                    ui.monospace(match v1 {
-                        Some(v) => format!("{v:.2}"),
-                        None => "—".into(),
+                for ((batch, name), (_, v)) in present.iter().zip(vmafs.iter()) {
+                    let b = bytes_for(FileSide::Output, name);
+                    ui.label(egui::RichText::new(batch.label()).weak().small());
+                    ui.horizontal(|ui| {
+                        ui.monospace(match b {
+                            Some(n) => format_bytes(n),
+                            None => "-".into(),
+                        });
+                        match (in_bytes, b) {
+                            (Some(a), Some(c)) => match size_delta(a, c) {
+                                Some(SizeDelta::Smaller { pct, bytes }) => {
+                                    ui.colored_label(green, format!("↓{pct}%"));
+                                    ui.colored_label(green, format!("↓{}", format_bytes(bytes)));
+                                }
+                                Some(SizeDelta::Larger { pct, bytes }) => {
+                                    ui.colored_label(red, format!("↑{pct}%"));
+                                    ui.colored_label(red, format!("↑{}", format_bytes(bytes)));
+                                }
+                                Some(SizeDelta::Same) | None => {}
+                            },
+                            _ => {}
+                        }
                     });
-                    ui.label(egui::RichText::new("→").weak());
-                    ui.monospace(match v2 {
-                        Some(v) => format!("{v:.2}"),
-                        None => "—".into(),
-                    });
-                    // Higher VMAF is better; color the T1→T2 delta like Size.
-                    if let (Some(a), Some(b)) = (v1, v2) {
-                        let d = b - a;
-                        if d.abs() >= 1e-4 {
-                            ui.add_space(6.0);
-                            if d > 0.0 {
-                                ui.colored_label(green, format!("↑{d:.2}"));
-                            } else {
-                                ui.colored_label(red, format!("↓{:.2}", -d));
+                    // Absolute VMAF is vs the input; ↑/↓ vs Test1 is the slot A/B heuristic.
+                    ui.horizontal(|ui| {
+                        ui.monospace(match v {
+                            Some(score) => format!("{score:.2}"),
+                            None => "-".into(),
+                        });
+                        if *batch != TestBatch::One {
+                            if let (Some(base), Some(score)) = (vmaf_baseline, *v) {
+                                let d = score - base;
+                                if d.abs() >= 1e-4 {
+                                    if d > 0.0 {
+                                        ui.colored_label(green, format!("↑{d:.2}"));
+                                    } else {
+                                        ui.colored_label(red, format!("↓{:.2}", -d));
+                                    }
+                                }
                             }
                         }
-                    }
-                });
-                ui.end_row();
+                    });
+                    ui.end_row();
+                }
             });
     }
 
@@ -4180,36 +4270,85 @@ impl GigaMuxApp {
                 FileSide::Output
             };
 
-            // Test mode: two virtual output folders (Test1 / Test2) with their own lists.
+            // Test mode: compare strip + collapsing panels; list height capped so other slot headers stay reachable.
             if !is_input && self.prefs.test_mode {
-                let files1 = Self::output_files_for_batch(files, TestBatch::One);
-                let files2 = Self::output_files_for_batch(files, TestBatch::Two);
-                let avail = ui.available_height();
-                let compare_h = 64.0;
-                let half = ((avail - compare_h) * 0.5).max(100.0);
-                let w = ui.available_width();
-
-                ui.allocate_ui_with_layout(
-                    egui::vec2(w, half),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        self.ui_slot_targets(ui, TestBatch::One, "Test1");
-                        ui.separator();
-                        self.ui_file_scroll_list(ui, side, false, &files1, "out_list_t1");
-                    },
-                );
-                ui.separator();
+                let batches: Vec<TestBatch> = self.prefs.active_batches().to_vec();
+                let multi = batches.len() > 2;
                 self.ui_test_compare_strip(ui);
                 ui.separator();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(w, ui.available_height().max(half * 0.5)),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        self.ui_slot_targets(ui, TestBatch::Two, "Test2");
-                        ui.separator();
-                        self.ui_file_scroll_list(ui, side, false, &files2, "out_list_t2");
-                    },
-                );
+                let n = batches.len().max(1) as f32;
+                let header_reserve = 24.0 * n;
+                let open_n = batches
+                    .iter()
+                    .filter(|b| {
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            Self::out_test_slot_id(**b),
+                            !multi || b.index() == 0,
+                        )
+                        .is_open()
+                    })
+                    .count()
+                    .max(1) as f32;
+                // Cap each open body so later slot headers are not pushed fully off-screen.
+                let list_max =
+                    ((ui.available_height() - header_reserve) / open_n - 90.0).clamp(96.0, 280.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("out_test_slots_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (i, batch) in batches.iter().enumerate() {
+                            let files_b = Self::output_files_for_batch(files, *batch);
+                            let salt = format!("out_list_t{}", batch.index() + 1);
+                            let default_open = !multi || i == 0;
+                            let id = Self::out_test_slot_id(*batch);
+                            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(),
+                                id,
+                                default_open,
+                            );
+                            let (toggle, header_ir, _body) = state
+                                .show_header(ui, |ui| {
+                                    ui.strong(batch.label())
+                                        .on_hover_text("Shift+click caret: expand/collapse all target slots");
+                                })
+                                .body(|ui| {
+                                    self.ui_slot_targets(ui, *batch, batch.label());
+                                    ui.separator();
+                                    // Constrain the inner file ScrollArea so sibling headers remain visible.
+                                    ui.allocate_ui(
+                                        egui::vec2(ui.available_width(), list_max),
+                                        |ui| {
+                                            self.ui_file_scroll_list(
+                                                ui, side, false, &files_b, &salt,
+                                            );
+                                        },
+                                    );
+                                });
+                            // Shift+caret: apply this slot's new open state to every active test slot.
+                            if toggle.clicked() && ui.input(|i| i.modifiers.shift) {
+                                let open = egui::collapsing_header::CollapsingState::load(
+                                    ui.ctx(),
+                                    id,
+                                )
+                                .map(|s| s.is_open())
+                                .unwrap_or(true);
+                                for b in &batches {
+                                    set_collapsing_open(
+                                        ui.ctx(),
+                                        Self::out_test_slot_id(*b),
+                                        open,
+                                    );
+                                }
+                                ui.ctx().request_repaint();
+                            }
+                            // Keyboard jump opens a collapsed slot: bring its header into the outer scroll.
+                            if self.focus_out_test_slot == Some(*batch) {
+                                header_ir.response.scroll_to_me(Some(egui::Align::TOP));
+                                self.focus_out_test_slot = None;
+                            }
+                        }
+                    });
                 return;
             }
 
@@ -4255,7 +4394,7 @@ impl GigaMuxApp {
                             .and_then(|e| e.to_str())
                             .unwrap_or("")
                             .to_ascii_lowercase();
-                        // Test-mode half-lists already name the batch — hide test1_/test2_ there only.
+                        // Test-mode slot lists already name the batch; hide testN_ there only.
                         // Non-test mode always shows the real basename (prefixes included).
                         let row_label = if self.prefs.test_mode {
                             let (batch, stem) = strip_test_prefix(&name);
@@ -5163,26 +5302,70 @@ impl GigaMuxApp {
             },
         );
         if close {
-            self.commit_maxrate_override_edit(TestBatch::One);
-            self.commit_maxrate_override_edit(TestBatch::Two);
-            self.commit_cq_override_edit(TestBatch::One);
-            self.commit_cq_override_edit(TestBatch::Two);
+            self.commit_all_slot_edits();
             let _ = prefs::save(&self.prefs);
             self.show_settings = false;
         }
     }
 
-    /// Encode tab: hardware, GPU, maxrate, peak ceiling (slot1 + optional slot2 in test mode).
+    /// Encode tab: hardware, GPU, maxrate, peak ceiling (active test slots when test mode).
     /// CQ is prefs-only (advanced); not shown here.
     fn ui_settings_encode(&mut self, ui: &mut egui::Ui) {
-        self.ui_slot_targets(ui, TestBatch::One, if self.prefs.test_mode { "Test1" } else { "Targets" });
         if self.prefs.test_mode {
-            ui.add_space(8.0);
-            self.ui_slot_targets(ui, TestBatch::Two, "Test2");
+            let batches: Vec<TestBatch> = self.prefs.active_batches().to_vec();
+            let multi = batches.len() > 2;
+            egui::ScrollArea::vertical()
+                .id_salt("settings_test_slots_scroll")
+                .auto_shrink([false, false])
+                .max_height(ui.available_height() * 0.55)
+                .show(ui, |ui| {
+                    for (i, batch) in batches.iter().enumerate() {
+                        let default_open = !multi || i == 0;
+                        let id = egui::Id::unique(("gigamux_settings_test_slot", batch.index() as u8));
+                        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            default_open,
+                        );
+                        let (toggle, _, _) = state
+                            .show_header(ui, |ui| {
+                                ui.strong(batch.label()).on_hover_text(
+                                    "Shift+click caret: expand/collapse all target slots",
+                                );
+                            })
+                            .body(|ui| {
+                                self.ui_slot_targets(ui, *batch, batch.label());
+                            });
+                        if toggle.clicked() && ui.input(|i| i.modifiers.shift) {
+                            let open = egui::collapsing_header::CollapsingState::load(ui.ctx(), id)
+                                .map(|s| s.is_open())
+                                .unwrap_or(true);
+                            for b in &batches {
+                                set_collapsing_open(
+                                    ui.ctx(),
+                                    egui::Id::unique((
+                                        "gigamux_settings_test_slot",
+                                        b.index() as u8,
+                                    )),
+                                    open,
+                                );
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                });
+        } else {
+            self.ui_slot_targets(ui, TestBatch::One, "Targets");
         }
         ui.add_space(8.0);
-        let hw_any = self.prefs.slot1.use_hardware
-            || (self.prefs.test_mode && self.prefs.slot2.use_hardware);
+        let hw_any = if self.prefs.test_mode {
+            self.prefs
+                .active_batches()
+                .iter()
+                .any(|&b| self.prefs.slot(b).use_hardware)
+        } else {
+            self.prefs.slot1.use_hardware
+        };
         ui.add_enabled_ui(hw_any, |ui| {
             ui.horizontal(|ui| {
                 ui.label("GPU");

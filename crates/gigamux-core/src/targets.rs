@@ -466,18 +466,24 @@ impl Default for OutputTargets {
     }
 }
 
-/// Test-mode batch index (maps to `test1_` / `test2_` output prefixes).
+/// Test-mode batch index (maps to `test1_`…`test4_` output prefixes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestBatch {
     One,
     Two,
+    Three,
+    Four,
 }
 
 impl TestBatch {
+    pub const ALL: [Self; 4] = [Self::One, Self::Two, Self::Three, Self::Four];
+
     pub fn prefix(self) -> &'static str {
         match self {
             Self::One => "test1_",
             Self::Two => "test2_",
+            Self::Three => "test3_",
+            Self::Four => "test4_",
         }
     }
 
@@ -485,30 +491,59 @@ impl TestBatch {
         match self {
             Self::One => "Test1",
             Self::Two => "Test2",
+            Self::Three => "Test3",
+            Self::Four => "Test4",
         }
     }
 
-    pub fn sibling(self) -> Self {
+    pub fn index(self) -> usize {
         match self {
-            Self::One => Self::Two,
-            Self::Two => Self::One,
+            Self::One => 0,
+            Self::Two => 1,
+            Self::Three => 2,
+            Self::Four => 3,
         }
+    }
+
+    pub fn from_index(i: usize) -> Option<Self> {
+        Self::ALL.get(i).copied()
+    }
+
+    /// Next batch in `active` after `self` (wraps). Falls back to `self` if empty/missing.
+    pub fn next_among(self, active: &[Self]) -> Self {
+        if active.is_empty() {
+            return self;
+        }
+        let Some(pos) = active.iter().position(|&b| b == self) else {
+            return active[0];
+        };
+        active[(pos + 1) % active.len()]
+    }
+
+    /// Previous batch in `active` before `self` (wraps).
+    pub fn prev_among(self, active: &[Self]) -> Self {
+        if active.is_empty() {
+            return self;
+        }
+        let Some(pos) = active.iter().position(|&b| b == self) else {
+            return active[0];
+        };
+        active[(pos + active.len() - 1) % active.len()]
     }
 }
 
-/// Strip a `test1_` / `test2_` basename prefix; returns batch + remainder stem (no extension).
+/// Strip a `test1_`…`test4_` basename prefix; returns batch + remainder stem (no extension).
 pub fn strip_test_prefix(name: &str) -> (Option<TestBatch>, String) {
     let stem = std::path::Path::new(name)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(name);
-    if let Some(rest) = stem.strip_prefix(TestBatch::One.prefix()) {
-        (Some(TestBatch::One), rest.to_string())
-    } else if let Some(rest) = stem.strip_prefix(TestBatch::Two.prefix()) {
-        (Some(TestBatch::Two), rest.to_string())
-    } else {
-        (None, stem.to_string())
+    for batch in TestBatch::ALL {
+        if let Some(rest) = stem.strip_prefix(batch.prefix()) {
+            return (Some(batch), rest.to_string());
+        }
     }
+    (None, stem.to_string())
 }
 
 /// Source stem used for input↔output pairing (strips test prefixes when present).
@@ -530,7 +565,7 @@ impl OutputTargets {
         self.expected_name_for(input_name, has_alpha, None)
     }
 
-    /// Basename with optional test prefix: `test1_{stem}.{ext}` / `test2_{stem}.{ext}`.
+    /// Basename with optional test prefix: `testN_{stem}.{ext}`.
     pub fn expected_name_for(
         self,
         input_name: &str,
