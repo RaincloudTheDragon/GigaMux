@@ -142,6 +142,8 @@ fn deliver_path(
     container: OutContainer,
     batch: Option<TestBatch>,
 ) -> PathBuf {
+    // Last-dot only: `foo.ts.mp4` stem is `foo.ts` (a name with a dot, not a second extension).
+    // Do not use Path::with_extension on the stem — it would replace `.ts` and yield `foo.mp4`.
     let stem = input
         .file_stem()
         .and_then(|s| s.to_str())
@@ -150,7 +152,7 @@ fn deliver_path(
         Some(b) => format!("{}{stem}", b.prefix()),
         None => stem.to_string(),
     };
-    output_dir.join(file_stem).with_extension(container.ext())
+    output_dir.join(format!("{file_stem}.{}", container.ext()))
 }
 
 fn append_audio_args(cmd: &mut Vec<String>, input: &Path, info: &serde_json::Value, out: OutContainer) {
@@ -1293,4 +1295,31 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         bitrate_k,
         bitrate_label,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deliver_path_keeps_dots_in_stem() {
+        // Filesystems treat only the final suffix as the extension; so do we.
+        let out = deliver_path(
+            Path::new("in/sample.ts.mp4"),
+            Path::new("out"),
+            OutContainer::Mp4,
+            None,
+        );
+        assert_eq!(out.file_name().and_then(|s| s.to_str()), Some("sample.ts.mp4"));
+        let test = deliver_path(
+            Path::new("clip.ts.mp4"),
+            Path::new("out"),
+            OutContainer::Mp4,
+            Some(TestBatch::One),
+        );
+        assert_eq!(
+            test.file_name().and_then(|s| s.to_str()),
+            Some("test1_clip.ts.mp4")
+        );
+    }
 }
