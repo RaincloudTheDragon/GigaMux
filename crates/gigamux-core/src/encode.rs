@@ -9,6 +9,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::chunk::{
+    chunk_frame_range, estimate_total_frames, list_chunk_paths, parse_fps, write_ffconcat,
+    CHUNK_SEEK_PAD_S,
+};
 use crate::gpu::GpuChoice;
 use crate::job_log::{JobLog, JobLogKind};
 use crate::probe::{
@@ -22,6 +26,14 @@ use crate::targets::{
     TestBatch,
 };
 use crate::webm_alpha::{mux_vp9_alpha_webm, wants_qsv_alpha_hybrid};
+
+/// Frame-accurate farm chunk trim (video-only encode).
+#[derive(Debug, Clone, Copy)]
+struct ChunkTrim {
+    start_frame: u64,
+    frame_count: u64,
+    fps: f64,
+}
 
 /// Same family as check `INPUT_EXTS` — what the batch encoder will pick up.
 const VIDEO_EXTS: &[&str] = &[
@@ -101,6 +113,8 @@ pub struct FarmEncodeRequest {
     pub slot: EncodeSlot,
     /// `None` = normal deliver name; `Some` = `test1_` / `test2_` prefix.
     pub test_batch: Option<TestBatch>,
+    /// `1` = single full encode; `>1` = frame-chunked farm graph.
+    pub chunks: u32,
 }
 
 /// ffmpeg argv for a Flamenco `misc`/`exec` task (`argv[0]` is the program name).
@@ -109,6 +123,21 @@ pub struct FarmFfmpegCommand {
     pub output: PathBuf,
     /// Full argv including leading `"ffmpeg"` (or replacement exe basename).
     pub argv: Vec<String>,
+    pub bitrate_k: u32,
+    pub bitrate_label: String,
+}
+
+/// Chunked Flamenco job: N video-only encodes + concat + mux source audio.
+#[derive(Debug, Clone)]
+pub struct FarmChunkedJob {
+    pub final_output: PathBuf,
+    pub chunk_paths: Vec<PathBuf>,
+    pub encode_argvs: Vec<Vec<String>>,
+    pub concat_argv: Vec<String>,
+    pub mux_argv: Vec<String>,
+    /// Written by the submitter onto shared storage before POST.
+    pub ffconcat_path: PathBuf,
+    pub chunk_durations_s: Vec<f64>,
     pub bitrate_k: u32,
     pub bitrate_label: String,
 }
@@ -539,6 +568,7 @@ fn build_cmd(
     opaque_container: OutContainer,
     alpha_video: AlphaVideo,
     alpha_container: OutContainer,
+    chunk: Option<ChunkTrim>,
 ) -> Vec<String> {
     let ceiling = format!("{bitrate_k}k");
     let bufsize = format!("{}k", bitrate_k * 2);
@@ -550,6 +580,7 @@ fn build_cmd(
     };
     let use_nvenc = use_hardware && opaque_video.is_nvenc() && !has_alpha;
     let use_qsv = use_hardware && opaque_video.is_qsv() && !has_alpha;
+    let video_only = chunk.is_some();
 
     let mut cmd = vec![
         "ffmpeg".into(),
@@ -575,8 +606,28 @@ fn build_cmd(
             "libvpx".into()
         });
     }
-    cmd.push("-i".into());
-    cmd.push(input.to_string_lossy().into_owned());
+    // Frame-accurate chunk: rough -ss pad + post-decode trim + hard frame cap.
+    if let Some(tr) = chunk {
+        let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
+        let pre_frame = tr.start_frame.saturating_sub(pad_frames);
+        if pre_frame > 0 {
+            cmd.extend(["-ss".into(), format!("{:.6}", pre_frame as f64 / tr.fps)]);
+        }
+        cmd.push("-i".into());
+        cmd.push(input.to_string_lossy().into_owned());
+        let rel_start = tr.start_frame - pre_frame;
+        let rel_end = rel_start + tr.frame_count;
+        cmd.extend([
+            "-vf".into(),
+            format!("trim=start_frame={rel_start}:end_frame={rel_end},setpts=PTS-STARTPTS"),
+            "-an".into(),
+            "-map".into(),
+            "0:v:0".into(),
+        ]);
+    } else {
+        cmd.push("-i".into());
+        cmd.push(input.to_string_lossy().into_owned());
+    }
 
     let src_pix = video_pix_fmt(info);
     let out_pix = delivery_pix_fmt(&src_pix, has_alpha, use_hardware, opaque_video);
@@ -613,12 +664,16 @@ fn build_cmd(
             "-bufsize".into(),
             bufsize,
         ]);
-        append_audio_args(&mut cmd, input, info, out_container);
+        if !video_only {
+            append_audio_args(&mut cmd, input, info, out_container);
+        }
     } else if use_qsv {
         // QSV VP9 is VBR-only — no CQ/CRF knob; cq_override is ignored here.
         append_vp9_qsv_args(&mut cmd, out_pix, &ceiling, &bufsize);
         append_color_meta_args(&mut cmd, &video_color_meta(info));
-        append_audio_args(&mut cmd, input, info, out_container);
+        if !video_only {
+            append_audio_args(&mut cmd, input, info, out_container);
+        }
     } else if opaque_video.is_libvpx() {
         append_libvpx_opaque_args(
             &mut cmd,
@@ -627,7 +682,9 @@ fn build_cmd(
             &bufsize,
             cq,
         );
-        append_audio_args(&mut cmd, input, info, out_container);
+        if !video_only {
+            append_audio_args(&mut cmd, input, info, out_container);
+        }
     } else if !use_nvenc {
         // CPU HEVC/H.264/AV1 — keep source chroma/bit-depth; CRF capped at source ceiling.
         let enc = opaque_video.ffmpeg_encoder(false);
@@ -653,7 +710,9 @@ fn build_cmd(
             cmd.extend(["-preset".into(), "medium".into()]);
             append_x264_profile(&mut cmd, out_pix);
         }
-        append_audio_args(&mut cmd, input, info, out_container);
+        if !video_only {
+            append_audio_args(&mut cmd, input, info, out_container);
+        }
     } else {
         // NVENC: match source chroma/depth when the codec allows (no 4:2:2 on GeForce).
         cmd.extend([
@@ -685,10 +744,24 @@ fn build_cmd(
             bufsize,
         ]);
         append_nvenc_profile(&mut cmd, opaque_video, out_pix);
-        append_audio_args(&mut cmd, input, info, out_container);
+        if !video_only {
+            append_audio_args(&mut cmd, input, info, out_container);
+        }
     }
 
-    if preserve_obs {
+    if let Some(tr) = chunk {
+        let chunk_dur = tr.frame_count as f64 / tr.fps;
+        cmd.extend([
+            "-frames:v".into(),
+            tr.frame_count.to_string(),
+            "-t".into(),
+            format!("{chunk_dur:.6}"),
+            "-force_key_frames".into(),
+            "expr:eq(n,0)".into(),
+        ]);
+    }
+
+    if preserve_obs && !video_only {
         // Keep creation_time / chapters / tags from OBS Hybrid MP4 across re-encode.
         cmd.extend([
             "-map_metadata".into(),
@@ -1199,6 +1272,7 @@ pub fn run_batch(
                         slot.opaque_container,
                         slot.alpha_video,
                         slot.alpha_container,
+                        None,
                     );
                     run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
                 }
@@ -1218,6 +1292,7 @@ pub fn run_batch(
                 slot.opaque_container,
                 slot.alpha_video,
                 slot.alpha_container,
+                None,
             );
             run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
         };
@@ -1299,6 +1374,7 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         req.slot.opaque_container,
         req.slot.alpha_video,
         req.slot.alpha_container,
+        None,
     );
     farm_argv_never_overwrite(&mut argv);
     Ok(FarmFfmpegCommand {
@@ -1307,6 +1383,201 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         bitrate_k,
         bitrate_label,
     })
+}
+
+fn first_video_stream(info: &serde_json::Value) -> Option<&serde_json::Value> {
+    info.get("streams")?.as_array()?.iter().find(|s| {
+        s.get("codec_type").and_then(|v| v.as_str()) == Some("video")
+            || s.get("width").is_some()
+    })
+}
+
+fn probe_video_fps(info: &serde_json::Value) -> Option<f64> {
+    let v = first_video_stream(info)?;
+    let rate = v
+        .get("r_frame_rate")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("avg_frame_rate").and_then(|x| x.as_str()))?;
+    parse_fps(rate)
+}
+
+fn probe_nb_frames(info: &serde_json::Value) -> Option<u64> {
+    let v = first_video_stream(info)?;
+    v.get("nb_frames")
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+        .filter(|&n| n > 0)
+}
+
+/// Build N video-only chunk encodes + concat + mux for Flamenco (vod_chunkutil model).
+pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob, String> {
+    let chunks = req.chunks.max(2);
+    if !req.input.is_file() {
+        return Err(format!("input not found: {}", req.input.display()));
+    }
+    if !req.output_dir.is_dir() {
+        return Err(format!("output dir not found: {}", req.output_dir.display()));
+    }
+    let info = file_info(&req.input)?;
+    let has_alpha = video_has_alpha(&info);
+    if wants_qsv_alpha_hybrid(
+        req.slot.use_hardware,
+        has_alpha,
+        req.slot.alpha_video == AlphaVideo::Vp9,
+        req.slot.alpha_container == OutContainer::Webm,
+    ) {
+        return Err(
+            "Flamenco chunking cannot run QSV+libvpx alpha hybrid; turn off hardware for alpha or encode opaque"
+                .into(),
+        );
+    }
+    let fps = probe_video_fps(&info).ok_or_else(|| "cannot probe video fps for chunking".to_string())?;
+    let duration_s = format_duration_s(&info);
+    let total_frames = estimate_total_frames(duration_s, fps, probe_nb_frames(&info))
+        .ok_or_else(|| "cannot estimate frame count for chunking".to_string())?;
+    let container = req.slot.container_for(has_alpha);
+    let final_output = deliver_path(&req.input, &req.output_dir, container, req.test_batch);
+    let stem = final_output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+    let ext = container.ext();
+    let chunk_paths = list_chunk_paths(&req.output_dir, stem, chunks, ext);
+    let (auto_k, auto_label) = video_ceiling_k(&req.input, &info, req.use_peak_bitrate);
+    let (bitrate_k, bitrate_label) = match req.slot.maxrate_override_k.filter(|&k| k > 0) {
+        Some(k) => (k, format!("override {k}k (auto {auto_k}k / {auto_label})")),
+        None => (auto_k, auto_label),
+    };
+    let cq = req.slot.cq_override.unwrap_or(0);
+
+    let mut encode_argvs = Vec::with_capacity(chunks as usize);
+    let mut chunk_durations_s = Vec::with_capacity(chunks as usize);
+    for i in 0..chunks {
+        let (start_frame, frame_count) = chunk_frame_range(total_frames, i, chunks)?;
+        chunk_durations_s.push(frame_count as f64 / fps);
+        let mut argv = build_cmd(
+            &req.input,
+            &chunk_paths[i as usize],
+            &info,
+            has_alpha,
+            req.gpu,
+            bitrate_k,
+            cq,
+            false, // chunk encodes are video-only; metadata remux happens at mux
+            req.slot.use_hardware,
+            req.slot.opaque_video,
+            req.slot.opaque_container,
+            req.slot.alpha_video,
+            req.slot.alpha_container,
+            Some(ChunkTrim {
+                start_frame,
+                frame_count,
+                fps,
+            }),
+        );
+        farm_argv_never_overwrite(&mut argv);
+        encode_argvs.push(argv);
+    }
+
+    let ffconcat_path = req.output_dir.join(format!("{stem}.ffconcat"));
+    let vcat_path = req
+        .output_dir
+        .join(format!("{stem}.vcat.{}", container.ext()));
+    // Concat: stream-copy video only (chunks are -an).
+    let concat_argv = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-y".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        ffconcat_path.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-c".into(),
+        "copy".into(),
+        vcat_path.to_string_lossy().into_owned(),
+    ];
+    // Mux source audio onto concatenated video → final deliver.
+    let mut mux_argv = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-y".into(),
+        "-i".into(),
+        vcat_path.to_string_lossy().into_owned(),
+        "-i".into(),
+        req.input.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "1:a?".into(),
+        "-c:v".into(),
+        "copy".into(),
+    ];
+    let raw = audio_codec_name(&info);
+    if raw.is_empty() {
+        mux_argv.push("-an".into());
+    } else {
+        match audio_encode_for(&raw, container) {
+            AudioEncode::Copy => mux_argv.extend(["-c:a".into(), "copy".into()]),
+            AudioEncode::Aac => {
+                let a_k = audio_bitrate_k(&req.input);
+                mux_argv.extend([
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    format!("{a_k}k"),
+                ]);
+            }
+            AudioEncode::Opus => {
+                let a_k = audio_bitrate_k(&req.input);
+                mux_argv.extend([
+                    "-c:a".into(),
+                    "libopus".into(),
+                    "-b:a".into(),
+                    format!("{a_k}k"),
+                ]);
+            }
+        }
+    }
+    if req.preserve_obs_metadata {
+        mux_argv.extend([
+            "-map_metadata".into(),
+            "1".into(),
+            "-map_chapters".into(),
+            "1".into(),
+        ]);
+    }
+    mux_argv.extend([
+        "-avoid_negative_ts".into(),
+        "make_zero".into(),
+        final_output.to_string_lossy().into_owned(),
+    ]);
+    // Never overwrite an existing final deliver on the worker.
+    farm_argv_never_overwrite(&mut mux_argv);
+
+    Ok(FarmChunkedJob {
+        final_output,
+        chunk_paths,
+        encode_argvs,
+        concat_argv,
+        mux_argv,
+        ffconcat_path,
+        chunk_durations_s,
+        bitrate_k,
+        bitrate_label,
+    })
+}
+
+/// Write the job's ffconcat list (call before submit so workers see it on shared storage).
+pub fn write_farm_ffconcat(job: &FarmChunkedJob) -> Result<(), String> {
+    write_ffconcat(&job.chunk_paths, &job.chunk_durations_s, &job.ffconcat_path)
 }
 
 #[cfg(test)]

@@ -37,6 +37,21 @@ pub struct SubmittedJob {
     pub worker_tag: Option<String>,
 }
 
+fn flamenco_exe_and_tag(
+    ffmpeg_exe: Option<&str>,
+    worker_tag: Option<&str>,
+) -> (String, Option<String>) {
+    let exe = ffmpeg_exe
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ffmpeg")
+        .to_string();
+    let tag = worker_tag
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    (exe, tag)
+}
+
 /// One-file encode job for Flamenco (`GigaMux.js` → worker `exec` ffmpeg).
 pub fn make_gigamux_encode_job(
     name: impl Into<String>,
@@ -48,20 +63,58 @@ pub fn make_gigamux_encode_job(
         return Err("ffmpeg argv is empty".into());
     }
     // argv[0] is the logical program name; worker uses settings.ffmpeg_exe (or "ffmpeg").
-    let exe = ffmpeg_exe
-        .filter(|s| !s.is_empty())
-        .unwrap_or("ffmpeg")
-        .to_string();
+    let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
     let argv_json =
         serde_json::to_string(&ffmpeg_argv).map_err(|e| format!("serialize ffmpeg argv: {e}"))?;
+    // Also set encode_argvs_json (length 1) so newer GigaMux.js prefers the array form.
+    let encode_argvs_json = serde_json::to_string(&vec![ffmpeg_argv])
+        .map_err(|e| format!("serialize encode_argvs: {e}"))?;
     let settings = json!({
         "ffmpeg_exe": exe,
         "ffmpeg_argv_json": argv_json,
+        "encode_argvs_json": encode_argvs_json,
+        "concat_argv_json": "",
+        "mux_argv_json": "",
     });
-    let tag = worker_tag
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    Ok(SubmittedJob {
+        name: name.into(),
+        job_type: "GigaMux".into(),
+        submitter_platform: "windows".into(),
+        priority: 50,
+        settings,
+        worker_tag: tag,
+    })
+}
+
+/// Chunked encode job: N video-only encodes + concat + mux (GigaMux.js task graph).
+pub fn make_gigamux_chunked_job(
+    name: impl Into<String>,
+    ffmpeg_exe: Option<&str>,
+    encode_argvs: &[Vec<String>],
+    concat_argv: &[String],
+    mux_argv: &[String],
+    worker_tag: Option<&str>,
+) -> Result<SubmittedJob, String> {
+    if encode_argvs.is_empty() {
+        return Err("encode_argvs is empty".into());
+    }
+    if concat_argv.is_empty() || mux_argv.is_empty() {
+        return Err("chunked job requires concat_argv and mux_argv".into());
+    }
+    let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
+    let encode_argvs_json = serde_json::to_string(encode_argvs)
+        .map_err(|e| format!("serialize encode_argvs: {e}"))?;
+    let concat_argv_json =
+        serde_json::to_string(concat_argv).map_err(|e| format!("serialize concat_argv: {e}"))?;
+    let mux_argv_json =
+        serde_json::to_string(mux_argv).map_err(|e| format!("serialize mux_argv: {e}"))?;
+    let settings = json!({
+        "ffmpeg_exe": exe,
+        "encode_argvs_json": encode_argvs_json,
+        "concat_argv_json": concat_argv_json,
+        "mux_argv_json": mux_argv_json,
+        "ffmpeg_argv_json": "",
+    });
     Ok(SubmittedJob {
         name: name.into(),
         job_type: "GigaMux".into(),
@@ -80,21 +133,44 @@ fn manager_base(url: &str) -> Result<String, String> {
     Ok(base.to_string())
 }
 
+/// Read ureq response text; on HTTP error statuses ureq returns `Error::Status` with the body.
+fn flamenco_http_text(result: Result<ureq::Response, ureq::Error>) -> Result<(u16, String), String> {
+    match result {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp
+                .into_string()
+                .map_err(|e| format!("Flamenco response read: {e}"))?;
+            Ok((status, text))
+        }
+        // ureq 2: non-2xx becomes Err(Status) — still extract the Manager message.
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Ok((code, text))
+        }
+        Err(e) => Err(format!("Flamenco submit: {e}")),
+    }
+}
+
 /// POST a job to Flamenco Manager. Returns the job id from the response when present.
 pub fn submit_job(manager_url: &str, job: &SubmittedJob) -> Result<String, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/jobs");
     let body = serde_json::to_vec(job).map_err(|e| format!("serialize job: {e}"))?;
-    let resp = ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .send_bytes(&body)
-        .map_err(|e| format!("Flamenco submit: {e}"))?;
-    let status = resp.status();
-    let text = resp
-        .into_string()
-        .map_err(|e| format!("Flamenco response read: {e}"))?;
+    let (status, text) = flamenco_http_text(
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_bytes(&body),
+    )?;
     if !(200..300).contains(&status) {
-        return Err(format!("Flamenco HTTP {status}: {text}"));
+        // Truncate huge bodies but keep compileJob errors readable.
+        let snippet: String = text.chars().take(500).collect();
+        let hint = if snippet.contains("ffmpeg_argv_json is required") {
+            " (Manager still has old GigaMux.js — Settings → Files → Deploy GigaMux.js…)"
+        } else {
+            ""
+        };
+        return Err(format!("Flamenco HTTP {status}: {snippet}{hint}"));
     }
     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     let id = v

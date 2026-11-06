@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Unlicense
-// Job type GigaMux: one misc/exec ffmpeg task; argv from the GigaMux submitter.
+// Job type GigaMux: ffmpeg argv(s) from the GigaMux submitter.
+// Single file: one misc/exec. Chunked: N encode tasks + concat (depends on all) with mux.
 // Deploy via Settings → Files → Deploy GigaMux.js… (or copy into Manager scripts/).
 
 const JOB_TYPE = {
@@ -14,33 +15,121 @@ const JOB_TYPE = {
             description: "ffmpeg binary on the worker (PATH name or absolute path)",
         },
         {
+            key: "encode_argvs_json",
+            type: "string",
+            required: false,
+            default: "",
+            description: "JSON array of argv arrays (each includes leading program name). Length 1 = single encode.",
+        },
+        {
+            key: "concat_argv_json",
+            type: "string",
+            required: false,
+            default: "",
+            description: "JSON argv for ffconcat video join (empty when not chunking)",
+        },
+        {
+            key: "mux_argv_json",
+            type: "string",
+            required: false,
+            default: "",
+            description: "JSON argv to mux source audio onto concatenated video (empty when not chunking)",
+        },
+        {
             key: "ffmpeg_argv_json",
             type: "string",
-            required: true,
-            description: "JSON array: full ffmpeg argv including leading program name",
+            required: false,
+            default: "",
+            description: "Legacy single argv JSON (used when encode_argvs_json is empty)",
         },
     ],
 };
 
-function compileJob(job) {
-    const settings = job.settings;
-    const exe = settings.ffmpeg_exe || "ffmpeg";
-    const raw = settings.ffmpeg_argv_json;
-    if (typeof raw !== "string" || raw.length === 0) {
-        throw "GigaMux: ffmpeg_argv_json is required";
+function parseArgvJson(raw, label) {
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+        return null;
     }
     const argv = JSON.parse(raw);
     if (!Array.isArray(argv) || argv.length === 0) {
-        throw "GigaMux: ffmpeg_argv_json must be a non-empty JSON array";
+        throw "GigaMux: " + label + " must be a non-empty JSON array";
     }
-    const args = argv.slice(1);
+    return argv;
+}
 
-    print("GigaMux compileJob: exe=", exe, " nargs=", args.length);
+function execArgsFromArgv(argv) {
+    // argv[0] is logical program name; worker uses settings.ffmpeg_exe.
+    return argv.slice(1);
+}
 
-    const task = author.Task("encode", "misc");
-    task.addCommand(author.Command("exec", {
-        exe: exe,
-        args: args,
-    }));
-    job.addTask(task);
+function compileJob(job) {
+    const settings = job.settings;
+    const exe = settings.ffmpeg_exe || "ffmpeg";
+
+    let encodeArgvs = null;
+    const encRaw = settings.encode_argvs_json;
+    if (typeof encRaw === "string" && encRaw.trim().length > 0) {
+        const parsed = JSON.parse(encRaw);
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+            throw "GigaMux: encode_argvs_json must be a non-empty JSON array of argv arrays";
+        }
+        encodeArgvs = parsed;
+    } else {
+        // Legacy single-task payload.
+        const legacy = parseArgvJson(settings.ffmpeg_argv_json, "ffmpeg_argv_json");
+        if (!legacy) {
+            throw "GigaMux: encode_argvs_json or ffmpeg_argv_json is required";
+        }
+        encodeArgvs = [legacy];
+    }
+
+    const concatArgv = parseArgvJson(settings.concat_argv_json, "concat_argv_json");
+    const muxArgv = parseArgvJson(settings.mux_argv_json, "mux_argv_json");
+    const chunked = concatArgv !== null && muxArgv !== null;
+
+    print(
+        "GigaMux compileJob: exe=",
+        exe,
+        " encodes=",
+        encodeArgvs.length,
+        " chunked=",
+        chunked
+    );
+
+    const encodeTasks = [];
+    for (let i = 0; i < encodeArgvs.length; i++) {
+        const argv = encodeArgvs[i];
+        if (!Array.isArray(argv) || argv.length === 0) {
+            throw "GigaMux: encode argv " + i + " is empty";
+        }
+        const name = encodeArgvs.length === 1 ? "encode" : "encode-c" + i;
+        const task = author.Task(name, "misc");
+        task.addCommand(
+            author.Command("exec", {
+                exe: exe,
+                args: execArgsFromArgv(argv),
+            })
+        );
+        job.addTask(task);
+        encodeTasks.push(task);
+    }
+
+    if (chunked) {
+        const concatTask = author.Task("concat", "misc");
+        concatTask.addCommand(
+            author.Command("exec", {
+                exe: exe,
+                args: execArgsFromArgv(concatArgv),
+            })
+        );
+        concatTask.addCommand(
+            author.Command("exec", {
+                exe: exe,
+                args: execArgsFromArgv(muxArgv),
+            })
+        );
+        for (const t of encodeTasks) {
+            concatTask.addDependency(t);
+        }
+        job.addTask(concatTask);
+    }
 }

@@ -1,6 +1,7 @@
 //! GigaMux core — prefs, GPU probe, encode batch, check (no UI).
 
 pub mod check;
+pub mod chunk;
 pub mod encode;
 pub mod ffmpeg_active;
 pub mod flamenco;
@@ -19,15 +20,16 @@ pub use check::{
     issue_has_deletable_output, list_media, permanent_delete_file, restore_trashed_file, run_check,
     trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
+pub use chunk::{chunk_time_range, estimate_total_frames, parse_fps};
 pub use encode::{
-    build_farm_ffmpeg_argv, run_batch, EncodeEvent, EncodeOptions, FarmEncodeRequest,
-    FarmFfmpegCommand,
+    build_farm_chunked_job, build_farm_ffmpeg_argv, run_batch, write_farm_ffconcat, EncodeEvent,
+    EncodeOptions, FarmChunkedJob, FarmEncodeRequest, FarmFfmpegCommand,
 };
 pub use ffmpeg_active::{active_ffmpeg_pid, ActiveFfmpegGuard};
 pub use flamenco::{
     deploy_gigamux_js, discover_manager, ensure_worker_tags, fetch_worker_tags,
-    make_gigamux_encode_job, ping_manager, scripts_dir_from_manager_install, submit_job,
-    SubmittedJob, GIGAMUX_JS, REQUIRED_WORKER_TAGS,
+    make_gigamux_chunked_job, make_gigamux_encode_job, ping_manager,
+    scripts_dir_from_manager_install, submit_job, SubmittedJob, GIGAMUX_JS, REQUIRED_WORKER_TAGS,
 };
 pub use job_log::{
     encode_event_line, encode_logs_dir, job_logs_dir, vmaf_event_line, EncodeJobLog, JobLog,

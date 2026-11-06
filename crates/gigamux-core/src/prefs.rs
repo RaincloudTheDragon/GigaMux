@@ -147,6 +147,19 @@ pub struct Prefs {
     /// Absolute path to ffmpeg on workers, or `ffmpeg` for PATH/tools. Empty → `ffmpeg`.
     #[serde(default)]
     pub flamenco_ffmpeg_exe: String,
+    /// Flamenco sender: enable frame chunking (N encode tasks + concat/mux). Default off.
+    #[serde(default)]
+    pub flamenco_chunking: bool,
+    /// Chunk count when chunking is on (clamped 2..=32). Default 4.
+    #[serde(default = "default_flamenco_chunks")]
+    pub flamenco_chunks: u32,
+    /// When chunking: only apply to software / alpha paths; HW opaque stays single-task. Default on.
+    #[serde(default = "default_true")]
+    pub flamenco_only_chunk_software: bool,
+}
+
+fn default_flamenco_chunks() -> u32 {
+    4
 }
 
 impl Default for Prefs {
@@ -173,6 +186,9 @@ impl Default for Prefs {
             flamenco_scripts_dir: String::new(),
             flamenco_worker_tag: String::new(),
             flamenco_ffmpeg_exe: String::new(),
+            flamenco_chunking: false,
+            flamenco_chunks: 4,
+            flamenco_only_chunk_software: true,
         }
     }
 }

@@ -48,11 +48,24 @@ Assign workers to those tags in Flamenco after probing. Submit with **Worker tag
 ## Job type
 
 - Script: [`flamenco/GigaMux.js`](../flamenco/GigaMux.js) (also embedded in the app for Deploy)
-- v0 graph: one `misc` task, one `exec` of `ffmpeg` + argv JSON from the UI
+- Single encode: one `misc`/`exec` task (`encode_argvs_json` length 1, or legacy `ffmpeg_argv_json`)
+- Chunked encode (sender option): `encode-c0`…`encode-cN` (video-only frame slices) → `concat` task (ffconcat join + mux source audio). Chunk files are named `{stem}.c000of004.{ext}` (Check already ignores these). The submitter writes the `.ffconcat` onto shared storage before POST so workers need no probe.
 
-## Limitations (v0)
+When GigaMux ships a newer bundled `GigaMux.js`, redeploy it to the Manager via **Settings → Files → Deploy GigaMux.js…**. The Manager keeps its own copy until you do this, and GigaMux will not be able to submit jobs.
 
-- No chunk/concat graph yet (local encode also has no chunking on main).
-- QSV+libvpx alpha hybrid is multi-ffmpeg locally. Flamenco submit refuses that combo until a multi-task graph exists; use software alpha or opaque.
+### Sender chunk options
+
+| Control | Default | Behavior |
+|---------|---------|----------|
+| Chunk encode | off | N equal frame ranges (`2`–`32`), then concat/mux |
+| Only chunk software | on | HW opaque paths stay single-task; software/alpha still chunk |
+
+Skip if the final deliver already exists. Chunk encodes and mux use ffmpeg `-n` (never overwrite).
+
+## Limitations
+
+- Local (non-Flamenco) encode has no chunking.
+- QSV+libvpx alpha hybrid is refused for chunked farm jobs; use software alpha or opaque.
+- No seam-scan on the farm (Python-only locally today).
 - Farm VMAF only after workers with `libvmaf` are tagged and confirmed.
 - SSDP Find does not configure Manager; URL is written to prefs when a Manager answers `/api/v3/version`.

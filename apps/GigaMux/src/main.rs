@@ -20,12 +20,14 @@ use gigamux_core::check::{
     issue_has_deletable_output, list_media, permanent_delete_file, restore_trashed_file, run_check,
     trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
+use gigamux_core::chunk::chunk_time_range;
 use gigamux_core::encode::{
-    build_farm_ffmpeg_argv, run_batch, EncodeEvent, EncodeOptions, FarmEncodeRequest,
+    build_farm_chunked_job, build_farm_ffmpeg_argv, run_batch, write_farm_ffconcat, EncodeEvent,
+    EncodeOptions, FarmEncodeRequest,
 };
 use gigamux_core::flamenco::{
-    deploy_gigamux_js, discover_manager, ensure_worker_tags, make_gigamux_encode_job,
-    scripts_dir_from_manager_install, submit_job, REQUIRED_WORKER_TAGS,
+    deploy_gigamux_js, discover_manager, ensure_worker_tags, make_gigamux_chunked_job,
+    make_gigamux_encode_job, scripts_dir_from_manager_install, submit_job, REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::active_ffmpeg_pid;
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
@@ -36,10 +38,10 @@ use gigamux_core::job_log;
 use gigamux_core::prefs::{self, EncodeSlot, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
-    codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
-    media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag, rate_mode_heat,
-    size_delta, thumbnail_rgba, truncate_cli_err, FrameTiming, MediaSummary, RgbaThumb, SizeDelta,
-    THUMB_W,
+    codec_heat, codec_tag, container_heat, enrich_summary_bitrates, file_info, format_bytes,
+    format_length, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,
+    rate_mode_heat, size_delta, thumbnail_rgba, truncate_cli_err, video_has_alpha, FrameTiming,
+    MediaSummary, RgbaThumb, SizeDelta, THUMB_W,
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container, pair_stem,
@@ -580,6 +582,16 @@ struct FlamencoSubmitPrompt {
     worker_tag: String,
     /// Draft ffmpeg exe on workers (seeded from prefs; written back on Submit).
     ffmpeg_exe: String,
+    /// Enable frame chunking (N encode + concat/mux).
+    chunking: bool,
+    /// Chunk count when `chunking` (2..=32).
+    chunks: u32,
+    /// Only chunk software/alpha paths; HW opaque stays single-task.
+    only_chunk_software: bool,
+    /// Duration (s) of the first selected input for the chunk estimate label.
+    estimate_duration_s: f64,
+    /// Basename used for the estimate label.
+    estimate_name: String,
 }
 
 /// Alt-at-launch purge chooser (which prefs slices + optional logs).
@@ -1846,6 +1858,9 @@ impl GigaMuxApp {
             self.prefs.flamenco_scripts_dir = d.flamenco_scripts_dir;
             self.prefs.flamenco_worker_tag = d.flamenco_worker_tag;
             self.prefs.flamenco_ffmpeg_exe = d.flamenco_ffmpeg_exe;
+            self.prefs.flamenco_chunking = d.flamenco_chunking;
+            self.prefs.flamenco_chunks = d.flamenco_chunks;
+            self.prefs.flamenco_only_chunk_software = d.flamenco_only_chunk_software;
             touched_prefs = true;
             parts.push("misc".into());
         }
@@ -1914,11 +1929,46 @@ impl GigaMuxApp {
             self.log_open = true;
             return;
         }
+        let (estimate_name, estimate_duration_s) = names
+            .first()
+            .map(|n| {
+                let p = self.prefs.input_dir.join(n);
+                let dur = file_info(&p)
+                    .ok()
+                    .map(|info| {
+                        info.pointer("/format/duration")
+                            .and_then(|v| {
+                                v.as_f64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
+                            .unwrap_or(0.0)
+                    })
+                    .unwrap_or(0.0);
+                (n.clone(), dur)
+            })
+            .unwrap_or_default();
         self.pending_flamenco = Some(FlamencoSubmitPrompt {
             names,
             worker_tag: self.prefs.flamenco_worker_tag.clone(),
             ffmpeg_exe: self.prefs.flamenco_ffmpeg_exe.clone(),
+            chunking: self.prefs.flamenco_chunking,
+            chunks: self.prefs.flamenco_chunks.clamp(2, 32),
+            only_chunk_software: self.prefs.flamenco_only_chunk_software,
+            estimate_duration_s,
+            estimate_name,
         });
+    }
+
+    /// True when farm encode for this input would use HW opaque (not alpha / not CPU).
+    fn farm_path_is_hw_opaque(&self, input: &Path, slot: &EncodeSlot) -> bool {
+        let Ok(info) = file_info(input) else {
+            return slot.use_hardware
+                && (slot.opaque_video.is_nvenc() || slot.opaque_video.is_qsv());
+        };
+        if video_has_alpha(&info) {
+            return false;
+        }
+        slot.use_hardware && (slot.opaque_video.is_nvenc() || slot.opaque_video.is_qsv())
     }
 
     /// Submit the given inputs to Flamenco (one job each; stock worker `exec` via `GigaMux.js`).
@@ -1965,6 +2015,9 @@ impl GigaMuxApp {
         };
         let exe = exe_owned.as_deref();
         let tag = tag_owned.as_deref();
+        let want_chunk = self.prefs.flamenco_chunking;
+        let chunk_n = self.prefs.flamenco_chunks.clamp(2, 32);
+        let only_soft = self.prefs.flamenco_only_chunk_software;
         let mut ok = 0usize;
         let mut skipped = 0usize;
         let mut failed = 0usize;
@@ -1975,16 +2028,80 @@ impl GigaMuxApp {
                 failed += 1;
                 continue;
             }
+            let hw_opaque = self.farm_path_is_hw_opaque(&input, &slot);
+            let use_chunks = want_chunk && !(only_soft && hw_opaque);
             let farm = FarmEncodeRequest {
-                input,
+                input: input.clone(),
                 output_dir: self.prefs.output_dir.clone(),
                 gpu: self.prefs.gpu,
                 preserve_obs_metadata: self.prefs.preserve_obs_metadata,
                 use_peak_bitrate: self.prefs.use_peak_bitrate,
                 slot: slot.clone(),
-                // Farm v0: one full deliver (not testN_ multi-slot).
+                // Farm: one full deliver (not testN_ multi-slot).
                 test_batch: None,
+                chunks: if use_chunks { chunk_n } else { 1 },
             };
+
+            if use_chunks {
+                let job_built = match build_farm_chunked_job(&farm) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        self.push_session(format!("Flamenco chunk argv: {e}"));
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let out_name = job_built
+                    .final_output
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| job_built.final_output.display().to_string());
+                if job_built.final_output.is_file() {
+                    self.push_session(format!("Flamenco skip (exists): {out_name}"));
+                    skipped += 1;
+                    continue;
+                }
+                if let Err(e) = write_farm_ffconcat(&job_built) {
+                    self.push_session(format!("Flamenco ffconcat: {e}"));
+                    failed += 1;
+                    continue;
+                }
+                let job = match make_gigamux_chunked_job(
+                    format!("GigaMux {name}"),
+                    exe,
+                    &job_built.encode_argvs,
+                    &job_built.concat_argv,
+                    &job_built.mux_argv,
+                    tag,
+                ) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        self.push_session(format!("Flamenco job: {e}"));
+                        failed += 1;
+                        continue;
+                    }
+                };
+                match submit_job(&url, &job) {
+                    Ok(id) => {
+                        self.push_session(format!(
+                            "Flamenco submitted: job {id}; {name} → {out_name} ({} chunks, {}k / {})",
+                            chunk_n, job_built.bitrate_k, job_built.bitrate_label
+                        ));
+                        ok += 1;
+                    }
+                    Err(e) => {
+                        self.push_session(format!("Flamenco submit failed ({name}): {e}"));
+                        failed += 1;
+                    }
+                }
+                continue;
+            }
+
+            if want_chunk && only_soft && hw_opaque {
+                self.push_session(format!(
+                    "Flamenco: {name} HW opaque — single encode (only-chunk-software)"
+                ));
+            }
             let cmd = match build_farm_ffmpeg_argv(&farm) {
                 Ok(c) => c,
                 Err(e) => {
@@ -6164,16 +6281,47 @@ impl GigaMuxApp {
                         .desired_width(280.0)
                         .hint_text("ffmpeg or absolute path"),
                 );
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("More sender options will land here (priority, chunking, …).")
-                        .weak()
-                        .small(),
-                );
+                ui.add_space(8.0);
+
+                ui.checkbox(&mut prompt.chunking, "Chunk encode (N workers → concat → mux)");
+                if prompt.chunking {
+                    ui.horizontal(|ui| {
+                        ui.label("Chunks");
+                        ui.add(egui::Slider::new(&mut prompt.chunks, 2..=32));
+                    });
+                    if prompt.estimate_duration_s > 0.0 {
+                        // Equal time slices for the label; last chunk absorbs remainder frames.
+                        let (_, per) =
+                            chunk_time_range(prompt.estimate_duration_s, 0, prompt.chunks)
+                                .unwrap_or((0.0, prompt.estimate_duration_s / prompt.chunks as f64));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "≈ {} per chunk from {} (last may be longer)",
+                                format_length(per),
+                                prompt.estimate_name
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("duration unknown for estimate")
+                                .weak()
+                                .small(),
+                        );
+                    }
+                    ui.checkbox(
+                        &mut prompt.only_chunk_software,
+                        "Only chunk software (HW opaque stays single)",
+                    );
+                }
 
                 if let Some(p) = self.pending_flamenco.as_mut() {
                     p.worker_tag = prompt.worker_tag.clone();
                     p.ffmpeg_exe = prompt.ffmpeg_exe.clone();
+                    p.chunking = prompt.chunking;
+                    p.chunks = prompt.chunks.clamp(2, 32);
+                    p.only_chunk_software = prompt.only_chunk_software;
                 }
 
                 ui.add_space(10.0);
@@ -6192,6 +6340,9 @@ impl GigaMuxApp {
                     {
                         self.prefs.flamenco_worker_tag = prompt.worker_tag.trim().to_string();
                         self.prefs.flamenco_ffmpeg_exe = prompt.ffmpeg_exe.trim().to_string();
+                        self.prefs.flamenco_chunking = prompt.chunking;
+                        self.prefs.flamenco_chunks = prompt.chunks.clamp(2, 32);
+                        self.prefs.flamenco_only_chunk_software = prompt.only_chunk_software;
                         let _ = prefs::save(&self.prefs);
                         let names = prompt.names;
                         self.pending_flamenco = None;
