@@ -36,7 +36,7 @@ Your codec choices in GigaMux:
 
 - Windows desktop app (egui shell in this repo).
 - `ffmpeg` on `PATH`. Encoding works with a normal build; **VMAF** needs a full build that includes the `libvmaf` filter (e.g. [gyan.dev full](https://www.gyan.dev/ffmpeg/builds/)).
-- Hardware encode (NVENC / QSV where available) is optional; software encoders are always selectable.
+- Hardware encode (NVENC / QSV where available) is optional; software encoders are always selectable. GigaMux probes NVENC Compute SM → generation (and QSV when present). With **multiple** NVENC GPUs, each Targets row (including each test slot) can pick a different device/gen. Optional **Write encoder metadata** (default on) stamps `GigaMux_encoder` / `GigaMux_hw` into outputs.
 
 ### Quick start
 
@@ -53,7 +53,7 @@ Enable **Test mode** on the Output path row (next to Change…). Choose **2–4 
 
 - `test1_{stem}.{ext}` … `test4_{stem}.{ext}` for the active slot count
 
-The Output column shows a compare strip (size Δ vs the original input; VMAF score vs input with ↑/↓ vs Test1) and a scrollable list of collapsing panels per slot, each with independent codec, container, hardware, and Maxrate. Use this to A/B Maxrate caps (e.g. HEVC on Test1 vs AV1 + ~18000 kbps on Test2) before a full batch; see [Comparing NVENC AV1 and HEVC](docs/codec-efficiency.md).
+The Output column shows a compare strip (size Δ vs the original input; VMAF score vs input with ↑/↓ vs Test1) and a scrollable list of collapsing panels per slot, each with independent codec, container, hardware, Maxrate, and (when multi-GPU) NVENC device/generation. Use this to A/B Maxrate caps or GPU gens (e.g. HEVC on Test1 vs AV1 + ~18000 kbps on Test2) before a full batch; see [Comparing NVENC AV1 and HEVC](docs/codec-efficiency.md). Local GPU pick only — farm worker-gen tags are separate.
 
 Navigation while Test mode is on (Output list):
 

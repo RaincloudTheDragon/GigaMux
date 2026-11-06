@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use gigamux_core::encode::{run_batch, EncodeEvent, EncodeOptions};
-use gigamux_core::gpu::GpuChoice;
+use gigamux_core::gpu::{probe_local_encoders, GpuChoice};
 use gigamux_core::prefs::EncodeSlot;
 
 fn main() {
@@ -17,7 +17,9 @@ fn main() {
         input_dir: input,
         output_dir: output,
         gpu: GpuChoice::Any,
+        hw: probe_local_encoders(),
         preserve_obs_metadata: false,
+        write_encoder_metadata: true,
         use_peak_bitrate: false,
         test_mode: false,
         test_slot_count: 2,

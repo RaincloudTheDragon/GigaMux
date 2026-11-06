@@ -33,9 +33,7 @@ use gigamux_core::flamenco::{
 };
 use gigamux_core::ffmpeg_active::active_ffmpeg_pid;
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
-use gigamux_core::gpu::{
-    list_av1_nvenc_devices, list_nvenc_devices, qsv_vp9_available, GpuChoice, NvencDevice,
-};
+use gigamux_core::gpu::{probe_local_encoders, GpuChoice, HwCatalog};
 use gigamux_core::job_log;
 use gigamux_core::prefs::{self, EncodeSlot, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
@@ -282,11 +280,8 @@ struct GigaMuxApp {
     test_nav_prefer: TestBatch,
     /// After Shift sibling/pair jump: scroll this Output test-slot header into view once.
     focus_out_test_slot: Option<TestBatch>,
-    devices: Vec<NvencDevice>,
-    /// GPUs that can open `av1_nvenc` (empty on pre-Ada / no AV1 NVENC).
-    av1_devices: Vec<NvencDevice>,
-    /// Intel QSV can open `vp9_qsv` (false on AMD / Intel F / no capable iGPU).
-    qsv_available: bool,
+    /// Local NVENC/QSV probe (generation, AV1 smoke, QSV name).
+    hw: HwCatalog,
     /// This ffmpeg build exposes the `libvmaf` filter (probed once at launch).
     vmaf_available: bool,
     gpu_warn: Option<String>,
@@ -657,21 +652,10 @@ impl PurgePrompt {
 impl GigaMuxApp {
     fn new(ask_purge_prefs: bool) -> Self {
         let mut prefs = prefs::load();
-        let devices = match list_nvenc_devices() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("NVENC probe: {e}");
-                Vec::new()
-            }
-        };
-        // Real one-frame smoke — `-gpu list` falsely reports AV1 on pre-Ada cards.
-        let av1_devices = list_av1_nvenc_devices(&devices);
-        // Same idea for QSV: device present ≠ `vp9_qsv` encode works.
-        let qsv_available = qsv_vp9_available();
+        let hw = probe_local_encoders();
         // ffmpeg `-filters` probe — avoid spawning every frame for greyed VMAF controls.
         let vmaf_available = libvmaf_available();
-        let (gpu, warn) = prefs.gpu.sanitize(&devices);
-        prefs.gpu = gpu;
+        let warn = prefs.sanitize_slot_gpus(&hw.nvenc);
         // Opaque VP8 has no HW path: UI greys the checkbox but keeps the prefs flag.
         let (maxrate_override_edit, cq_override_edit) = Self::draft_edits_from_prefs(&prefs);
         let mut app = Self {
@@ -680,9 +664,7 @@ impl GigaMuxApp {
             cq_override_edit,
             test_nav_prefer: TestBatch::One,
             focus_out_test_slot: None,
-            devices,
-            av1_devices,
-            qsv_available,
+            hw,
             vmaf_available,
             gpu_warn: warn,
             input_files: Vec::new(),
@@ -737,11 +719,20 @@ impl GigaMuxApp {
         app.refresh_lists();
         let started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         app.push_session(format!("—— session start {started} ——"));
+        // Probe is RAM-only (no disk cache); log what we saw at launch.
+        app.push_session(format!("HW probe (launch): {}", app.hw.summary_line()));
         // Pref on at launch: one immediate idle pass, then 5m/1h cadence after each finish.
         if app.prefs.auto_vmaf_when_idle {
             app.schedule_auto_vmaf(Duration::ZERO);
         }
         app
+    }
+
+    /// Live re-probe NVENC/QSV into RAM + session log. Never trust a prior snapshot.
+    fn refresh_hw_probe(&mut self, why: &str) {
+        self.hw = probe_local_encoders();
+        self.gpu_warn = self.prefs.sanitize_slot_gpus(&self.hw.nvenc);
+        self.push_session(format!("HW probe ({why}): {}", self.hw.summary_line()));
     }
 
     fn clear_active(&mut self) {
@@ -1886,12 +1877,11 @@ impl GigaMuxApp {
             match prefs::import_profile(&path) {
                 Ok(mut p) => {
                     p.sanitize_targets();
-                    let (gpu, warn) = p.gpu.sanitize(&self.devices);
-                    self.prefs = Prefs { gpu, ..p };
+                    self.gpu_warn = p.sanitize_slot_gpus(&self.hw.nvenc);
+                    self.prefs = p;
                     let (maxrate, cq) = Self::draft_edits_from_prefs(&self.prefs);
                     self.maxrate_override_edit = maxrate;
                     self.cq_override_edit = cq;
-                    self.gpu_warn = warn;
                     let _ = prefs::save(&self.prefs);
                     self.refresh_lists();
                     self.push_session(format!("imported profile ← {}", path.display()));
@@ -1931,7 +1921,10 @@ impl GigaMuxApp {
             self.prefs.slot2.use_hardware = d.slot2.use_hardware;
             self.prefs.slot3.use_hardware = d.slot3.use_hardware;
             self.prefs.slot4.use_hardware = d.slot4.use_hardware;
-            self.prefs.gpu = d.gpu;
+            self.prefs.slot1.gpu = d.slot1.gpu;
+            self.prefs.slot2.gpu = d.slot2.gpu;
+            self.prefs.slot3.gpu = d.slot3.gpu;
+            self.prefs.slot4.gpu = d.slot4.gpu;
             touched_prefs = true;
             parts.push("hardware".into());
         }
@@ -1948,6 +1941,7 @@ impl GigaMuxApp {
         }
         if p.misc {
             self.prefs.preserve_obs_metadata = d.preserve_obs_metadata;
+            self.prefs.write_encoder_metadata = d.write_encoder_metadata;
             self.prefs.warn_recycle_delete = d.warn_recycle_delete;
             self.prefs.warn_permanent_delete = d.warn_permanent_delete;
             self.prefs.job_done_chime = d.job_done_chime;
@@ -1968,9 +1962,7 @@ impl GigaMuxApp {
         }
         if touched_prefs {
             self.prefs.sanitize_targets();
-            let (gpu, warn) = self.prefs.gpu.sanitize(&self.devices);
-            self.prefs.gpu = gpu;
-            self.gpu_warn = warn;
+            self.gpu_warn = self.prefs.sanitize_slot_gpus(&self.hw.nvenc);
             let _ = prefs::save(&self.prefs);
             if p.folders {
                 self.clear_active();
@@ -2108,6 +2100,8 @@ impl GigaMuxApp {
             );
             return;
         }
+        // Local HW catalog is only for argv metadata / path checks — still re-probe.
+        self.refresh_hw_probe("flamenco");
         // Effective HW for this machine (same as local encode mute); shared across the batch.
         let mut slot = self.prefs.slot1.clone();
         slot.use_hardware = self.effective_use_hardware_for(&slot);
@@ -2187,8 +2181,10 @@ impl GigaMuxApp {
             let farm = FarmEncodeRequest {
                 input: input.clone(),
                 output_dir: self.prefs.output_dir.clone(),
-                gpu: self.prefs.gpu,
+                gpu: slot.gpu,
+                hw: self.hw.clone(),
                 preserve_obs_metadata: self.prefs.preserve_obs_metadata,
+                write_encoder_metadata: self.prefs.write_encoder_metadata,
                 use_peak_bitrate: self.prefs.use_peak_bitrate,
                 slot: slot.clone(),
                 // Farm: one full deliver (not testN_ multi-slot).
@@ -2344,6 +2340,8 @@ impl GigaMuxApp {
 
     /// Spawn the encode worker (caller already cleared folder guards).
     fn start_encode_now(&mut self, only_name: Option<String>) {
+        // Hardware can change mid-session — re-probe; do not reuse a stale catalog.
+        self.refresh_hw_probe("encode");
         let _ = prefs::save(&self.prefs);
         self.cancel.store(false, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
@@ -2359,8 +2357,10 @@ impl GigaMuxApp {
         let opts = EncodeOptions {
             input_dir: self.prefs.input_dir.clone(),
             output_dir: self.prefs.output_dir.clone(),
-            gpu: self.prefs.gpu,
+            gpu: GpuChoice::Any,
+            hw: self.hw.clone(),
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
+            write_encoder_metadata: self.prefs.write_encoder_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
             test_mode: self.prefs.test_mode,
             test_slot_count: self.prefs.test_slot_count,
@@ -4282,12 +4282,9 @@ impl GigaMuxApp {
         let _ = prefs::save(&self.prefs);
     }
 
-    /// True when the selected GPU can run `av1_nvenc`.
-    fn av1_nvenc_ok_for_gpu(&self) -> bool {
-        match self.prefs.gpu {
-            GpuChoice::Any => !self.av1_devices.is_empty(),
-            GpuChoice::Index(i) => self.av1_devices.iter().any(|d| d.index == i),
-        }
+    /// True when this slot's GPU choice can run `av1_nvenc`.
+    fn av1_nvenc_ok_for_slot(&self, slot: &EncodeSlot) -> bool {
+        self.hw.av1_ok_for(slot.gpu)
     }
 
     fn batch_edit_idx(batch: TestBatch) -> usize {
@@ -4298,9 +4295,9 @@ impl GigaMuxApp {
     fn opaque_hardware_path_available_for(&self, slot: &EncodeSlot) -> bool {
         match slot.opaque_video {
             OpaqueVideo::Vp8 => false,
-            OpaqueVideo::Av1 => self.av1_nvenc_ok_for_gpu(),
-            OpaqueVideo::Vp9 => self.qsv_available,
-            OpaqueVideo::Hevc | OpaqueVideo::H264 => true,
+            OpaqueVideo::Av1 => self.av1_nvenc_ok_for_slot(slot),
+            OpaqueVideo::Vp9 => self.hw.qsv.is_some(),
+            OpaqueVideo::Hevc | OpaqueVideo::H264 => !self.hw.nvenc.is_empty(),
         }
     }
 
@@ -4315,8 +4312,8 @@ impl GigaMuxApp {
             return "On: NVENC for HEVC/H.264/AV1; Intel QSV for opaque VP9; QSV+libvpx hybrid for α VP9/.webm (falls back to full libvpx). Off: CPU.".into();
         }
         match slot.opaque_video {
-            OpaqueVideo::Av1 if self.av1_devices.is_empty() => {
-                "AV1 NVENC not available on this GPU. Checkbox greyed (preference kept). Encode uses libaom (CPU) for AV1, or pick HEVC/H.264."
+            OpaqueVideo::Av1 if !self.hw.nvenc.iter().any(|d| d.av1) => {
+                "AV1 NVENC not available on this machine. Checkbox greyed (preference kept). Encode uses libaom (CPU) for AV1, or pick HEVC/H.264."
                     .into()
             }
             OpaqueVideo::Av1 => {
@@ -4332,7 +4329,8 @@ impl GigaMuxApp {
                     .into()
             }
             OpaqueVideo::Hevc | OpaqueVideo::H264 => {
-                "Use hardware unavailable for this target.".into()
+                "No NVENC GPU detected. Checkbox greyed (preference kept). Encode uses CPU."
+                    .into()
             }
         }
     }
@@ -4558,11 +4556,86 @@ impl GigaMuxApp {
             self.ui_maxrate_override(ui, batch);
             // CQ stays prefs-only (advanced); not exposed in the shell UI.
         });
+        self.ui_slot_gpu_picker(ui, batch);
         if let Some(warn) = self.chroma_convert_warning_for(batch) {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
         }
         if let Some(warn) = self.audio_recode_warning_for(batch) {
             ui.colored_label(egui::Color32::from_rgb(220, 160, 60), warn);
+        }
+    }
+
+    /// Device/gen under Use hardware (same place on QSV-only machines as on NVENC).
+    fn ui_slot_gpu_picker(&mut self, ui: &mut egui::Ui, batch: TestBatch) {
+        let slot = self.prefs.slot(batch).clone();
+        if !slot.use_hardware {
+            return;
+        }
+        match slot.opaque_video {
+            OpaqueVideo::Vp9 => {
+                if let Some(q) = &self.hw.qsv {
+                    ui.label(egui::RichText::new(q.label.clone()).weak().small());
+                }
+            }
+            OpaqueVideo::Hevc | OpaqueVideo::H264 | OpaqueVideo::Av1 => {
+                if self.hw.nvenc.is_empty() {
+                    // QSV-only machine: still show the probe line under Use hardware.
+                    if let Some(q) = &self.hw.qsv {
+                        ui.label(
+                            egui::RichText::new(format!("{} — Opaque VP9 uses this", q.label))
+                                .weak()
+                                .small(),
+                        );
+                    }
+                    return;
+                }
+                if self.hw.nvenc.len() == 1 {
+                    ui.label(
+                        egui::RichText::new(self.hw.nvenc[0].ui_label())
+                            .weak()
+                            .small(),
+                    );
+                    return;
+                }
+                // Multi-GPU: combo so each test target can pick a different gen/device.
+                let mut selected = match slot.gpu {
+                    GpuChoice::Any => None,
+                    GpuChoice::Index(i) => Some(i),
+                };
+                let id = format!("slot_gpu_{}", batch.index());
+                let preview = match slot.gpu {
+                    GpuChoice::Any => self
+                        .hw
+                        .nvenc
+                        .first()
+                        .map(|d| format!("Any ({})", d.ui_label()))
+                        .unwrap_or_else(|| "Any".into()),
+                    GpuChoice::Index(i) => self
+                        .hw
+                        .nvenc
+                        .iter()
+                        .find(|d| d.index == i)
+                        .map(|d| d.ui_label())
+                        .unwrap_or_else(|| format!("#{i}")),
+                };
+                egui::ComboBox::from_id_salt(id)
+                    .selected_text(preview)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut selected, None, "Any");
+                        for d in &self.hw.nvenc {
+                            ui.selectable_value(&mut selected, Some(d.index), d.ui_label());
+                        }
+                    });
+                let next = match selected {
+                    None => GpuChoice::Any,
+                    Some(i) => GpuChoice::Index(i),
+                };
+                if next != self.prefs.slot(batch).gpu {
+                    self.prefs.slot_mut(batch).gpu = next;
+                    self.save_targets();
+                }
+            }
+            OpaqueVideo::Vp8 => {}
         }
     }
 
@@ -5924,64 +5997,47 @@ impl GigaMuxApp {
             self.ui_slot_targets(ui, TestBatch::One, "Targets");
         }
         ui.add_space(8.0);
-        let hw_any = if self.prefs.test_mode {
-            self.prefs
-                .active_batches()
-                .iter()
-                .any(|&b| self.prefs.slot(b).use_hardware)
-        } else {
-            self.prefs.slot1.use_hardware
-        };
-        ui.add_enabled_ui(hw_any, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("GPU");
-                let mut selected = match self.prefs.gpu {
-                    GpuChoice::Any => None,
-                    GpuChoice::Index(i) => Some(i),
-                };
-                egui::ComboBox::from_id_salt("gpu_settings")
-                    .selected_text(match self.prefs.gpu {
-                        GpuChoice::Any => "Any".to_string(),
-                        GpuChoice::Index(i) => self
-                            .devices
-                            .iter()
-                            .find(|d| d.index == i)
-                            .map(|d| format!("#{i} {}", d.name))
-                            .unwrap_or_else(|| format!("#{i}")),
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut selected, None, "Any");
-                        for d in &self.devices {
-                            ui.selectable_value(
-                                &mut selected,
-                                Some(d.index),
-                                format!("#{} {}", d.index, d.name),
-                            );
-                        }
-                    });
-                self.prefs.gpu = match selected {
-                    None => GpuChoice::Any,
-                    Some(i) => GpuChoice::Index(i),
-                };
-                if ui.button("Refresh").clicked() {
-                    match list_nvenc_devices() {
-                        Ok(d) => {
-                            let (gpu, warn) = self.prefs.gpu.sanitize(&d);
-                            self.prefs.gpu = gpu;
-                            self.gpu_warn = warn;
-                            self.devices = d;
-                        }
-                        Err(e) => self.alert_error("GPU", format!("GPU probe failed: {e}")),
-                    }
-                    self.av1_devices = list_av1_nvenc_devices(&self.devices);
-                    self.qsv_available = qsv_vp9_available();
-                    self.vmaf_available = libvmaf_available();
-                    let _ = prefs::save(&self.prefs);
+        // Detected encoders summary (GPU pick lives on each Targets row when multi-GPU).
+        ui.horizontal(|ui| {
+            let detected = {
+                let mut parts = Vec::new();
+                for d in &self.hw.nvenc {
+                    parts.push(d.ui_label());
                 }
-            });
+                if let Some(q) = &self.hw.qsv {
+                    parts.push(q.label.clone());
+                }
+                if parts.is_empty() {
+                    "none (CPU only)".into()
+                } else {
+                    parts.join(" · ")
+                }
+            };
+            ui.label(egui::RichText::new(format!("Detected: {detected}")).weak().small());
+            if ui
+                .small_button("Refresh")
+                .on_hover_text("Re-probe NVENC / QSV (not cached to disk)")
+                .clicked()
+            {
+                self.refresh_hw_probe("manual");
+                self.vmaf_available = libvmaf_available();
+                let _ = prefs::save(&self.prefs);
+            }
         });
         if let Some(w) = &self.gpu_warn {
             ui.colored_label(egui::Color32::from_rgb(200, 140, 40), w.clone());
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.write_encoder_metadata,
+                "Write encoder metadata",
+            )
+            .on_hover_text(
+                "Stamp GigaMux_encoder / GigaMux_hw (codec + NVENC gen / QSV) into output files.",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
         }
         if ui
             .checkbox(
@@ -6006,6 +6062,18 @@ impl GigaMuxApp {
             )
             .on_hover_text(
                 "Keep creation time / chapters / tags from OBS Hybrid MP4 across re-encode",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.write_encoder_metadata,
+                "Write encoder metadata",
+            )
+            .on_hover_text(
+                "Stamp GigaMux_encoder / GigaMux_hw into outputs (also on Settings → Encode).",
             )
             .changed()
         {

@@ -144,9 +144,20 @@ pub fn save(cache: &PersistedPreviewCache) -> Result<(), String> {
     fs::create_dir_all(&thumb_root).map_err(|e| format!("create thumbs dir: {e}"))?;
 
     let index_path = dir.join("preview_cache.json");
+    // Rotate before overwrite so a bad empty save is recoverable.
+    if index_path.is_file() && !cache.entries.is_empty() {
+        let _ = fs::copy(&index_path, dir.join("preview_cache.json.bak"));
+    }
     let text =
         serde_json::to_string_pretty(cache).map_err(|e| format!("serialize preview cache: {e}"))?;
-    fs::write(&index_path, text).map_err(|e| format!("write preview_cache.json: {e}"))?;
+    let tmp = dir.join("preview_cache.json.tmp");
+    fs::write(&tmp, &text).map_err(|e| format!("write preview cache tmp: {e}"))?;
+    fs::rename(&tmp, &index_path).map_err(|e| format!("replace preview_cache.json: {e}"))?;
+
+    // Empty index already dropped scores/meta in the JSON; don't orphan every .rgba.
+    if cache.entries.is_empty() {
+        return Ok(());
+    }
 
     // Drop thumb files no longer referenced by the index.
     let keep: HashMap<&str, ()> = cache

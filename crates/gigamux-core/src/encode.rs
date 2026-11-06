@@ -13,7 +13,7 @@ use crate::chunk::{
     chunk_frame_range, estimate_total_frames, list_chunk_paths, parse_fps, write_ffconcat,
     CHUNK_SEEK_PAD_S,
 };
-use crate::gpu::GpuChoice;
+use crate::gpu::{encoder_metadata_tags, GpuChoice, HwCatalog};
 use crate::job_log::{JobLog, JobLogKind};
 use crate::probe::{
     audio_bitrate_k, audio_codec_name, file_info, require_tools, thumbnail_rgba_at,
@@ -71,8 +71,13 @@ pub enum EncodeEvent {
 pub struct EncodeOptions {
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
+    /// Legacy; prefer each [`EncodeSlot::gpu`]. Kept so older call sites still compile.
     pub gpu: GpuChoice,
+    /// Local probe snapshot for `GigaMux_hw` labels (generation / device).
+    pub hw: HwCatalog,
     pub preserve_obs_metadata: bool,
+    /// Write `GigaMux_encoder` / `GigaMux_hw` into outputs.
+    pub write_encoder_metadata: bool,
     /// Ceiling from 1s video peak when true; otherwise average rate.
     pub use_peak_bitrate: bool,
     /// Multi full-frame A/B: write `test1_*`…`testN_*` with `slot1`… matching `test_slot_count`.
@@ -107,8 +112,11 @@ impl EncodeOptions {
 pub struct FarmEncodeRequest {
     pub input: PathBuf,
     pub output_dir: PathBuf,
+    /// Legacy fallback when `slot.gpu` is unused by older callers; prefer `slot.gpu`.
     pub gpu: GpuChoice,
+    pub hw: HwCatalog,
     pub preserve_obs_metadata: bool,
+    pub write_encoder_metadata: bool,
     pub use_peak_bitrate: bool,
     pub slot: EncodeSlot,
     /// `None` = normal deliver name; `Some` = `test1_` / `test2_` prefix.
@@ -563,12 +571,15 @@ fn build_cmd(
     bitrate_k: u32,
     cq: u32,
     preserve_obs: bool,
+    write_encoder_meta: bool,
     use_hardware: bool,
     opaque_video: OpaqueVideo,
     opaque_container: OutContainer,
     alpha_video: AlphaVideo,
     alpha_container: OutContainer,
     chunk: Option<ChunkTrim>,
+    // Optional `GigaMux_hw` value (NVENC gen / QSV); encoder name is derived from the path.
+    hw_meta: Option<String>,
 ) -> Vec<String> {
     let ceiling = format!("{bitrate_k}k");
     let bufsize = format!("{}k", bitrate_k * 2);
@@ -769,6 +780,28 @@ fn build_cmd(
             "-map_chapters".into(),
             "0".into(),
         ]);
+    }
+
+    if write_encoder_meta && !video_only {
+        let enc_name = if has_alpha {
+            alpha_video.ffmpeg_encoder()
+        } else if use_nvenc || use_qsv {
+            opaque_video.ffmpeg_encoder(true)
+        } else {
+            opaque_video.ffmpeg_encoder(false)
+        };
+        let hw = if use_nvenc {
+            hw_meta
+                .clone()
+                .or_else(|| Some(format!("NVENC_gpu{}", gpu.ffmpeg_arg())))
+        } else if use_qsv {
+            hw_meta.clone().or_else(|| Some("QSV".into()))
+        } else {
+            None
+        };
+        for (k, v) in encoder_metadata_tags(enc_name, hw.as_deref()) {
+            cmd.extend(["-metadata".into(), format!("{k}={v}")]);
+        }
     }
 
     cmd.push("-avoid_negative_ts".into());
@@ -1174,12 +1207,22 @@ pub fn run_batch(
                 slot.opaque_container.label()
             )
         };
+        let slot_gpu = slot.gpu;
         let device = if use_hybrid {
-            "qsv+libvpx hybrid".into()
+            match &opts.hw.qsv {
+                Some(q) => format!("qsv+libvpx hybrid ({})", q.name),
+                None => "qsv+libvpx hybrid".into(),
+            }
         } else if use_nvenc {
-            format!("gpu={}", opts.gpu.ffmpeg_arg())
+            match opts.hw.resolve_nvenc(slot_gpu) {
+                Some(d) => format!("gpu={} ({})", d.index, d.generation.label()),
+                None => format!("gpu={}", slot_gpu.ffmpeg_arg()),
+            }
         } else if use_qsv {
-            format!("qsv={}", slot.opaque_video.ffmpeg_encoder(true))
+            match &opts.hw.qsv {
+                Some(q) => format!("qsv={}", q.label),
+                None => format!("qsv={}", slot.opaque_video.ffmpeg_encoder(true)),
+            }
         } else {
             format!(
                 "cpu={}",
@@ -1263,36 +1306,53 @@ pub fn run_batch(
                         &output,
                         &info,
                         has_alpha,
-                        opts.gpu,
+                        slot_gpu,
                         bitrate_k,
                         cq,
                         opts.preserve_obs_metadata,
+                        opts.write_encoder_metadata,
                         false, // force CPU α path
                         slot.opaque_video,
                         slot.opaque_container,
                         slot.alpha_video,
                         slot.alpha_container,
                         None,
+                        None,
                     );
                     run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
                 }
             }
         } else {
+            let hw_meta = if use_nvenc {
+                Some(opts.hw.nvenc_meta_hw(slot_gpu))
+            } else if use_qsv {
+                Some(
+                    opts.hw
+                        .qsv
+                        .as_ref()
+                        .map(|q| q.meta_hw_tag())
+                        .unwrap_or_else(|| "QSV".into()),
+                )
+            } else {
+                None
+            };
             let argv = build_cmd(
                 &input,
                 &output,
                 &info,
                 has_alpha,
-                opts.gpu,
+                slot_gpu,
                 bitrate_k,
                 cq,
                 opts.preserve_obs_metadata,
+                opts.write_encoder_metadata,
                 slot.use_hardware,
                 slot.opaque_video,
                 slot.opaque_container,
                 slot.alpha_video,
                 slot.alpha_container,
                 None,
+                hw_meta,
             );
             run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
         };
@@ -1360,21 +1420,43 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         None => (auto_k, auto_label),
     };
     let cq = req.slot.cq_override.unwrap_or(0);
+    let gpu = if req.slot.gpu != GpuChoice::Any {
+        req.slot.gpu
+    } else {
+        req.gpu
+    };
+    let use_nvenc = req.slot.use_hardware && req.slot.opaque_video.is_nvenc() && !has_alpha;
+    let use_qsv = req.slot.use_hardware && req.slot.opaque_video.is_qsv() && !has_alpha;
+    let hw_meta = if use_nvenc {
+        Some(req.hw.nvenc_meta_hw(gpu))
+    } else if use_qsv {
+        Some(
+            req.hw
+                .qsv
+                .as_ref()
+                .map(|q| q.meta_hw_tag())
+                .unwrap_or_else(|| "QSV".into()),
+        )
+    } else {
+        None
+    };
     let mut argv = build_cmd(
         &req.input,
         &output,
         &info,
         has_alpha,
-        req.gpu,
+        gpu,
         bitrate_k,
         cq,
         req.preserve_obs_metadata,
+        req.write_encoder_metadata,
         req.slot.use_hardware,
         req.slot.opaque_video,
         req.slot.opaque_container,
         req.slot.alpha_video,
         req.slot.alpha_container,
         None,
+        hw_meta,
     );
     farm_argv_never_overwrite(&mut argv);
     Ok(FarmFfmpegCommand {
@@ -1457,15 +1539,21 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
     for i in 0..chunks {
         let (start_frame, frame_count) = chunk_frame_range(total_frames, i, chunks)?;
         chunk_durations_s.push(frame_count as f64 / fps);
+        let gpu = if req.slot.gpu != GpuChoice::Any {
+            req.slot.gpu
+        } else {
+            req.gpu
+        };
         let mut argv = build_cmd(
             &req.input,
             &chunk_paths[i as usize],
             &info,
             has_alpha,
-            req.gpu,
+            gpu,
             bitrate_k,
             cq,
             false, // chunk encodes are video-only; metadata remux happens at mux
+            false,
             req.slot.use_hardware,
             req.slot.opaque_video,
             req.slot.opaque_container,
@@ -1476,6 +1564,7 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
                 frame_count,
                 fps,
             }),
+            None,
         );
         farm_argv_never_overwrite(&mut argv);
         encode_argvs.push(argv);
@@ -1553,6 +1642,38 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
             "-map_chapters".into(),
             "1".into(),
         ]);
+    }
+    if req.write_encoder_metadata {
+        let gpu = if req.slot.gpu != GpuChoice::Any {
+            req.slot.gpu
+        } else {
+            req.gpu
+        };
+        let use_nvenc = req.slot.use_hardware && req.slot.opaque_video.is_nvenc() && !has_alpha;
+        let use_qsv = req.slot.use_hardware && req.slot.opaque_video.is_qsv() && !has_alpha;
+        let enc_name = if has_alpha {
+            req.slot.alpha_video.ffmpeg_encoder()
+        } else if use_nvenc || use_qsv {
+            req.slot.opaque_video.ffmpeg_encoder(true)
+        } else {
+            req.slot.opaque_video.ffmpeg_encoder(false)
+        };
+        let hw = if use_nvenc {
+            Some(req.hw.nvenc_meta_hw(gpu))
+        } else if use_qsv {
+            Some(
+                req.hw
+                    .qsv
+                    .as_ref()
+                    .map(|q| q.meta_hw_tag())
+                    .unwrap_or_else(|| "QSV".into()),
+            )
+        } else {
+            None
+        };
+        for (k, v) in encoder_metadata_tags(enc_name, hw.as_deref()) {
+            mux_argv.extend(["-metadata".into(), format!("{k}={v}")]);
+        }
     }
     mux_argv.extend([
         "-avoid_negative_ts".into(),

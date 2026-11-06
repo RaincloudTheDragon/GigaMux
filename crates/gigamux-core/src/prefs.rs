@@ -26,6 +26,9 @@ pub struct EncodeSlot {
     /// NVENC for HEVC/H.264/AV1 when true; CPU encoders when false. Default on.
     #[serde(default = "default_true")]
     pub use_hardware: bool,
+    /// Per-slot NVENC device (`Any` or `#index`). Ignored for QSV/CPU paths.
+    #[serde(default)]
+    pub gpu: GpuChoice,
     /// When set, replaces the automatic video ceiling (maxrate / bufsize) in kbps.
     #[serde(default)]
     pub maxrate_override_k: Option<u32>,
@@ -46,6 +49,7 @@ impl Default for EncodeSlot {
     fn default() -> Self {
         Self {
             use_hardware: true,
+            gpu: GpuChoice::Any,
             maxrate_override_k: None,
             cq_override: None,
             opaque_video: OpaqueVideo::Av1,
@@ -94,8 +98,10 @@ impl EncodeSlot {
 pub struct Prefs {
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
-    pub gpu: GpuChoice,
     pub preserve_obs_metadata: bool,
+    /// Stamp `GigaMux_encoder` / `GigaMux_hw` into output containers. Default on.
+    #[serde(default = "default_true")]
+    pub write_encoder_metadata: bool,
     /// When true, encode ceiling uses 1s video peak; default is average rate (CBR-oriented).
     #[serde(default)]
     pub use_peak_bitrate: bool,
@@ -177,8 +183,8 @@ impl Default for Prefs {
         Self {
             input_dir: PathBuf::new(),
             output_dir: PathBuf::new(),
-            gpu: GpuChoice::Any,
             preserve_obs_metadata: false,
+            write_encoder_metadata: true,
             use_peak_bitrate: false,
             test_mode: false,
             test_slot_count: 2,
@@ -213,6 +219,24 @@ impl Prefs {
         self.slot2.sanitize();
         self.slot3.sanitize();
         self.slot4.sanitize();
+    }
+
+    /// Sanitize each slot's GPU against the live NVENC list; returns a warn if any fell back.
+    pub fn sanitize_slot_gpus(&mut self, devices: &[crate::gpu::NvencDevice]) -> Option<String> {
+        let mut warn = None;
+        for slot in [
+            &mut self.slot1,
+            &mut self.slot2,
+            &mut self.slot3,
+            &mut self.slot4,
+        ] {
+            let (g, w) = slot.gpu.sanitize(devices);
+            slot.gpu = g;
+            if warn.is_none() {
+                warn = w;
+            }
+        }
+        warn
     }
 
     /// Active test batches when test mode is on (`TestBatch::ALL[..count]`); empty otherwise.
@@ -320,26 +344,48 @@ fn prefs_path() -> Option<PathBuf> {
     prefs_dir().map(|d| d.join("prefs.json"))
 }
 
-/// Load prefs from AppData; missing/corrupt → defaults.
+/// Load prefs from AppData; missing/corrupt → defaults (corrupt file is copied aside, never overwritten here).
 pub fn load() -> Prefs {
     let Some(path) = prefs_path() else {
         return Prefs::default();
     };
     let mut prefs = match fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => Prefs::default(),
+        Ok(text) => match serde_json::from_str::<Prefs>(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                // Keep evidence — silent unwrap_or_default previously wiped real prefs on schema clash.
+                let bad = path.with_extension("json.bad");
+                let _ = fs::copy(&path, &bad);
+                eprintln!(
+                    "GigaMux: prefs.json failed to parse ({e}); kept copy at {}; using defaults in memory (not saved)",
+                    bad.display()
+                );
+                Prefs::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Prefs::default(),
+        Err(e) => {
+            eprintln!("GigaMux: could not read prefs.json ({e}); using defaults in memory");
+            Prefs::default()
+        }
     };
     prefs.sanitize_targets();
     prefs
 }
 
-/// Save prefs to AppData (creates directory if needed).
+/// Save prefs to AppData (creates directory if needed). Rotates `prefs.json.bak` first.
 pub fn save(prefs: &Prefs) -> Result<(), String> {
     let dir = prefs_dir().ok_or_else(|| "could not resolve AppData config dir".to_string())?;
     fs::create_dir_all(&dir).map_err(|e| format!("create prefs dir: {e}"))?;
     let path = dir.join("prefs.json");
+    if path.is_file() {
+        let bak = dir.join("prefs.json.bak");
+        let _ = fs::copy(&path, &bak);
+    }
     let text = serde_json::to_string_pretty(prefs).map_err(|e| format!("serialize prefs: {e}"))?;
-    fs::write(&path, text).map_err(|e| format!("write prefs: {e}"))?;
+    let tmp = dir.join("prefs.json.tmp");
+    fs::write(&tmp, &text).map_err(|e| format!("write prefs tmp: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("replace prefs.json: {e}"))?;
     Ok(())
 }
 
@@ -364,6 +410,28 @@ pub fn import_profile(path: &Path) -> Result<Prefs, String> {
         serde_json::from_str(&text).map_err(|e| format!("parse profile: {e}"))?;
     prefs.sanitize_targets();
     Ok(prefs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flatten_slot1_gpu_roundtrips_without_duplicate_key() {
+        // Regression: Prefs.gpu + flattened EncodeSlot.gpu both claimed "gpu" and wiped prefs on load.
+        let mut p = Prefs::default();
+        p.input_dir = PathBuf::from(r"W:\Videos\GigaMux\input");
+        p.slot1.gpu = GpuChoice::Index(0);
+        let text = serde_json::to_string_pretty(&p).unwrap();
+        assert_eq!(
+            text.matches("\"gpu\"").count(),
+            4, // slot1 (flattened) + slot2/3/4
+            "serialized prefs:\n{text}"
+        );
+        let back: Prefs = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.slot1.gpu, GpuChoice::Index(0));
+        assert_eq!(back.input_dir, p.input_dir);
+    }
 }
 
 /// `%APPDATA%\GigaMux\logs\session.log` — full durable transcript (UI + encode + VMAF).
