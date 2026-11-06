@@ -1244,7 +1244,18 @@ pub fn run_batch(
     });
 }
 
+/// Replace ffmpeg `-y` (overwrite) with `-n` (never overwrite) so farm workers match local skip-if-exists.
+fn farm_argv_never_overwrite(argv: &mut [String]) {
+    for a in argv.iter_mut() {
+        if a == "-y" {
+            *a = "-n".into();
+            return;
+        }
+    }
+}
+
 /// Build a single-file ffmpeg argv for Flamenco (same flags as local encode).
+/// Uses `-n` instead of `-y` so an existing deliver is never replaced on the worker.
 /// Refuses QSV+libvpx alpha hybrid (multi-process locally; not a single `exec` yet).
 pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegCommand, String> {
     if !req.input.is_file() {
@@ -1274,7 +1285,7 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         None => (auto_k, auto_label),
     };
     let cq = req.slot.cq_override.unwrap_or(0);
-    let argv = build_cmd(
+    let mut argv = build_cmd(
         &req.input,
         &output,
         &info,
@@ -1289,6 +1300,7 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         req.slot.alpha_video,
         req.slot.alpha_container,
     );
+    farm_argv_never_overwrite(&mut argv);
     Ok(FarmFfmpegCommand {
         output,
         argv,

@@ -1913,6 +1913,7 @@ impl GigaMuxApp {
         let exe = exe_owned.as_deref();
         let tag = tag_owned.as_deref();
         let mut ok = 0usize;
+        let mut skipped = 0usize;
         let mut failed = 0usize;
         for name in &names {
             let input = self.prefs.input_dir.join(name);
@@ -1939,6 +1940,17 @@ impl GigaMuxApp {
                     continue;
                 }
             };
+            let out_name = cmd
+                .output
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cmd.output.display().to_string());
+            // Same as local encode: never replace an existing deliver (do not submit).
+            if cmd.output.is_file() {
+                self.push_session(format!("Flamenco skip (exists): {out_name}"));
+                skipped += 1;
+                continue;
+            }
             let job = match make_gigamux_encode_job(
                 format!("GigaMux {name}"),
                 exe,
@@ -1952,11 +1964,6 @@ impl GigaMuxApp {
                     continue;
                 }
             };
-            let out_name = cmd
-                .output
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| cmd.output.display().to_string());
             match submit_job(&url, &job) {
                 Ok(id) => {
                     self.push_session(format!(
@@ -1972,9 +1979,9 @@ impl GigaMuxApp {
             }
         }
         self.log_open = true;
-        if names.len() > 1 {
+        if names.len() > 1 || skipped > 0 {
             self.push_session(format!(
-                "Flamenco batch: submitted={ok} failed={failed} (of {})",
+                "Flamenco batch: submitted={ok} skipped={skipped} failed={failed} (of {})",
                 names.len()
             ));
         }
