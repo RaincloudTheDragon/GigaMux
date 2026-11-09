@@ -854,12 +854,27 @@ pub fn deletable_issues<'a>(
         .collect()
 }
 
+/// When Recycle Bin fails vaguely, probe write-open for the real OS reason (e.g. sharing violation / os error 32).
+fn file_delete_block_hint(path: &Path) -> Option<String> {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Err(e) => Some(e.to_string()),
+        Ok(_) => None,
+    }
+}
+
 /// Move a path to the OS Recycle Bin / Trash. Errors if missing or trash fails.
 pub fn trash_file(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Err("not present on disk".into());
     }
-    trash::delete(path).map_err(|e| format!("{e}"))
+    trash::delete(path).map_err(|e| {
+        // Windows IFileOperation often only says "Some operations were aborted" — append the OS lock/share error when present.
+        let mut msg = format!("{e}");
+        if let Some(hint) = file_delete_block_hint(path) {
+            msg = format!("{msg} ({hint})");
+        }
+        msg
+    })
 }
 
 /// Permanently remove a file (no Recycle Bin). Errors if missing or remove fails.
@@ -930,10 +945,11 @@ pub fn restore_trashed_file(original: &Path) -> Result<(), String> {
 pub fn delete_issue_outputs(
     output_dir: &Path,
     issues: &[CheckIssue],
-) -> (usize, usize, Vec<PathBuf>) {
+) -> (usize, usize, Vec<PathBuf>, Vec<String>) {
     let mut deleted = 0usize;
     let mut failed = 0usize;
     let mut trashed = Vec::new();
+    let mut errors = Vec::new();
     for issue in issues {
         if !issue_has_deletable_output(output_dir, issue) {
             continue;
@@ -946,10 +962,14 @@ pub fn delete_issue_outputs(
                 deleted += 1;
                 trashed.push(recorded);
             }
-            Err(_) => failed += 1,
+            Err(e) => {
+                failed += 1;
+                // Keep the OS / trash error text (locked file, access denied, …) for the Check UI.
+                errors.push(format!("delete failed ({name}): {e}"));
+            }
         }
     }
-    (deleted, failed, trashed)
+    (deleted, failed, trashed, errors)
 }
 
 /// List video filenames in a folder (non-recursive).

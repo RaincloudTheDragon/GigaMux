@@ -7166,7 +7166,7 @@ impl GigaMuxApp {
                     .filter_map(|idx| w.issues.get(idx).cloned())
                     .collect();
                 if !to_delete.is_empty() {
-                    let (deleted, failed, trashed) =
+                    let (deleted, failed, trashed, errors) =
                         delete_issue_outputs(&self.prefs.output_dir, &to_delete);
                     self.push_undo_step(UndoStep::Delete(DeleteUndoBatch {
                         side: FileSide::Output,
@@ -7175,6 +7175,19 @@ impl GigaMuxApp {
                     self.push_session(format!(
                         "Recycle Bin: {deleted} output(s); failed {failed}"
                     ));
+                    // Same surface as active → delete (locked file / access denied must not be silent).
+                    for e in &errors {
+                        self.push_session(e.clone());
+                    }
+                    if let Some(first) = errors.first() {
+                        let msg = if errors.len() == 1 {
+                            first.clone()
+                        } else {
+                            format!("{first}\n(+{} more — see session log)", errors.len() - 1)
+                        };
+                        // Session lines already written — modal only (avoid duplicate via alert_error).
+                        self.show_alert("Delete", msg);
+                    }
                     self.refresh_lists();
                 }
             }
