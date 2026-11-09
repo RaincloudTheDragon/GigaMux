@@ -32,7 +32,7 @@ use gigamux_core::flamenco::{
     scripts_dir_from_manager_install, submit_job, CancelExecMode, FlamencoTwoway,
     REQUIRED_WORKER_TAGS,
 };
-use gigamux_core::ffmpeg_active::active_ffmpeg_pid;
+use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
 use gigamux_core::gpu::{probe_local_encoders, GpuChoice, HwCatalog};
 use gigamux_core::job_log;
@@ -2445,10 +2445,15 @@ impl GigaMuxApp {
         });
     }
 
-    /// Request cancel of the running encode (kills in-flight ffmpeg, then stops the batch).
+    /// Request cancel of the running encode/VMAF (kills in-flight ffmpeg tree, then stops the batch).
     fn cancel_encode(&mut self) {
         // Shared cancel flag for encode + VMAF (both drive ffmpeg).
         if matches!(self.job, Some(JobKind::Encode | JobKind::Vmaf)) && self.busy {
+            // Resume a Shutter-paused tree first, then tree-kill immediately (don't wait for the worker's 50ms poll — Esc spam was orphaning Chocolatey-shim grandchildren).
+            self.resume_ffmpeg_if_suspended();
+            if let Some(pid) = active_ffmpeg_pid() {
+                kill_process_tree(pid);
+            }
             self.cancel.store(true, Ordering::Relaxed);
             self.push_session("cancel requested…");
         }

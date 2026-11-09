@@ -2,7 +2,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -827,23 +827,6 @@ fn parse_ffmpeg_out_time(line: &str) -> Option<f64> {
     }
 }
 
-/// Hard-stop ffmpeg. On Windows, `Child::kill` alone often leaves shim/worker trees alive.
-fn force_kill_ffmpeg(child: &mut Child) {
-    let pid = child.id();
-    #[cfg(windows)]
-    {
-        // /T = process tree (shims + real ffmpeg.exe); /F = force.
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 /// Run ffmpeg and stream stderr live (progress uses `\r`; other lines use `\n`).
 /// `on_line` gets `(log_text, optional out_time_seconds from time=)`.
 /// Cancel is polled on a timer (not gated on stderr), then the process tree is force-killed.
@@ -853,18 +836,20 @@ fn run_ffmpeg(
     mut on_line: impl FnMut(String, Option<f64>),
 ) -> Result<(), String> {
     let (prog, args) = argv.split_first().ok_or_else(|| "empty ffmpeg argv".to_string())?;
-    let mut child = Command::new(prog)
+    let spawned = Command::new(prog)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("ffmpeg spawn: {e}"))?;
+    // Tree-kill on drop if still running (Chocolatey shim must not orphan real ffmpeg).
+    let mut child = crate::ffmpeg_active::TrackedFfmpegChild::new(spawned);
     // UI may Shutter-style suspend/resume this tree while the encode runs.
     let _active = crate::ffmpeg_active::ActiveFfmpegGuard::new(child.id());
 
     let mut stderr = child
-        .stderr
+        .stderr()
         .take()
         .ok_or_else(|| "ffmpeg stderr missing".to_string())?;
 
@@ -920,7 +905,7 @@ fn run_ffmpeg(
     let poll = Duration::from_millis(50);
     loop {
         if cancel.load(Ordering::Relaxed) {
-            force_kill_ffmpeg(&mut child);
+            child.force_kill();
             return Err("cancelled".into());
         }
         match child.try_wait() {
@@ -939,20 +924,21 @@ fn run_ffmpeg(
                     return Ok(());
                 }
                 if cancel.load(Ordering::Relaxed) {
+                    child.force_kill();
                     return Err("cancelled".into());
                 }
                 return Err(format!("ffmpeg exited with {status}"));
             }
             Ok(None) => {}
             Err(e) => {
-                force_kill_ffmpeg(&mut child);
+                child.force_kill();
                 return Err(format!("ffmpeg wait: {e}"));
             }
         }
         match rx.recv_timeout(poll) {
             Ok(Ok(raw)) => emit(&raw, &mut on_line),
             Ok(Err(e)) => {
-                force_kill_ffmpeg(&mut child);
+                child.force_kill();
                 return Err(e);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,

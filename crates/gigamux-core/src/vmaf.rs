@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -113,21 +113,6 @@ fn n_threads() -> usize {
         .unwrap_or(8)
 }
 
-fn force_kill(child: &mut Child) {
-    let pid = child.id();
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 /// Run libvmaf: `reference` = original, `distorted` = encode. Returns pooled score.
 /// `on_update` gets `(optional log line, optional out_time_s)`.
 pub fn run_vmaf_pair(
@@ -143,7 +128,7 @@ pub fn run_vmaf_pair(
     let filter = format!(
         "[0:v]setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
     );
-    let mut child = Command::new("ffmpeg")
+    let spawned = Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-stats",
@@ -164,11 +149,13 @@ pub fn run_vmaf_pair(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("ffmpeg spawn: {e}"))?;
+    // Tree-kill on drop if still running (Chocolatey shim must not orphan real ffmpeg).
+    let mut child = crate::ffmpeg_active::TrackedFfmpegChild::new(spawned);
     // UI may Shutter-style suspend/resume this tree while the pair runs.
     let _active = crate::ffmpeg_active::ActiveFfmpegGuard::new(child.id());
 
     let mut stderr = child
-        .stderr
+        .stderr()
         .take()
         .ok_or_else(|| "ffmpeg stderr missing".to_string())?;
 
@@ -209,7 +196,7 @@ pub fn run_vmaf_pair(
     let poll = Duration::from_millis(50);
     loop {
         if cancel.load(Ordering::Relaxed) {
-            force_kill(&mut child);
+            child.force_kill();
             return Err("cancelled".into());
         }
         match child.try_wait() {
@@ -239,6 +226,8 @@ pub fn run_vmaf_pair(
                     }
                 }
                 if cancel.load(Ordering::Relaxed) {
+                    // Shim may have exited while a grandchild encoder kept running.
+                    child.force_kill();
                     return Err("cancelled".into());
                 }
                 if !status.success() && score.is_none() {
@@ -248,7 +237,7 @@ pub fn run_vmaf_pair(
             }
             Ok(None) => {}
             Err(e) => {
-                force_kill(&mut child);
+                child.force_kill();
                 return Err(format!("ffmpeg wait: {e}"));
             }
         }
@@ -273,7 +262,7 @@ pub fn run_vmaf_pair(
                 }
             }
             Ok(Err(e)) => {
-                force_kill(&mut child);
+                child.force_kill();
                 return Err(e);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
