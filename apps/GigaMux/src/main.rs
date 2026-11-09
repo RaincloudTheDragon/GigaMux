@@ -1782,6 +1782,109 @@ impl GigaMuxApp {
         format!("{count} {noun} · {}", format_bytes(bytes))
     }
 
+    /// 1-based index of the primary row in the ↑/↓ nav list (None if inactive on this side).
+    fn active_nav_index(&self, side: FileSide) -> Option<usize> {
+        let (a_side, name) = self.active.as_ref()?;
+        if *a_side != side {
+            return None;
+        }
+        self.names_for_nav(side)
+            .iter()
+            .position(|n| n == name)
+            .map(|i| i + 1)
+    }
+
+    /// Sum on-disk sizes for basenames on `side` (missing files contribute 0).
+    fn sum_named_bytes(&self, side: FileSide, names: &[String]) -> u64 {
+        let dir = match side {
+            FileSide::Input => &self.prefs.input_dir,
+            FileSide::Output => &self.prefs.output_dir,
+        };
+        names
+            .iter()
+            .filter_map(|n| std::fs::metadata(dir.join(n)).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Bytes of each selected name's counterpart on the other side (skips unpaired).
+    fn sum_counterpart_bytes(&self, side: FileSide, names: &[String]) -> u64 {
+        let other = Self::other_side(side);
+        let dir = match other {
+            FileSide::Input => &self.prefs.input_dir,
+            FileSide::Output => &self.prefs.output_dir,
+        };
+        names
+            .iter()
+            .filter_map(|n| self.counterpart_name(side, n))
+            .filter_map(|c| std::fs::metadata(dir.join(c)).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Footer: active index + selected total/compare (when this side is active), then bulk folder total.
+    fn ui_folder_footer(&self, ui: &mut egui::Ui, side: FileSide) {
+        let bulk_count = match side {
+            FileSide::Input => self.input_files.len(),
+            FileSide::Output => self.output_files.len(),
+        };
+        let bulk_bytes = match side {
+            FileSide::Input => self.input_listed_bytes,
+            FileSide::Output => self.output_listed_bytes,
+        };
+        let active_here = self.active.as_ref().is_some_and(|(s, _)| *s == side);
+        let sel = if active_here {
+            self.selected_names_ordered()
+        } else {
+            Vec::new()
+        };
+
+        ui.horizontal(|ui| {
+            if active_here && !sel.is_empty() {
+                let nav_total = self.names_for_nav(side).len().max(1);
+                if let Some(idx) = self.active_nav_index(side) {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{idx}/{nav_total}")).small(),
+                        )
+                        .truncate(),
+                    );
+                    ui.label(egui::RichText::new("·").small().weak());
+                }
+                let sel_bytes = self.sum_named_bytes(side, &sel);
+                let sel_label = if sel.len() > 1 {
+                    format!("{} sel · {}", sel.len(), format_bytes(sel_bytes))
+                } else {
+                    format_bytes(sel_bytes)
+                };
+                ui.add(egui::Label::new(egui::RichText::new(sel_label).small()).truncate());
+                // Selection Δ only on Output (vs paired inputs); Input footer stays count/size only.
+                if side == FileSide::Output {
+                    let in_bytes = self.sum_counterpart_bytes(side, &sel);
+                    if in_bytes > 0 {
+                        if let Some(d) = size_delta(in_bytes, sel_bytes) {
+                            Self::ui_size_delta_labels(ui, d, true);
+                        }
+                    }
+                }
+                ui.label(egui::RichText::new("·").small().weak());
+            }
+
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(Self::folder_size_footer(bulk_count, bulk_bytes)).small(),
+                )
+                .truncate(),
+            );
+            // Bulk folder compare only on Output.
+            if side == FileSide::Output {
+                if let Some(d) = size_delta(self.input_listed_bytes, self.output_listed_bytes) {
+                    Self::ui_size_delta_labels(ui, d, true);
+                }
+            }
+        });
+    }
+
     /// ↓/% green or ↑/% red — same markers as center Size row / test compare strip.
     /// `small` matches pane footer text size when true.
     fn ui_size_delta_labels(ui: &mut egui::Ui, delta: SizeDelta, small: bool) {
@@ -7746,14 +7849,8 @@ impl eframe::App for GigaMuxApp {
                     in_size,
                     egui::Layout::bottom_up(egui::Align::Min),
                     |ui| {
-                        // Size footer stays under the Input list (full side width).
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(Self::folder_size_footer(
-                                self.input_files.len(),
-                                self.input_listed_bytes,
-                            )).small())
-                            .truncate(),
-                        );
+                        // Index / selected total+compare + bulk folder total under the list.
+                        self.ui_folder_footer(ui, FileSide::Input);
                         let files = self.input_files.clone();
                         let dir = self.prefs.input_dir.clone();
                         self.ui_folder_pane(ui, "Input", &dir, true, &files);
@@ -7774,21 +7871,8 @@ impl eframe::App for GigaMuxApp {
                     out_size,
                     egui::Layout::bottom_up(egui::Align::Min),
                     |ui| {
-                        // Folder total vs Input: same ↓/% green · ↑/% red as center Size.
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(Self::folder_size_footer(
-                                    self.output_files.len(),
-                                    self.output_listed_bytes,
-                                )).small())
-                                .truncate(),
-                            );
-                            if let Some(d) =
-                                size_delta(self.input_listed_bytes, self.output_listed_bytes)
-                            {
-                                Self::ui_size_delta_labels(ui, d, true);
-                            }
-                        });
+                        // Selected compare (when Output is active) plus bulk folder vs Input.
+                        self.ui_folder_footer(ui, FileSide::Output);
                         let files = self.output_files.clone();
                         let dir = self.prefs.output_dir.clone();
                         self.ui_folder_pane(ui, "Output", &dir, false, &files);
