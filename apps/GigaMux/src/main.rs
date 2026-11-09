@@ -7699,77 +7699,110 @@ fn short_path(path: &Path) -> String {
 
 /// Open a path with the OS default handler (same as double-click in Explorer).
 fn open_path_in_os(path: &Path) -> Result<(), String> {
-    let path = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
     #[cfg(target_os = "windows")]
     {
+        let path = windows_path_for_shell(path);
         // `start` needs an empty title arg when the path may be quoted/spaced.
         Command::new("cmd")
             .args(["/C", "start", "", &path.to_string_lossy()])
             .spawn()
             .map_err(|e| format!("start: {e}"))?;
-        return Ok(());
+        Ok(())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
-        Command::new("open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("open: {e}"))?;
-        return Ok(());
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Command::new("xdg-open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("xdg-open: {e}"))?;
-        return Ok(());
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
-    {
-        let _ = path;
-        Err("open not supported on this OS".into())
+        let path = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf());
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| format!("open: {e}"))?;
+            return Ok(());
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Command::new("xdg-open")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| format!("xdg-open: {e}"))?;
+            return Ok(());
+        }
+        #[cfg(not(any(target_os = "macos", unix)))]
+        {
+            let _ = path;
+            Err("open not supported on this OS".into())
+        }
     }
 }
 
 /// Reveal a file/folder in the OS file browser (select in Explorer / Finder; open parent on Linux).
 fn reveal_path_in_os(path: &Path) -> Result<(), String> {
-    let path = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
     #[cfg(target_os = "windows")]
     {
-        return reveal_path_in_os_windows(&path);
+        // Keep mapped letter drives (Z:\…) — canonicalize() would rewrite them to UNC.
+        reveal_path_in_os_windows(&windows_path_for_shell(path))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
-        Command::new("open")
-            .args(["-R", &path.to_string_lossy()])
-            .spawn()
-            .map_err(|e| format!("open -R: {e}"))?;
-        return Ok(());
+        let path = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf());
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open")
+                .args(["-R", &path.to_string_lossy()])
+                .spawn()
+                .map_err(|e| format!("open -R: {e}"))?;
+            return Ok(());
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let dir = if path.is_dir() {
+                path.clone()
+            } else {
+                path.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| path.clone())
+            };
+            Command::new("xdg-open")
+                .arg(&dir)
+                .spawn()
+                .map_err(|e| format!("xdg-open: {e}"))?;
+            return Ok(());
+        }
+        #[cfg(not(any(target_os = "macos", unix)))]
+        {
+            let _ = path;
+            Err("reveal not supported on this OS".into())
+        }
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let dir = if path.is_dir() {
-            path.clone()
-        } else {
-            path.parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| path.clone())
-        };
-        Command::new("xdg-open")
-            .arg(&dir)
-            .spawn()
-            .map_err(|e| format!("xdg-open: {e}"))?;
-        return Ok(());
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
-    {
-        let _ = path;
-        Err("reveal not supported on this OS".into())
+}
+
+/// Absolute path for Shell/Explorer without resolving mapped drives to UNC.
+/// Strips `\\?\` / `\\?\UNC\` so ILCreateFromPathW / `start` accept the string.
+#[cfg(target_os = "windows")]
+fn windows_path_for_shell(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    PathBuf::from(strip_win_extended_prefix(&abs.to_string_lossy()))
+}
+
+/// `\\?\C:\…` → `C:\…`, `\\?\UNC\server\share` → `\\server\share`.
+fn strip_win_extended_prefix(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -7781,15 +7814,7 @@ fn reveal_path_in_os_windows(path: &Path) -> Result<(), String> {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
 
-    // canonicalize() often yields `\\?\C:\…` / `\\?\UNC\…`, which ILCreateFromPathW rejects.
-    let s = path.to_string_lossy();
-    let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        s.into_owned()
-    };
+    let s = path.to_string_lossy().into_owned();
     let wide: Vec<u16> = std::ffi::OsStr::new(&s)
         .encode_wide()
         .chain(Some(0))
@@ -7926,5 +7951,26 @@ impl eframe::App for GigaMuxApp {
     fn on_exit(&mut self) {
         let _ = prefs::save(&self.prefs);
         self.save_preview_cache_to_disk();
+    }
+}
+
+#[cfg(test)]
+mod path_shell_tests {
+    use super::strip_win_extended_prefix;
+
+    #[test]
+    fn strip_extended_keeps_drive_and_unc() {
+        assert_eq!(
+            strip_win_extended_prefix(r"\\?\Z:\Videos\clip.mp4"),
+            r"Z:\Videos\clip.mp4"
+        );
+        assert_eq!(
+            strip_win_extended_prefix(r"\\?\UNC\server\share\clip.mp4"),
+            r"\\server\share\clip.mp4"
+        );
+        assert_eq!(
+            strip_win_extended_prefix(r"Z:\Videos\clip.mp4"),
+            r"Z:\Videos\clip.mp4"
+        );
     }
 }
