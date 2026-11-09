@@ -37,3 +37,7 @@ Desktop.ini
 .cursorindexingignore
 
 test/
+
+# Flamenco helper binaries (build into flamenco/helpers/ — see flamenco/helpers/README.md)
+flamenco/helpers/gigamux-check
+flamenco/helpers/gigamux-check.exe

@@ -1,0 +1,16 @@
+[package]
+name = "gigamux-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Flamenco worker helper: chunk/final integrity + farm intermediate cleanup"
+
+[[bin]]
+name = "gigamux-check"
+path = "src/main.rs"
+
+[dependencies]
+gigamux-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

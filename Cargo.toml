@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/GigaMux",
+    "apps/gigamux-check",
     "crates/gigamux-core",
 ]
 default-members = ["apps/GigaMux"]

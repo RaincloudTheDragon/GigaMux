@@ -147,6 +147,9 @@ pub struct Prefs {
     /// Last Manager `scripts/` folder used for `GigaMux.js` deploy (optional).
     #[serde(default)]
     pub flamenco_scripts_dir: String,
+    /// Absolute worker-reachable path to `gigamux-check` (no `.exe`). Empty → derive from Deploy scripts dir.
+    #[serde(default)]
+    pub flamenco_check_exe: String,
     /// Optional Flamenco worker tag UUID/name for submitted jobs (empty = tagless).
     #[serde(default)]
     pub flamenco_worker_tag: String,
@@ -200,6 +203,7 @@ impl Default for Prefs {
             work_during_inactivity: false,
             flamenco_manager_url: String::new(),
             flamenco_scripts_dir: String::new(),
+            flamenco_check_exe: String::new(),
             flamenco_worker_tag: String::new(),
             flamenco_ffmpeg_exe: String::new(),
             flamenco_chunking: false,

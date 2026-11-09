@@ -15,8 +15,9 @@ pub mod vmaf;
 pub mod webm_alpha;
 
 pub use check::{
-    check_issue_category, check_issue_severity, deletable_issues, delete_issue_outputs,
-    integrity_blocked_outputs, is_codec_mismatch_issue, is_orphan_output_issue,
+    check_chunk_file, check_issue_category, check_issue_severity, check_output_pair,
+    cleanup_farm_intermediates, deletable_issues, delete_issue_outputs, ensure_chunk_file,
+    ensure_out_file, integrity_blocked_outputs, is_codec_mismatch_issue, is_orphan_output_issue,
     issue_has_deletable_output, list_media, permanent_delete_file, restore_trashed_file, run_check,
     trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
@@ -25,13 +26,16 @@ pub use encode::{
     build_farm_chunked_job, build_farm_ffmpeg_argv, run_batch, write_farm_ffconcat, EncodeEvent,
     EncodeOptions, FarmChunkedJob, FarmEncodeRequest, FarmFfmpegCommand,
 };
-pub use ffmpeg_active::{active_ffmpeg_pid, ActiveFfmpegGuard};
+pub use ffmpeg_active::{active_ffmpeg_pid, kill_process_tree, ActiveFfmpegGuard};
 pub use flamenco::{
-    cancel_exec_mode_for_manager_version, deploy_gigamux_js, discover_manager, ensure_worker_tags,
-    fetch_worker_tags, flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
-    make_gigamux_chunked_job, make_gigamux_encode_job, ping_manager, rewrite_flamenco_twoway_path,
-    scripts_dir_from_manager_install, submit_job, CancelExecMode, FlamencoTwoway, SubmittedJob,
-    GIGAMUX_JS, REQUIRED_WORKER_TAGS,
+    cancel_exec_mode_for_manager_version, check_exe_from_deploy_scripts_dir, deploy_gigamux_js,
+    deploy_gigamux_manager, discover_manager, ensure_worker_tags, fetch_worker_tags,
+    flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
+    make_gigamux_chunked_job, make_gigamux_encode_job, normalize_check_exe_path, ping_manager,
+    resolve_flamenco_check_exe, rewrite_flamenco_twoway_path, scripts_dir_from_manager_install,
+    submit_job, CancelExecMode, DeployReport, FarmChunkCheck, FarmCleanup, FarmFinalCheck,
+    FlamencoIntegrity, FlamencoTwoway, SubmittedJob, DEFAULT_CHECK_EXE, GIGAMUX_JS,
+    REQUIRED_WORKER_TAGS,
 };
 pub use job_log::{
     encode_event_line, encode_logs_dir, job_logs_dir, vmaf_event_line, EncodeJobLog, JobLog,

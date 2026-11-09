@@ -1,10 +1,14 @@
-# Flamenco job type: GigaMux
+# Flamenco job type
 
-Prefer **Settings → Files → Deploy GigaMux.js…** in the app (picks Manager install or `scripts/`).
+Prefer **Settings → Files → Deploy GigaMux…** in the app.
 
-Manual: copy [`GigaMux.js`](GigaMux.js) into the Manager’s `scripts/` folder. Flamenco 3.7+ hot-loads; older builds may need a restart.
+Pick the **Manager install folder** (must contain `flamenco-manager.yaml`). Deploy writes:
 
-Then **Find** or set Manager URL, **Ensure tags** if you want `nvenc` / `qsv` / `vmaf`, and **Flamenco** / **Send to Flamenco** on an input.
+- `scripts/GigaMux.js`
+- `tools/gigamux-check.exe` (Windows)
+- `tools/gigamux-check` (Linux)
+
+Release builds ship both helpers next to `GigaMux.exe` under `helpers/` — Deploy finds them there. From-source builds: place binaries in [`helpers/`](helpers/) first (see that README). Deploy defaults **Worker check helper** to `{ManagerInstall}/tools/gigamux-check`, which assumes the Manager install is on **shared storage**. Override that path in Settings → Files if helpers live elsewhere.
 
 ## Cancel
 

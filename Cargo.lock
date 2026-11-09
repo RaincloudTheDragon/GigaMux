@@ -1310,6 +1310,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gigamux-check"
+version = "0.1.0"
+dependencies = [
+ "gigamux-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gigamux-core"
 version = "0.1.0"
 dependencies = [

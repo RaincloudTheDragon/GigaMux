@@ -26,11 +26,10 @@ use gigamux_core::encode::{
     EncodeOptions, FarmEncodeRequest,
 };
 use gigamux_core::flamenco::{
-    cancel_exec_mode_for_manager_version, deploy_gigamux_js, discover_manager, ensure_worker_tags,
-    flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
-    make_gigamux_chunked_job, make_gigamux_encode_job, ping_manager,
-    scripts_dir_from_manager_install, submit_job, CancelExecMode, FlamencoTwoway,
-    REQUIRED_WORKER_TAGS,
+    cancel_exec_mode_for_manager_version, deploy_gigamux_manager, discover_manager,
+    ensure_worker_tags, flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
+    make_gigamux_chunked_job, make_gigamux_encode_job, normalize_check_exe_path, ping_manager,
+    submit_job, CancelExecMode, FlamencoTwoway, REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
@@ -605,7 +604,7 @@ struct FlamencoSubmitPrompt {
 enum AlertAfterOk {
     #[default]
     None,
-    /// Open Settings → Files (e.g. Flamenco URL / Deploy GigaMux.js).
+    /// Open Settings → Files (e.g. Flamenco URL / Deploy GigaMux).
     OpenSettingsFiles,
 }
 
@@ -1976,6 +1975,7 @@ impl GigaMuxApp {
             self.prefs.work_during_inactivity = d.work_during_inactivity;
             self.prefs.flamenco_manager_url = d.flamenco_manager_url;
             self.prefs.flamenco_scripts_dir = d.flamenco_scripts_dir;
+            self.prefs.flamenco_check_exe = d.flamenco_check_exe;
             self.prefs.flamenco_worker_tag = d.flamenco_worker_tag;
             self.prefs.flamenco_ffmpeg_exe = d.flamenco_ffmpeg_exe;
             self.prefs.flamenco_chunking = d.flamenco_chunking;
@@ -2128,7 +2128,7 @@ impl GigaMuxApp {
             self.alert_error_with(
                 "Flamenco",
                 format!(
-                    "GigaMux.js is missing from:\n{scripts_dir}\n\nSettings → Files → Deploy GigaMux.js… then retry."
+                    "GigaMux.js is missing from:\n{scripts_dir}\n\nSettings → Files → Deploy GigaMux… then retry."
                 ),
                 AlertAfterOk::OpenSettingsFiles,
             );
@@ -6250,12 +6250,20 @@ impl GigaMuxApp {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("scripts/");
+            ui.label("Manager install");
             ui.label(
                 egui::RichText::new(if self.prefs.flamenco_scripts_dir.is_empty() {
                     "(not set)".into()
                 } else {
-                    self.prefs.flamenco_scripts_dir.clone()
+                    // Prefer showing Manager root when scripts/ was stored.
+                    let p = std::path::Path::new(&self.prefs.flamenco_scripts_dir);
+                    if p.file_name().is_some_and(|n| n == "scripts") {
+                        p.parent()
+                            .map(|x| x.display().to_string())
+                            .unwrap_or_else(|| self.prefs.flamenco_scripts_dir.clone())
+                    } else {
+                        self.prefs.flamenco_scripts_dir.clone()
+                    }
                 })
                 .weak()
                 .small(),
@@ -6263,42 +6271,49 @@ impl GigaMuxApp {
         });
         ui.horizontal(|ui| {
             if ui
-                .button("Deploy GigaMux.js…")
+                .button("Deploy GigaMux…")
                 .on_hover_text(
-                    "Copy bundled GigaMux.js into Manager scripts/. Pick the Manager install folder (has flamenco-manager.yaml) or the scripts/ folder itself.",
+                    "Pick the Manager install folder (must contain flamenco-manager.yaml). Writes scripts/GigaMux.js plus tools/gigamux-check.exe and tools/gigamux-check (Linux). Jobs point check_exe at that shared tools path.",
                 )
                 .clicked()
             {
                 if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Flamenco Manager folder or scripts/")
+                    .set_title("Flamenco Manager install folder")
                     .pick_folder()
                 {
-                    let scripts = if path.join("flamenco-manager.yaml").is_file() {
-                        scripts_dir_from_manager_install(&path)
-                    } else if path.file_name().is_some_and(|n| n == "scripts")
-                        || path.join("GigaMux.js").exists()
-                        || path
-                            .read_dir()
-                            .ok()
-                            .map(|mut d| d.any(|e| e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "js"))))
-                            .unwrap_or(false)
-                    {
-                        Ok(path.clone())
-                    } else {
-                        // Still try as Manager dir (creates scripts/ if yaml present).
-                        scripts_dir_from_manager_install(&path).or_else(|_| Ok(path.clone()))
-                    };
-                    match scripts.and_then(|dir| {
-                        deploy_gigamux_js(&dir).map(|dest| (dir, dest))
-                    }) {
-                        Ok((dir, dest)) => {
-                            self.prefs.flamenco_scripts_dir =
-                                dir.to_string_lossy().into_owned();
+                    match deploy_gigamux_manager(&path) {
+                        Ok(rep) => {
+                            self.prefs.flamenco_scripts_dir = rep
+                                .scripts_js
+                                .parent()
+                                .unwrap_or(rep.manager_dir.as_path())
+                                .to_string_lossy()
+                                .into_owned();
+                            // Default helper path = Deployed tools/ (assumes Manager install is on shared storage).
+                            self.prefs.flamenco_check_exe = normalize_check_exe_path(
+                                &rep.manager_dir
+                                    .join("tools")
+                                    .join("gigamux-check")
+                                    .to_string_lossy(),
+                            );
                             let _ = prefs::save(&self.prefs);
                             self.push_session(format!(
-                                "Flamenco deployed {}",
-                                dest.display()
+                                "Flamenco deployed {} ; {} ; {} ; check_exe={}",
+                                rep.scripts_js.display(),
+                                rep.tools_win.display(),
+                                rep.tools_linux.display(),
+                                self.prefs.flamenco_check_exe
                             ));
+                            self.show_alert(
+                                "Flamenco deploy",
+                                format!(
+                                    "Wrote:\n• {}\n• {}\n• {}\n\nWorker check path set to:\n{}\n\nAssumes the Manager install is on shared storage. If not, set Worker check helper to a path workers can open.",
+                                    rep.scripts_js.display(),
+                                    rep.tools_win.display(),
+                                    rep.tools_linux.display(),
+                                    self.prefs.flamenco_check_exe
+                                ),
+                            );
                         }
                         Err(e) => self.alert_error("Flamenco", format!("Flamenco deploy: {e}")),
                     }
@@ -6330,6 +6345,39 @@ impl GigaMuxApp {
                         ));
                     }
                     Err(e) => self.alert_error("Flamenco", format!("Flamenco tags: {e}")),
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Worker check helper");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.prefs.flamenco_check_exe)
+                        .desired_width(280.0)
+                        .hint_text(r"Z:\Flamenco\tools\gigamux-check"),
+                )
+                .on_hover_text(
+                    "Absolute path to gigamux-check that workers can open (shared storage). No .exe suffix. Deploy fills this from Manager tools/ when the Manager install is on shared storage; override if helpers live elsewhere.",
+                )
+                .changed()
+            {
+                self.prefs.flamenco_check_exe =
+                    normalize_check_exe_path(&self.prefs.flamenco_check_exe);
+                let _ = prefs::save(&self.prefs);
+            }
+            if ui
+                .button("Browse…")
+                .on_hover_text("Pick gigamux-check or gigamux-check.exe on shared storage.")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("gigamux-check (worker-reachable)")
+                    .add_filter("gigamux-check", &["exe", ""])
+                    .pick_file()
+                {
+                    self.prefs.flamenco_check_exe =
+                        normalize_check_exe_path(&path.to_string_lossy());
+                    let _ = prefs::save(&self.prefs);
                 }
             }
         });

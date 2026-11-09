@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use regex::Regex;
 use serde_json::Value;
@@ -18,6 +18,8 @@ const INPUT_EXTS: &[&str] = &[
 const OUTPUT_EXTS: &[&str] = &["mp4", "webm", "mkv"];
 const STREAM_END_SLACK_S: f64 = 1.0;
 const STREAM_END_SLACK_FRAC: f64 = 0.002;
+/// Allowed |input − output| `nb_frames` difference when both sides report counts.
+const NB_FRAMES_SLACK: u64 = 2;
 
 /// One reported mismatch or probe failure.
 #[derive(Debug, Clone)]
@@ -44,9 +46,242 @@ impl CheckReport {
 pub fn is_chunk_filename(name: &str) -> bool {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"(?i)^.+\.c\d{3}of\d{3}\.(mp4|webm)$").expect("chunk name regex")
+        Regex::new(r"(?i)^.+\.c\d{3}of\d{3}\.(mp4|webm|mkv)$").expect("chunk name regex")
     });
     re.is_match(name)
+}
+
+/// Absolute duration slack for farm chunk expects (frame-split rounding).
+const CHUNK_DUR_SLACK_S: f64 = 0.25;
+const CHUNK_DUR_SLACK_FRAC: f64 = 0.02;
+
+/// Force ffmpeg overwrite (`-y`); replaces a leading `-n` if present.
+fn argv_force_overwrite(argv: &[String]) -> Vec<String> {
+    let mut out = argv.to_vec();
+    // Skip argv[0] program name when swapping flags.
+    let start = if out.len() > 1 { 1 } else { 0 };
+    for a in out.iter_mut().skip(start) {
+        if a == "-n" {
+            *a = "-y".into();
+            return out;
+        }
+        if a == "-y" {
+            return out;
+        }
+    }
+    if out.len() > start {
+        out.insert(start, "-y".into());
+    }
+    out
+}
+
+/// Reuse a good existing chunk, otherwise encode with `-y` then healthcheck.
+///
+/// `ffmpeg_argv` is a full argv (leading program name ignored); `ffmpeg_exe` is what actually runs.
+pub fn ensure_chunk_file(
+    path: &Path,
+    expect_dur_s: f64,
+    ffmpeg_exe: &str,
+    ffmpeg_argv: &[String],
+) -> Result<(), String> {
+    if path.is_file() {
+        match check_chunk_file(path, expect_dur_s) {
+            Ok(()) => return Ok(()), // reuse existing good chunk
+            Err(e) => {
+                // Bad leftover — remove so `-y` encode is unambiguous on odd filesystems.
+                let _ = std::fs::remove_file(path);
+                // Surface why we're re-encoding (worker task log).
+                eprintln!("ensure-chunk: re-encode after failed check: {e}");
+            }
+        }
+    }
+    let exe = {
+        let t = ffmpeg_exe.trim();
+        if t.is_empty() {
+            "ffmpeg"
+        } else {
+            t
+        }
+    };
+    let argv = argv_force_overwrite(ffmpeg_argv);
+    let args: Vec<&str> = if argv.is_empty() {
+        Vec::new()
+    } else {
+        argv[1..].iter().map(String::as_str).collect()
+    };
+    // Inherit stdio so Flamenco captures live `-stats` (`.output()` buffers until exit → silent task log).
+    let status = Command::new(exe)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("ffmpeg start ({exe}): {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "ffmpeg encode failed (status {:?}); see task log for ffmpeg stderr",
+            status.code()
+        ));
+    }
+    check_chunk_file(path, expect_dur_s)
+}
+
+/// Reuse a good existing concat/mux output, otherwise run ffmpeg with `-y` then healthcheck.
+///
+/// Same contract as [`ensure_chunk_file`], but **surfaces** remove failures (locked incomplete leftovers must not block `-y`).
+pub fn ensure_out_file(
+    path: &Path,
+    expect_dur_s: f64,
+    ffmpeg_exe: &str,
+    ffmpeg_argv: &[String],
+) -> Result<(), String> {
+    if path.is_file() {
+        match check_chunk_file(path, expect_dur_s) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                std::fs::remove_file(path).map_err(|re| {
+                    format!(
+                        "ensure-out: cannot remove bad {}: {re} (check was: {e})",
+                        path.display()
+                    )
+                })?;
+                eprintln!("ensure-out: re-run after failed check: {e}");
+            }
+        }
+    }
+    let exe = {
+        let t = ffmpeg_exe.trim();
+        if t.is_empty() {
+            "ffmpeg"
+        } else {
+            t
+        }
+    };
+    let argv = argv_force_overwrite(ffmpeg_argv);
+    let args: Vec<&str> = if argv.is_empty() {
+        Vec::new()
+    } else {
+        argv[1..].iter().map(String::as_str).collect()
+    };
+    // Inherit stdio so Flamenco captures live `-stats`.
+    let status = Command::new(exe)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("ffmpeg start ({exe}): {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "ffmpeg ensure-out failed (status {:?}); see task log for ffmpeg stderr",
+            status.code()
+        ));
+    }
+    check_chunk_file(path, expect_dur_s)
+}
+
+/// Healthcheck one farm chunk file against its expected duration (video-only).
+pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!("chunk missing: {}", path.display()));
+    }
+    if expect_dur_s <= 0.0 {
+        return Err(format!("invalid expect_dur {expect_dur_s}"));
+    }
+    let info = file_info(path)?;
+    let Some(video) = first_video(&info) else {
+        return Err(format!("chunk missing video stream: {}", path.display()));
+    };
+    let declared = format_duration(&info).ok_or_else(|| {
+        format!("chunk missing duration: {}", path.display())
+    })?;
+    let slack = CHUNK_DUR_SLACK_S.max(expect_dur_s * CHUNK_DUR_SLACK_FRAC);
+    if (declared - expect_dur_s).abs() > slack {
+        return Err(format!(
+            "chunk duration mismatch: expect {expect_dur_s:.3}s, got {declared:.3}s ({})",
+            path.display()
+        ));
+    }
+    // Truncated containers: declared tags can lie while packets stop early.
+    if declared > 5.0 {
+        let codec = video
+            .get("codec_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let (written, premature) = written_media_seconds(path, Some(declared), codec);
+        let end_slack = STREAM_END_SLACK_S.max(declared * STREAM_END_SLACK_FRAC);
+        match written {
+            None if premature && codec.eq_ignore_ascii_case("av1") => {
+                // Same soft AV1 probe caveat as final check — do not fail the chunk.
+            }
+            None => {
+                return Err(format!(
+                    "Incomplete chunk: declared {declared:.2}s but no video packets readable ({})",
+                    path.display()
+                ));
+            }
+            Some(w) if premature || w + end_slack < declared => {
+                return Err(format!(
+                    "Incomplete chunk: declared {declared:.2}s but video ends at ~{w:.2}s ({})",
+                    path.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// One input/output pair integrity check (same rules as directory Check).
+pub fn check_output_pair(
+    input_path: &Path,
+    output_path: &Path,
+    targets: OutputTargets,
+) -> Result<(), String> {
+    if !input_path.is_file() {
+        return Err(format!("input missing: {}", input_path.display()));
+    }
+    if !output_path.is_file() {
+        return Err(format!("output missing: {}", output_path.display()));
+    }
+    let input_info = file_info(input_path)?;
+    let output_info = file_info(output_path)?;
+    match check_pair_inner(output_path, &input_info, &output_info, targets) {
+        None => Ok(()),
+        Some(msg) => Err(msg),
+    }
+}
+
+/// Delete farm intermediates for a stem (`*.cNNNofMMM.*`, `.ffconcat`, `.vcat.*`, `.vmux.mkv`). Permanent remove (shared storage).
+pub fn cleanup_farm_intermediates(
+    output_dir: &Path,
+    stem: &str,
+    ext: &str,
+    chunks: u32,
+) -> Result<(), String> {
+    let ext = ext.trim_start_matches('.');
+    let mut errors = Vec::new();
+    let mut remove = |path: PathBuf| {
+        if path.is_file() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                errors.push(format!("{}: {e}", path.display()));
+            }
+        }
+    };
+    if chunks > 0 {
+        for i in 0..chunks {
+            remove(output_dir.join(crate::chunk::chunk_output_name(stem, i, chunks, ext)));
+        }
+    }
+    remove(output_dir.join(format!("{stem}.ffconcat")));
+    remove(output_dir.join(format!("{stem}.vcat.{ext}")));
+    // Multi-audio MP4 staging (see farm mux MKV→final remux).
+    remove(output_dir.join(format!("{stem}.vmux.mkv")));
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn ext_of(name: &str) -> String {
@@ -101,6 +336,27 @@ fn implied_bitrate_bps(info: &Value) -> Option<f64> {
         return None;
     }
     Some((size as f64) * 8.0 / dur)
+}
+
+fn stream_nb_frames(stream: &Value) -> Option<u64> {
+    stream
+        .get("nb_frames")
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+        .filter(|&n| n > 0)
+}
+
+fn streams_of_type<'a>(info: &'a Value, codec_type: &str) -> Vec<&'a Value> {
+    info.get("streams")
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some(codec_type))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_pts_lines(text: &str) -> Option<f64> {
@@ -313,24 +569,8 @@ fn check_pair_inner(
         return Some("Alpha mismatch: opaque input but output has alpha".into());
     }
 
-    let in_audio: Vec<_> = input_info
-        .get("streams")
-        .and_then(|s| s.as_array())
-        .map(|a| {
-            a.iter()
-                .filter(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let out_audio: Vec<_> = output_info
-        .get("streams")
-        .and_then(|s| s.as_array())
-        .map(|a| {
-            a.iter()
-                .filter(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let in_audio = streams_of_type(input_info, "audio");
+    let out_audio = streams_of_type(output_info, "audio");
 
     if in_audio.len() != out_audio.len() {
         return Some(format!(
@@ -349,8 +589,31 @@ fn check_pair_inner(
         }
     }
 
+    let in_subs = streams_of_type(input_info, "subtitle");
+    let out_subs = streams_of_type(output_info, "subtitle");
+    if in_subs.len() != out_subs.len() {
+        return Some(format!(
+            "Subtitle stream count mismatch: Input={}, Output={}",
+            in_subs.len(),
+            out_subs.len()
+        ));
+    }
+
+    if let (Some(in_n), Some(out_n)) = (
+        stream_nb_frames(input_video),
+        stream_nb_frames(output_video),
+    ) {
+        let diff = in_n.abs_diff(out_n);
+        if diff > NB_FRAMES_SLACK {
+            return Some(format!(
+                "Frame count mismatch: Input={in_n}, Output={out_n}, Diff={diff} (slack {NB_FRAMES_SLACK})"
+            ));
+        }
+    }
+
     None
 }
+
 
 /// Check all input/output pairs under the two folders against `slots`.
 /// Non-test: one `(None, targets)` entry. Test mode: `(Some(TestN), targets)` per active batch.
@@ -447,7 +710,9 @@ pub fn run_check(
         let out_path = output_dir.join(&outp);
         match file_info(&out_path) {
             Ok(out_info) => match check_pair_inner(&out_path, &info, &out_info, slot) {
-                None => report.ok_pairs += 1,
+                None => {
+                    report.ok_pairs += 1;
+                }
                 Some(msg) => report.issues.push(CheckIssue {
                     input: Some(inf),
                     output: Some(outp),
@@ -525,6 +790,10 @@ pub fn check_issue_category(issue: &CheckIssue) -> &'static str {
         "Alpha mismatch"
     } else if m.starts_with("Audio") {
         "Audio mismatch"
+    } else if m.starts_with("Subtitle") {
+        "Subtitle mismatch"
+    } else if m.starts_with("Frame count") {
+        "Frame count mismatch"
     } else if m.starts_with("Input probe") {
         "Input probe failed"
     } else if m.starts_with("Output file error") {
@@ -657,7 +926,7 @@ pub fn restore_trashed_file(original: &Path) -> Result<(), String> {
 }
 
 /// Recycle output files listed on issues (skips “Missing from output”).
-/// Returns `(ok_count, fail_count, successfully trashed absolute paths)` for undo.
+/// Returns `(ok_count, fail_count, successfully trashed absolute paths, per-file error lines)` for undo / UI.
 pub fn delete_issue_outputs(
     output_dir: &Path,
     issues: &[CheckIssue],
@@ -691,4 +960,61 @@ pub fn list_media(dir: &Path, input_side: bool) -> Vec<PathBuf> {
         .into_iter()
         .map(|n| dir.join(n))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn chunk_check_missing_file() {
+        let err = check_chunk_file(Path::new("definitely-missing-chunk.webm"), 1.0).unwrap_err();
+        assert!(err.contains("chunk missing"), "{err}");
+    }
+
+    #[test]
+    fn cleanup_removes_known_intermediates() {
+        let dir = std::env::temp_dir().join(format!(
+            "gigamux_cleanup_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stem = "clip";
+        let ext = "mp4";
+        fs::write(dir.join("clip.c000of002.mp4"), b"x").unwrap();
+        fs::write(dir.join("clip.c001of002.mp4"), b"x").unwrap();
+        fs::write(dir.join("clip.ffconcat"), b"x").unwrap();
+        fs::write(dir.join("clip.vcat.mp4"), b"x").unwrap();
+        fs::write(dir.join("clip.vmux.mkv"), b"x").unwrap();
+        fs::write(dir.join("clip.mp4"), b"keep").unwrap();
+        cleanup_farm_intermediates(&dir, stem, ext, 2).unwrap();
+        assert!(!dir.join("clip.c000of002.mp4").exists());
+        assert!(!dir.join("clip.ffconcat").exists());
+        assert!(!dir.join("clip.vcat.mp4").exists());
+        assert!(!dir.join("clip.vmux.mkv").exists());
+        assert!(dir.join("clip.mp4").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunk_filename_accepts_mkv() {
+        assert!(is_chunk_filename("a.c000of003.mkv"));
+        assert!(is_chunk_filename("a.c000of003.webm"));
+        assert!(!is_chunk_filename("a.mp4"));
+    }
+
+    #[test]
+    fn argv_force_overwrite_swaps_n_for_y() {
+        let v = argv_force_overwrite(&[
+            "ffmpeg".into(),
+            "-n".into(),
+            "-i".into(),
+            "in.mp4".into(),
+        ]);
+        assert_eq!(v[1], "-y");
+        let already = argv_force_overwrite(&["ffmpeg".into(), "-y".into(), "out".into()]);
+        assert_eq!(already[1], "-y");
+    }
 }

@@ -6,8 +6,10 @@ use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::targets::{AlphaVideo, OutContainer, OpaqueVideo, OutputTargets};
 
 /// Bundled job compiler (deploy into Manager `scripts/`).
 pub const GIGAMUX_JS: &str = include_str!("../../../flamenco/GigaMux.js");
@@ -95,6 +97,118 @@ pub fn cancel_exec_mode_for_manager_version(version: &str) -> CancelExecMode {
         [maj] if *maj <= 3 => CancelExecMode::LegacyStub,
         _ => CancelExecMode::LegacyStub,
     }
+}
+
+/// Default worker binary name for hybrid integrity (`PATH` / Flamenco `tools/`).
+pub const DEFAULT_CHECK_EXE: &str = "gigamux-check";
+
+/// Final input→output integrity payload for `gigamux-check final`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FarmFinalCheck {
+    pub input: String,
+    pub output: String,
+    pub opaque_video: OpaqueVideo,
+    pub opaque_container: OutContainer,
+    pub alpha_video: AlphaVideo,
+    pub alpha_container: OutContainer,
+}
+
+impl FarmFinalCheck {
+    pub fn targets(&self) -> OutputTargets {
+        OutputTargets {
+            opaque_video: self.opaque_video,
+            opaque_container: self.opaque_container,
+            alpha_video: self.alpha_video,
+            alpha_container: self.alpha_container,
+        }
+    }
+}
+
+/// One chunk path + expected duration for same-task trailing healthcheck.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FarmChunkCheck {
+    pub path: String,
+    pub expect_dur: f64,
+}
+
+/// Delete farm intermediates after a successful final check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FarmCleanup {
+    pub dir: String,
+    pub stem: String,
+    pub ext: String,
+    /// Chunk count (`0` = no `*.cNNNofMMM.*` files).
+    pub chunks: u32,
+}
+
+/// Integrity settings embedded in a GigaMux Flamenco job (hybrid model).
+#[derive(Debug, Clone)]
+pub struct FlamencoIntegrity {
+    /// Worker exe name/path (`gigamux-check` by default).
+    pub check_exe: String,
+    /// Parallel to encode tasks (empty when not chunking).
+    pub chunk_checks: Vec<FarmChunkCheck>,
+    pub final_check: Option<FarmFinalCheck>,
+    /// Only run after successful final check (chunked jobs).
+    pub cleanup: Option<FarmCleanup>,
+}
+
+impl Default for FlamencoIntegrity {
+    fn default() -> Self {
+        Self {
+            check_exe: DEFAULT_CHECK_EXE.into(),
+            chunk_checks: Vec::new(),
+            final_check: None,
+            cleanup: None,
+        }
+    }
+}
+
+/// Strip a trailing `.exe` so one path works on Windows (CreateProcess) and Linux.
+pub fn normalize_check_exe_path(path: &str) -> String {
+    let t = path.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    t.strip_suffix(".exe")
+        .or_else(|| t.strip_suffix(".EXE"))
+        .unwrap_or(t)
+        .to_string()
+}
+
+/// `scripts/` or Manager install from last Deploy → `{manager}/tools/gigamux-check` (no `.exe`; Windows CreateProcess adds it).
+///
+/// Empty / unknown → bare `gigamux-check` (PATH fallback).
+pub fn check_exe_from_deploy_scripts_dir(scripts_or_manager: &str) -> String {
+    let t = scripts_or_manager.trim();
+    if t.is_empty() {
+        return DEFAULT_CHECK_EXE.to_string();
+    }
+    let p = Path::new(t);
+    let manager = if p.file_name().and_then(|n| n.to_str()) == Some("scripts") {
+        p.parent().unwrap_or(p)
+    } else if p.join("flamenco-manager.yaml").is_file() || p.join("tools").is_dir() {
+        p
+    } else if p.join("GigaMux.js").is_file() {
+        // Bare scripts dir without being named "scripts".
+        p.parent().unwrap_or(p)
+    } else {
+        p
+    };
+    manager
+        .join("tools")
+        .join(DEFAULT_CHECK_EXE)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Prefer explicit worker-reachable helper path; else Deploy-derived Manager `tools/`; else PATH name.
+pub fn resolve_flamenco_check_exe(override_path: &str, scripts_or_manager: &str) -> String {
+    let over = normalize_check_exe_path(override_path);
+    if !over.is_empty() {
+        return over;
+    }
+    check_exe_from_deploy_scripts_dir(scripts_or_manager)
 }
 
 /// Optional two-way path rewrite for argv (Flamenco only HasPrefix-replaces whole setting strings).
@@ -431,7 +545,52 @@ pub fn scripts_dir_from_manager_install(manager_dir: &Path) -> Result<PathBuf, S
     Ok(scripts)
 }
 
-/// Copy bundled `GigaMux.js` into `scripts_dir`.
+/// Paths written by [`deploy_gigamux_manager`].
+#[derive(Debug, Clone)]
+pub struct DeployReport {
+    pub manager_dir: PathBuf,
+    pub scripts_js: PathBuf,
+    pub tools_win: PathBuf,
+    pub tools_linux: PathBuf,
+}
+
+/// Candidate dirs that may contain prebuilt `gigamux-check` helpers.
+fn helper_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.join("helpers"));
+            roots.push(dir.join("flamenco").join("helpers"));
+            // Dev: GigaMux.exe under target/debug → repo flamenco/helpers + target/release.
+            roots.push(dir.join("..").join("..").join("flamenco").join("helpers"));
+            roots.push(dir.join("..").join("release"));
+            roots.push(dir.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join("flamenco").join("helpers"));
+        roots.push(cwd.join("helpers"));
+        roots.push(cwd.join("target").join("release"));
+    }
+    // Compile-time workspace path (dev builds of gigamux-core).
+    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../flamenco/helpers"));
+    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release"));
+    roots
+}
+
+fn find_helper_file(file_name: &str) -> Result<PathBuf, String> {
+    for root in helper_search_roots() {
+        let p = root.join(file_name);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err(format!(
+        "missing helper `{file_name}` — expected next to the app under helpers/ (release) or flamenco/helpers/ (dev; see flamenco/helpers/README.md)"
+    ))
+}
+
+/// Copy bundled `GigaMux.js` into `scripts_dir` (legacy; prefer [`deploy_gigamux_manager`]).
 pub fn deploy_gigamux_js(scripts_dir: &Path) -> Result<PathBuf, String> {
     if !scripts_dir.is_dir() {
         return Err(format!("not a directory: {}", scripts_dir.display()));
@@ -441,13 +600,68 @@ pub fn deploy_gigamux_js(scripts_dir: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// Deploy job script + Win/Linux `gigamux-check` into a Manager install folder.
+///
+/// Requires `flamenco-manager.yaml` (not a bare `scripts/` pick). Writes:
+/// - `scripts/GigaMux.js`
+/// - `tools/gigamux-check.exe` (Windows)
+/// - `tools/gigamux-check` (Linux)
+///
+/// Workers must still have `gigamux-check` on `PATH` (`misc`/`exec` does not search worker `tools/`).
+pub fn deploy_gigamux_manager(manager_dir: &Path) -> Result<DeployReport, String> {
+    let scripts = scripts_dir_from_manager_install(manager_dir)?;
+    let tools = manager_dir.join("tools");
+    fs::create_dir_all(&tools).map_err(|e| format!("create tools/: {e}"))?;
+
+    let win_src = find_helper_file("gigamux-check.exe")?;
+    let linux_src = find_helper_file("gigamux-check")?;
+    // Refuse accidentally deploying the Windows PE as the Linux name.
+    if win_src.canonicalize().ok() == linux_src.canonicalize().ok() {
+        return Err(
+            "Windows and Linux helpers resolved to the same file — place a Linux ELF at flamenco/helpers/gigamux-check"
+                .into(),
+        );
+    }
+
+    let scripts_js = deploy_gigamux_js(&scripts)?;
+    let tools_win = tools.join("gigamux-check.exe");
+    let tools_linux = tools.join("gigamux-check");
+    fs::copy(&win_src, &tools_win)
+        .map_err(|e| format!("copy {}: {e}", tools_win.display()))?;
+    fs::copy(&linux_src, &tools_linux)
+        .map_err(|e| format!("copy {}: {e}", tools_linux.display()))?;
+    // Windows→SMB copies usually drop the Unix execute bit; set it when the OS supports it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&tools_linux)
+            .map_err(|e| format!("stat {}: {e}", tools_linux.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tools_linux, perms)
+            .map_err(|e| format!("chmod {}: {e}", tools_linux.display()))?;
+    }
+
+    Ok(DeployReport {
+        manager_dir: manager_dir.to_path_buf(),
+        scripts_js,
+        tools_win,
+        tools_linux,
+    })
+}
+
 /// True when `scripts_dir/GigaMux.js` exists (local path from last Deploy).
 pub fn local_gigamux_js_present(scripts_dir: &str) -> bool {
     let t = scripts_dir.trim();
     if t.is_empty() {
         return false;
     }
-    Path::new(t).join("GigaMux.js").is_file()
+    let p = Path::new(t);
+    // Accept either scripts/ path or Manager install path.
+    if p.join("GigaMux.js").is_file() {
+        return true;
+    }
+    p.join("scripts").join("GigaMux.js").is_file()
 }
 
 /// User-facing hint when Manager rejects a GigaMux job due to missing/old script.
@@ -455,13 +669,13 @@ pub fn flamenco_script_hint(err_or_body: &str) -> Option<&'static str> {
     let lower = err_or_body.to_ascii_lowercase();
     if lower.contains("job type unknown") {
         Some(
-            "GigaMux.js is missing from the Manager scripts/ folder (or Manager has not loaded it). Settings → Files → Deploy GigaMux.js… then retry",
+            "GigaMux.js is missing from the Manager scripts/ folder (or Manager has not loaded it). Settings → Files → Deploy GigaMux… then retry",
         )
     } else if lower.contains("ffmpeg_argv_json is required")
         || (lower.contains("encode_argvs_json") && lower.contains("required"))
     {
         Some(
-            "Manager has an old/incompatible GigaMux.js. Settings → Files → Deploy GigaMux.js… then retry",
+            "Manager has an old/incompatible GigaMux.js. Settings → Files → Deploy GigaMux… then retry",
         )
     } else {
         None
@@ -535,6 +749,23 @@ pub fn ensure_worker_tags(manager_url: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_exe_from_scripts_dir() {
+        assert_eq!(
+            check_exe_from_deploy_scripts_dir(r"Z:\Flamenco\scripts"),
+            r"Z:\Flamenco\tools\gigamux-check"
+        );
+        assert_eq!(check_exe_from_deploy_scripts_dir(""), DEFAULT_CHECK_EXE);
+        assert_eq!(
+            resolve_flamenco_check_exe(r"W:\shared\tools\gigamux-check.exe", ""),
+            r"W:\shared\tools\gigamux-check"
+        );
+        assert_eq!(
+            resolve_flamenco_check_exe("", r"Z:\Flamenco\scripts"),
+            r"Z:\Flamenco\tools\gigamux-check"
+        );
+    }
 
     #[test]
     fn script_hint_maps_manager_errors() {
