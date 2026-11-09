@@ -6119,7 +6119,7 @@ impl GigaMuxApp {
                 "Write encoder metadata",
             )
             .on_hover_text(
-                "Stamp GigaMux_encoder / GigaMux_hw (codec + NVENC gen / QSV) into output files.",
+                "Stamp GigaMux (version[+git SHA]), GigaMux_encoder, and GigaMux_hw into output files.",
             )
             .changed()
         {
@@ -6159,7 +6159,7 @@ impl GigaMuxApp {
                 "Write encoder metadata",
             )
             .on_hover_text(
-                "Stamp GigaMux_encoder / GigaMux_hw into outputs (also on Settings → Encode).",
+                "Stamp GigaMux (version[+git SHA]), GigaMux_encoder, and GigaMux_hw into outputs (also on Settings → Encode).",
             )
             .changed()
         {

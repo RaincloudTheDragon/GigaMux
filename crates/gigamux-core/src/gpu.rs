@@ -553,12 +553,36 @@ fn parse_gpu_list(stderr: &str) -> Result<Vec<NvencDevice>, String> {
     Ok(devices)
 }
 
-/// Build `GigaMux_encoder` / `GigaMux_hw` metadata pairs for an encode.
+/// Workspace crate version (`0.1.0`) plus optional `+` short git SHA from [`build.rs`](../../build.rs).
+pub fn gigamux_version_payload() -> String {
+    let ver = env!("CARGO_PKG_VERSION");
+    let sha = env!("GIGAMUX_GIT_SHA");
+    if sha.is_empty() {
+        ver.to_string()
+    } else {
+        format!("{ver}+{sha}")
+    }
+}
+
+/// OBS-style label, e.g. `GigaMux (0.1.0+abcdef12)`.
+pub fn gigamux_version_label() -> String {
+    format!("GigaMux ({})", gigamux_version_payload())
+}
+
+/// Build metadata pairs stamped into outputs when Write encoder metadata is on.
 pub fn encoder_metadata_tags(
     encoder_name: &str,
     hw: Option<&str>,
 ) -> Vec<(String, String)> {
-    let mut tags = vec![("GigaMux_encoder".into(), sanitize_meta_token(encoder_name))];
+    let payload = gigamux_version_payload();
+    let label = gigamux_version_label();
+    let mut tags = vec![
+        ("GigaMux_encoder".into(), sanitize_meta_token(encoder_name)),
+        // Keep `0.1.0+abcdef12` literal (do not run through sanitize_meta_token — it mangles `+` / `.`).
+        ("GigaMux_version".into(), payload),
+        // OBS-style; some muxers still overwrite with Lavf — UI prefers GigaMux_* on probe.
+        ("encoder".into(), label),
+    ];
     if let Some(h) = hw {
         // `hw` is already built from sanitize_meta_token pieces.
         tags.push(("GigaMux_hw".into(), h.to_string()));
@@ -610,6 +634,21 @@ mod tests {
             nvenc_generation_from_sm_name(0, 0, "GeForce GTX 680"),
             NvencGeneration::Kepler
         );
+    }
+
+    #[test]
+    fn version_label_shape() {
+        let payload = gigamux_version_payload();
+        let label = gigamux_version_label();
+        assert!(label.starts_with("GigaMux ("));
+        assert!(label.ends_with(')'));
+        assert!(label.contains(env!("CARGO_PKG_VERSION")));
+        // Pre-release builds usually embed SHA; empty only if git was unavailable at compile.
+        if !env!("GIGAMUX_GIT_SHA").is_empty() {
+            assert!(payload.contains('+'));
+            assert_eq!(env!("GIGAMUX_GIT_SHA").len(), 8);
+        }
+        assert_eq!(label, format!("GigaMux ({payload})"));
     }
 
     #[test]

@@ -804,15 +804,26 @@ fn build_cmd(
         } else {
             None
         };
-        for (k, v) in encoder_metadata_tags(enc_name, hw.as_deref()) {
-            cmd.extend(["-metadata".into(), format!("{k}={v}")]);
-        }
+        append_gigamux_metadata(&mut cmd, out_container, &encoder_metadata_tags(enc_name, hw.as_deref()));
     }
 
     cmd.push("-avoid_negative_ts".into());
     cmd.push("make_zero".into());
     cmd.push(output.to_string_lossy().into_owned());
     cmd
+}
+
+/// Stamp GigaMux_* / encoder tags. MP4 needs `use_metadata_tags` or custom keys stay invisible to ffprobe (Lavf still owns `encoder`).
+fn append_gigamux_metadata(cmd: &mut Vec<String>, container: OutContainer, tags: &[(String, String)]) {
+    if tags.is_empty() {
+        return;
+    }
+    if container == OutContainer::Mp4 {
+        cmd.extend(["-movflags".into(), "+use_metadata_tags".into()]);
+    }
+    for (k, v) in tags {
+        cmd.extend(["-metadata".into(), format!("{k}={v}")]);
+    }
 }
 
 /// Parse `time=HH:MM:SS.cs` or `time=123.45` from an ffmpeg progress line.
@@ -1676,9 +1687,8 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
             "1".into(),
         ]);
     }
-    for (k, v) in &gigamux_meta_tags {
-        mux_argv.extend(["-metadata".into(), format!("{k}={v}")]);
-    }
+    // Intermediate Matroska — no movflags needed; remux re-stamps for MP4 visibility.
+    append_gigamux_metadata(&mut mux_argv, OutContainer::Mkv, &gigamux_meta_tags);
     mux_argv.push(vmux_path.to_string_lossy().into_owned());
 
     // Remux → final container (bitstream copy; separate Flamenco task so soft-fail never re-joins).
@@ -1700,13 +1710,7 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
     if !raw.is_empty() {
         mux_remux_argv.extend(["-bsf:a".into(), "setts=ts=TS-STARTPTS".into()]);
     }
-    // MP4 needs use_metadata_tags or custom GigaMux_* keys stay invisible to ffprobe.
-    if container == OutContainer::Mp4 && !gigamux_meta_tags.is_empty() {
-        mux_remux_argv.extend(["-movflags".into(), "+use_metadata_tags".into()]);
-    }
-    for (k, v) in &gigamux_meta_tags {
-        mux_remux_argv.extend(["-metadata".into(), format!("{k}={v}")]);
-    }
+    append_gigamux_metadata(&mut mux_remux_argv, container, &gigamux_meta_tags);
     mux_remux_argv.push(final_output.to_string_lossy().into_owned());
 
     Ok(FarmChunkedJob {
@@ -1813,6 +1817,18 @@ pub fn farm_integrity_for_chunked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mp4_metadata_gets_use_metadata_tags() {
+        let tags = encoder_metadata_tags("hevc_nvenc", Some("NVENC_Ada"));
+        let mut mp4 = Vec::new();
+        append_gigamux_metadata(&mut mp4, OutContainer::Mp4, &tags);
+        assert!(mp4.windows(2).any(|w| w[0] == "-movflags" && w[1] == "+use_metadata_tags"));
+        assert!(mp4.iter().any(|a| a.starts_with("GigaMux_version=")));
+        let mut mkv = Vec::new();
+        append_gigamux_metadata(&mut mkv, OutContainer::Mkv, &tags);
+        assert!(!mkv.iter().any(|a| a.contains("use_metadata_tags")));
+    }
 
     #[test]
     fn deliver_path_keeps_dots_in_stem() {

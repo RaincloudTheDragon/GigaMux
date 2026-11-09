@@ -43,10 +43,10 @@ pub use job_log::{
     JobLogKind,
 };
 pub use gpu::{
-    av1_nvenc_available, encoder_metadata_tags, list_av1_nvenc_devices, list_nvenc_devices,
-    list_nvenc_devices_for, nvenc_encoder_works, nvenc_generation_from_sm_name, probe_local_encoders,
-    qsv_vp9_available, sanitize_meta_token, GpuChoice, HwCatalog, NvencDevice, NvencGeneration,
-    QsvDevice,
+    av1_nvenc_available, encoder_metadata_tags, gigamux_version_label, gigamux_version_payload,
+    list_av1_nvenc_devices, list_nvenc_devices, list_nvenc_devices_for, nvenc_encoder_works,
+    nvenc_generation_from_sm_name, probe_local_encoders, qsv_vp9_available, sanitize_meta_token,
+    GpuChoice, HwCatalog, NvencDevice, NvencGeneration, QsvDevice,
 };
 pub use prefs::{logs_dir, EncodeSlot, Prefs};
 pub use probe::{

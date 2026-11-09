@@ -93,7 +93,7 @@ pub struct MediaSummary {
     pub has_obs_chapters: bool,
     /// True when format/stream tags explicitly mention OBS.
     pub from_obs: bool,
-    /// Format `encoder` tag when present (e.g. Lavf… / obs-studio).
+    /// Display encoder: `GigaMux (ver[+sha])` when stamped, else format `encoder` (OBS / Lavf).
     pub encoder: Option<String>,
     pub has_alpha: bool,
     /// First video stream `pix_fmt` (e.g. yuv422p); empty when unknown.
@@ -103,7 +103,7 @@ pub struct MediaSummary {
 
 impl MediaSummary {
     /// Bump when summary fields change so UI preview cache re-fetches.
-    pub const SCHEMA: u32 = 4;
+    pub const SCHEMA: u32 = 5;
 }
 
 /// RGBA thumbnail extracted via ffmpeg (fixed canvas for easy UI upload).
@@ -576,11 +576,29 @@ fn tag_strings(info: &Value) -> Vec<String> {
 }
 
 /// True when any format/stream/chapter tag key or value mentions OBS.
+/// Encoder display prefers GigaMux stamps over Lavf when present (OBS-style `GigaMux (0.1.0+…)`).
 fn detect_obs_origin(info: &Value) -> (bool, Option<String>) {
-    let encoder = info
-        .pointer("/format/tags/encoder")
+    let tags = info.pointer("/format/tags");
+    let gigamux_ver = tags
+        .and_then(|t| t.get("GigaMux_version"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let gigamux_enc = tags
+        .and_then(|t| t.get("GigaMux_encoder"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let encoder = if let Some(ver) = gigamux_ver {
+        Some(format!("GigaMux ({ver})"))
+    } else if gigamux_enc.is_some() {
+        // Older outputs stamped codec/hw but not version.
+        Some("GigaMux".into())
+    } else {
+        tags.and_then(|t| t.get("encoder"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
     let from_obs = tag_strings(info)
         .iter()
         .any(|s| s.to_ascii_lowercase().contains("obs"));
