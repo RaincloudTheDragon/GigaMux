@@ -43,7 +43,7 @@ Your codec choices in GigaMux:
 1. Set **Input** and **Output** folders (`Change…` on each path row).
 2. Pick Opaque targets (codec / container / Use hardware). Alpha targets are ignored unless an input has Alpha (only use if you need VP9 with transparency).
 3. Leave Maxrate empty for the GigaMux Target (CQ0 + auto ceiling from the source average bitrate), or type a kbps override.
-4. Select files and **Encode** (or press **F12**). Right-click a row to encode one file. Existing outputs are skipped unless you force them.
+4. Select files and **Encode** (or press **F12**). Right-click a row to encode one file. Existing outputs are skipped unless you force them. **Flamenco** uses the Input selection when present; with nothing selected on Input it queues every input (same idea as Encode all).
 5. **Check** so you know your outputs are intact.
 6. Use VMAF to get scores for your outputs. Option for minmaxers, quite useful for test mode so you can choose a target.
 

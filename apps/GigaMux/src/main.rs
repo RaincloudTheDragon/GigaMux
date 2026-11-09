@@ -2134,7 +2134,7 @@ impl GigaMuxApp {
         }
     }
 
-    /// Open the Flamenco sender dialog for the current Input selection (or `only_name`).
+    /// Open the Flamenco sender dialog for the Input selection, `only_name`, or every input when none selected.
     fn open_flamenco_submit(&mut self, only_name: Option<String>) {
         let url = self.prefs.flamenco_manager_url.trim();
         if url.is_empty() {
@@ -2154,16 +2154,16 @@ impl GigaMuxApp {
         }
         let names: Vec<String> = if let Some(n) = only_name {
             vec![n]
-        } else if self.active.as_ref().is_some_and(|(s, _)| *s == FileSide::Input) {
+        } else if self.active.as_ref().is_some_and(|(s, _)| *s == FileSide::Input)
+            && !self.selected.is_empty()
+        {
             self.selected_names_ordered()
         } else {
-            Vec::new()
+            // No Input selection (or focus on Output) → send the whole Input list.
+            self.names_for(FileSide::Input)
         };
         if names.is_empty() {
-            self.alert_error(
-                "Flamenco",
-                "select input file(s) (or use context menu) for Flamenco submit",
-            );
+            self.alert_error("Flamenco", "no input files to send");
             return;
         }
         let (estimate_name, estimate_duration_s) = names
@@ -2229,10 +2229,7 @@ impl GigaMuxApp {
         self.commit_maxrate_override_edit(TestBatch::One);
         self.commit_cq_override_edit(TestBatch::One);
         if names.is_empty() {
-            self.alert_error(
-                "Flamenco",
-                "select input file(s) (or use context menu) for Flamenco submit",
-            );
+            self.alert_error("Flamenco", "no input files to send");
             return;
         }
         // Local Deploy path remembered: catch missing GigaMux.js before Manager returns "job type unknown".
@@ -5366,7 +5363,7 @@ impl GigaMuxApp {
                                 if ui
                                     .add_enabled(farm_ok, egui::Button::new(farm_label))
                                     .on_hover_text(
-                                        "Submit selected input(s) to Flamenco Manager (one job each via GigaMux.js)",
+                                        "Submit this selection to Flamenco (one job each via GigaMux.js). With nothing selected, Flamenco sends every input.",
                                     )
                                     .on_disabled_hover_text(
                                         "Set Flamenco Manager URL in Settings → Files",
@@ -5666,7 +5663,7 @@ impl GigaMuxApp {
                             egui::Button::new("Flamenco").min_size(egui::vec2(120.0, 28.0)),
                         )
                         .on_hover_text(
-                            "Open Flamenco sender for every selected input. Use Settings → Files to Find Manager, Deploy JS, Ensure tags.",
+                            "Open Flamenco sender for the Input selection, or every input when none are selected. Settings → Files: Find Manager, Deploy JS, Ensure tags.",
                         )
                         .on_disabled_hover_text(
                             "Set Flamenco Manager URL (or Find) in Settings → Files",
