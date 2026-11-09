@@ -5408,16 +5408,28 @@ impl GigaMuxApp {
                                 }
                                 ui.close();
                             }
-                            if ui
-                                .button("Reveal in file browser")
-                                .on_hover_text("Select this file in Explorer / Finder / file manager")
-                                .clicked()
                             {
-                                self.select_file(side, name.clone());
-                                if let Err(e) = reveal_path_in_os(path) {
-                                    self.alert_error("Reveal", format!("reveal failed: {e}"));
+                                let multi_reveal = self.is_selected(side, &name)
+                                    && self.selected.len() > 1;
+                                let reveal_label = if multi_reveal {
+                                    format!("Reveal {} in file browser", self.selected.len())
+                                } else {
+                                    "Reveal in file browser".into()
+                                };
+                                if ui
+                                    .button(reveal_label)
+                                    .on_hover_text(
+                                        "Select in Explorer / Finder. Multi-select reveals every selected file in the same folder.",
+                                    )
+                                    .clicked()
+                                {
+                                    if let Err(e) =
+                                        self.reveal_active_selection(side, &name, path)
+                                    {
+                                        self.alert_error("Reveal", format!("reveal failed: {e}"));
+                                    }
+                                    ui.close();
                                 }
-                                ui.close();
                             }
                             let rename_label = if self.is_selected(side, &name)
                                 && self.selected.len() > 1
@@ -7698,6 +7710,34 @@ fn short_path(path: &Path) -> String {
 }
 
 /// Open a path with the OS default handler (same as double-click in Explorer).
+/// Reveal the current multi-selection when `clicked` is part of it; otherwise reveal `clicked` alone.
+impl GigaMuxApp {
+    fn reveal_active_selection(
+        &mut self,
+        side: FileSide,
+        clicked: &str,
+        clicked_path: &Path,
+    ) -> Result<(), String> {
+        let paths: Vec<PathBuf> =
+            if self.is_selected(side, clicked) && self.selected.len() > 1 {
+                let dir = match side {
+                    FileSide::Input => self.prefs.input_dir.clone(),
+                    FileSide::Output => self.prefs.output_dir.clone(),
+                };
+                self.selected_names_ordered()
+                    .into_iter()
+                    .map(|n| dir.join(n))
+                    .collect()
+            } else {
+                if !self.is_selected(side, clicked) {
+                    self.select_file(side, clicked.to_string());
+                }
+                vec![clicked_path.to_path_buf()]
+            };
+        reveal_paths_in_os(&paths)
+    }
+}
+
 fn open_path_in_os(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -7738,20 +7778,41 @@ fn open_path_in_os(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Reveal a file/folder in the OS file browser (select in Explorer / Finder; open parent on Linux).
-fn reveal_path_in_os(path: &Path) -> Result<(), String> {
+/// Reveal one or more paths in the OS file browser (multi-select when same parent folder).
+fn reveal_paths_in_os(paths: &[PathBuf]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
     #[cfg(target_os = "windows")]
     {
         // Keep mapped letter drives (Z:\…) — canonicalize() would rewrite them to UNC.
-        reveal_path_in_os_windows(&windows_path_for_shell(path))
+        let paths: Vec<PathBuf> = paths.iter().map(|p| windows_path_for_shell(p)).collect();
+        if paths.len() == 1 {
+            return reveal_one_in_os_windows(&paths[0]);
+        }
+        let folder = paths[0]
+            .parent()
+            .ok_or_else(|| "reveal: no parent folder".to_string())?
+            .to_path_buf();
+        // Drop anything that is not a sibling of the first path (shouldn't happen for one pane).
+        let siblings: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| p.parent() == Some(folder.as_path()))
+            .cloned()
+            .collect();
+        if siblings.is_empty() {
+            return reveal_one_in_os_windows(&paths[0]);
+        }
+        return reveal_many_in_os_windows(&folder, &siblings);
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let path = path
+        let path = paths[0]
             .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf());
+            .unwrap_or_else(|_| paths[0].clone());
         #[cfg(target_os = "macos")]
         {
+            // Finder `open -R` is single-item; reveal the primary and leave multi for Windows Shell.
             Command::new("open")
                 .args(["-R", &path.to_string_lossy()])
                 .spawn()
@@ -7806,30 +7867,80 @@ fn strip_win_extended_prefix(s: &str) -> String {
     }
 }
 
-/// Windows: Shell `SHOpenFolderAndSelectItems` (explorer `/select,` mishandles spaces and `\\?\`).
 #[cfg(target_os = "windows")]
-fn reveal_path_in_os_windows(path: &Path) -> Result<(), String> {
+fn path_to_wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+/// Windows: single item via absolute PIDL (`cidl == 0`).
+#[cfg(target_os = "windows")]
+fn reveal_one_in_os_windows(path: &Path) -> Result<(), String> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
 
-    let s = path.to_string_lossy().into_owned();
-    let wide: Vec<u16> = std::ffi::OsStr::new(&s)
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-
+    let wide = path_to_wide(path);
     unsafe {
-        // Ignore already-initialized / mode mismatch; egui may have COM up already.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let item = ILCreateFromPathW(PCWSTR(wide.as_ptr()));
         if item.is_null() {
-            return Err(format!("reveal: could not resolve {s}"));
+            return Err(format!("reveal: could not resolve {}", path.display()));
         }
         let hr = SHOpenFolderAndSelectItems(item, None, 0);
         ILFree(Some(item));
         hr.map_err(|e| format!("reveal: {e}"))
+    }
+}
+
+/// Windows: select many siblings in one Explorer window (`SHOpenFolderAndSelectItems` + relative PIDLs).
+#[cfg(target_os = "windows")]
+fn reveal_many_in_os_windows(folder: &Path, files: &[PathBuf]) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        ILCreateFromPathW, ILFindLastID, ILFree, SHOpenFolderAndSelectItems,
+    };
+
+    let folder_wide = path_to_wide(folder);
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let folder_pidl = ILCreateFromPathW(PCWSTR(folder_wide.as_ptr()));
+        if folder_pidl.is_null() {
+            return Err(format!("reveal: could not resolve folder {}", folder.display()));
+        }
+
+        // Absolute child PIDLs must stay alive: ILFindLastID returns a pointer into each.
+        let mut abs_pidls = Vec::with_capacity(files.len());
+        let mut rel_pidls: Vec<*const windows::Win32::UI::Shell::Common::ITEMIDLIST> =
+            Vec::with_capacity(files.len());
+        for f in files {
+            let wide = path_to_wide(f);
+            let abs = ILCreateFromPathW(PCWSTR(wide.as_ptr()));
+            if abs.is_null() {
+                continue;
+            }
+            let rel = ILFindLastID(abs);
+            if rel.is_null() {
+                ILFree(Some(abs));
+                continue;
+            }
+            rel_pidls.push(rel);
+            abs_pidls.push(abs);
+        }
+
+        let result = if rel_pidls.is_empty() {
+            Err("reveal: could not resolve any selected files".into())
+        } else {
+            SHOpenFolderAndSelectItems(folder_pidl, Some(&rel_pidls), 0)
+                .map_err(|e| format!("reveal: {e}"))
+        };
+
+        for abs in abs_pidls {
+            ILFree(Some(abs));
+        }
+        ILFree(Some(folder_pidl));
+        result
     }
 }
 
