@@ -1,0 +1,55 @@
+# Build a Windows app zip with both Flamenco helpers so Deploy works without cargo.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  helpers-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Linux gigamux-check
+        run: cargo build -p gigamux-check --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helper-linux
+          path: target/release/gigamux-check
+
+  app-windows:
+    runs-on: windows-latest
+    needs: helpers-linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build GigaMux + Windows helper
+        run: cargo build -p GigaMux -p gigamux-check --release
+      - uses: actions/download-artifact@v4
+        with:
+          name: helper-linux
+          path: _helper_linux
+      - name: Stage release layout
+        shell: pwsh
+        run: |
+          $stage = "dist/GigaMux"
+          New-Item -ItemType Directory -Force -Path "$stage/helpers" | Out-Null
+          Copy-Item target/release/GigaMux.exe "$stage/GigaMux.exe"
+          Copy-Item target/release/gigamux-check.exe "$stage/helpers/gigamux-check.exe"
+          Copy-Item _helper_linux/gigamux-check "$stage/helpers/gigamux-check"
+          Compress-Archive -Path "$stage/*" -DestinationPath dist/GigaMux-windows-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GigaMux-windows-x64
+          path: dist/GigaMux-windows-x64.zip
+      - name: Upload GitHub Release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/GigaMux-windows-x64.zip
+          generate_release_notes: true
