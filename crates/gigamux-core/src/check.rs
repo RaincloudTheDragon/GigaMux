@@ -18,8 +18,12 @@ const INPUT_EXTS: &[&str] = &[
 const OUTPUT_EXTS: &[&str] = &["mp4", "webm", "mkv"];
 const STREAM_END_SLACK_S: f64 = 1.0;
 const STREAM_END_SLACK_FRAC: f64 = 0.002;
+/// Soft-WARN threshold for |video start − audio start| (Check Low; farm final does not hard-fail).
+const AV_START_SKEW_S: f64 = 0.025;
 /// Allowed |input − output| `nb_frames` difference when both sides report counts.
 const NB_FRAMES_SLACK: u64 = 2;
+/// Soft warn when output implied bitrate is below this fraction of input (often valid for static footage).
+const BITRATE_FLOOR_FRAC: f64 = 0.05;
 
 /// One reported mismatch or probe failure.
 #[derive(Debug, Clone)]
@@ -348,6 +352,13 @@ fn stream_nb_frames(stream: &Value) -> Option<u64> {
         .filter(|&n| n > 0)
 }
 
+fn stream_start_s(stream: &Value) -> Option<f64> {
+    stream.get("start_time").and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
 fn streams_of_type<'a>(info: &'a Value, codec_type: &str) -> Vec<&'a Value> {
     info.get("streams")
         .and_then(|s| s.as_array())
@@ -614,6 +625,39 @@ fn check_pair_inner(
     None
 }
 
+/// Soft warnings for a structurally OK pair (UI Check Low WARN, not farm `final` hard-fail).
+fn check_pair_soft_warnings(input_info: &Value, output_info: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    // Same idea as encode_VOD.py: flag huge size cuts, but static desktop can legitimately compress ~95%+.
+    if let (Some(in_bps), Some(out_bps)) = (
+        implied_bitrate_bps(input_info),
+        implied_bitrate_bps(output_info),
+    ) {
+        if in_bps > 0.0 && out_bps < in_bps * BITRATE_FLOOR_FRAC {
+            out.push(format!(
+                "Bitrate floor: output {:.1} kbps is below {:.0}% of input {:.1} kbps (may be fine for static footage)",
+                out_bps / 1000.0,
+                BITRATE_FLOOR_FRAC * 100.0,
+                in_bps / 1000.0
+            ));
+        }
+    }
+    // A/V start skew (farm mux can leave ~44ms on Linux Matroska); WARN only so cleanup still runs.
+    if let (Some(out_v), Some(out_a0)) = (
+        streams_of_type(output_info, "video").into_iter().next(),
+        streams_of_type(output_info, "audio").into_iter().next(),
+    ) {
+        if let (Some(vs), Some(aus)) = (stream_start_s(out_v), stream_start_s(out_a0)) {
+            let skew = (vs - aus).abs();
+            if skew > AV_START_SKEW_S {
+                out.push(format!(
+                    "A/V start skew: video={vs:.3}s audio={aus:.3}s diff={skew:.3}s (max {AV_START_SKEW_S:.3}s)"
+                ));
+            }
+        }
+    }
+    out
+}
 
 /// Check all input/output pairs under the two folders against `slots`.
 /// Non-test: one `(None, targets)` entry. Test mode: `(Some(TestN), targets)` per active batch.
@@ -712,6 +756,14 @@ pub fn run_check(
             Ok(out_info) => match check_pair_inner(&out_path, &info, &out_info, slot) {
                 None => {
                     report.ok_pairs += 1;
+                    // Soft WARN only (Low severity / not default-purge); farm final ignores these.
+                    for msg in check_pair_soft_warnings(&info, &out_info) {
+                        report.issues.push(CheckIssue {
+                            input: Some(inf.clone()),
+                            output: Some(outp.clone()),
+                            message: msg,
+                        });
+                    }
                 }
                 Some(msg) => report.issues.push(CheckIssue {
                     input: Some(inf),
@@ -766,6 +818,8 @@ pub fn check_issue_severity(issue: &CheckIssue) -> CheckSeverity {
     if is_codec_mismatch_issue(issue)
         || is_orphan_output_issue(issue)
         || issue.message.starts_with("AV1 output unreadable")
+        || issue.message.starts_with("Bitrate floor:")
+        || issue.message.starts_with("A/V start skew:")
     {
         CheckSeverity::Low
     } else if issue.message.starts_with("Missing from output") {
@@ -794,6 +848,10 @@ pub fn check_issue_category(issue: &CheckIssue) -> &'static str {
         "Subtitle mismatch"
     } else if m.starts_with("Frame count") {
         "Frame count mismatch"
+    } else if m.starts_with("Bitrate floor") {
+        "Bitrate floor"
+    } else if m.starts_with("A/V start skew") {
+        "A/V start skew"
     } else if m.starts_with("Input probe") {
         "Input probe failed"
     } else if m.starts_with("Output file error") {

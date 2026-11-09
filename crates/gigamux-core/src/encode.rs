@@ -1631,13 +1631,21 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
         "1:s?".into(),
         "-c:v".into(),
         "copy".into(),
+        // Reset PTS so Linux Matroska mux does not leave ~44ms video-ahead of source audio.
+        "-bsf:v".into(),
+        "setts=ts=TS-STARTPTS".into(),
     ]);
     let raw = audio_codec_name(&info);
     if raw.is_empty() {
         mux_argv.push("-an".into());
     } else {
         match audio_encode_for(&raw, container) {
-            AudioEncode::Copy => mux_argv.extend(["-c:a".into(), "copy".into()]),
+            AudioEncode::Copy => mux_argv.extend([
+                "-c:a".into(),
+                "copy".into(),
+                "-bsf:a".into(),
+                "setts=ts=TS-STARTPTS".into(),
+            ]),
             AudioEncode::Aac => {
                 let a_k = audio_bitrate_k(&req.input);
                 mux_argv.extend([
@@ -1674,6 +1682,7 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
     mux_argv.push(vmux_path.to_string_lossy().into_owned());
 
     // Remux → final container (bitstream copy; separate Flamenco task so soft-fail never re-joins).
+    // setts on remux heals an already-skewed `.vmux.mkv` without re-joining chunks.
     let mut mux_remux_argv = vec![
         "ffmpeg".into(),
         "-v".into(),
@@ -1685,7 +1694,16 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
         "0".into(),
         "-c".into(),
         "copy".into(),
+        "-bsf:v".into(),
+        "setts=ts=TS-STARTPTS".into(),
     ];
+    if !raw.is_empty() {
+        mux_remux_argv.extend(["-bsf:a".into(), "setts=ts=TS-STARTPTS".into()]);
+    }
+    // MP4 needs use_metadata_tags or custom GigaMux_* keys stay invisible to ffprobe.
+    if container == OutContainer::Mp4 && !gigamux_meta_tags.is_empty() {
+        mux_remux_argv.extend(["-movflags".into(), "+use_metadata_tags".into()]);
+    }
     for (k, v) in &gigamux_meta_tags {
         mux_remux_argv.extend(["-metadata".into(), format!("{k}={v}")]);
     }
