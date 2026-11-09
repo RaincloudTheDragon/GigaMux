@@ -2691,23 +2691,43 @@ impl GigaMuxApp {
         }
     }
 
-    /// ← input / → output: jump to the same-stem file on that side.
-    /// `prefer` selects which test batch when landing on Output in test mode.
+    /// ← input / → output: jump selection to same-stem twins on that side.
+    /// Multi-select maps each name; unpaired twins are dropped silently. `prefer` picks the Output test batch.
     fn jump_to_side_prefer(&mut self, ctx: &egui::Context, target: FileSide, prefer: TestBatch) {
-        let Some((side, name)) = self.active.clone() else {
+        let Some((side, primary)) = self.active.clone() else {
             return;
         };
         if side == target {
             return;
         }
-        if let Some(other) = self.counterpart_name_prefer(side, &name, prefer) {
-            if target == FileSide::Output {
-                self.focus_out_test_slot_for(ctx, &other);
-            }
-            self.select_file(target, other);
-            // Keep the landed row on-screen (same path as ↑/↓ / Home/End).
-            self.scroll_sel_into_view = true;
+        let selected = self.selected_names_ordered();
+        // Preserve list order; HashSet later collapses Output→Input collisions (same stem).
+        let landed: Vec<String> = selected
+            .iter()
+            .filter_map(|n| self.counterpart_name_prefer(side, n, prefer))
+            .collect();
+        if landed.is_empty() {
+            return;
         }
+        let primary_twin = self.counterpart_name_prefer(side, &primary, prefer);
+        let focus = primary_twin
+            .clone()
+            .or_else(|| landed.first().cloned());
+        if target == FileSide::Output {
+            if let Some(ref name) = focus {
+                self.focus_out_test_slot_for(ctx, name);
+            }
+        }
+        let set: HashSet<String> = landed.into_iter().collect();
+        let anchor = primary_twin.clone().or(focus);
+        self.select_set(target, set, anchor);
+        // Keep focus on the twin of the previous primary when it survived.
+        if let Some(p) = primary_twin {
+            if self.selected.contains(&p) {
+                self.set_primary(target, p);
+            }
+        }
+        self.scroll_sel_into_view = true;
     }
 
     /// Shift+↑/↓ on Output in test mode: cycle among active test encodes for this stem.
@@ -4833,7 +4853,7 @@ impl GigaMuxApp {
             if ui
                 .checkbox(&mut self.prefs.test_mode, "Test mode")
                 .on_hover_text(
-                    "Encode each input as test1_*…testN_* with independent targets for size + VMAF comparison. ←/→ = Test1, Shift+←/→ cycles prefer, Shift+↑/↓ cycles siblings.",
+                    "Encode each input as test1_*…testN_* with independent targets for size + VMAF comparison. ←/→ jumps selection (drops missing twins); Shift+←/→ cycles prefer; Shift+↑/↓ cycles siblings.",
                 )
                 .changed()
             {

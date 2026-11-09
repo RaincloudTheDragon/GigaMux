@@ -47,6 +47,8 @@ Your codec choices in GigaMux:
 5. **Check** so you know your outputs are intact.
 6. Use VMAF to get scores for your outputs. Option for minmaxers, quite useful for test mode so you can choose a target.
 
+Pane footers show folder totals (`N items · size`). With a selection, they also show `index/total` and selected size; **Output** adds ↓/↑ size compare vs the paired Input(s) for the selection and for the whole folder.
+
 ### Test mode
 
 Enable **Test mode** on the Output path row (next to Change…). Choose **2–4 Target Slots** (default 2). Each selected input encodes once per slot, sequentially, into the same folder:
@@ -57,9 +59,9 @@ The Output column shows a compare strip (size Δ vs the original input; VMAF sco
 
 Navigation while Test mode is on (Output list):
 
-- `←` / `→` - jump by stem, prefer Test1
-- `Shift+←` / `Shift+→` - cycle prefer among active slots, then pair-jump
-- `Shift+↑` / `Shift+↓` - cycle sibling test files for the same stem
+- `←` / `→` — jump the current selection by stem (prefer Test1); names with no twin on the other side are dropped
+- `Shift+←` / `Shift+→` — cycle prefer among active slots, then selection pair-jump
+- `Shift+↑` / `Shift+↓` — cycle sibling test files for the same stem
 
 ### Check & VMAF
 
@@ -73,8 +75,8 @@ Navigation while Test mode is on (Output list):
 | `F12` | Encode selection |
 | `F5` | Reload / re-index folders |
 | `Ctrl+F5` | Wipe preview cache, then re-index (can be heavy; wipes expensive VMAF results) |
-| `←` / `→` | Jump to paired file (Input ↔ Output; Test mode prefers Test1) |
-| `Shift+←` / `Shift+→` | Test mode: cycle prefer among active slots, then pair-jump |
+| `←` / `→` | Jump selection to paired twins (Input ↔ Output; missing twins dropped; Test mode prefers Test1) |
+| `Shift+←` / `Shift+→` | Test mode: cycle prefer among active slots, then selection pair-jump |
 | `Shift+↑` / `Shift+↓` | Test mode Output: cycle sibling among active `testN_*` |
 | `Ctrl+Z` | Undo delete / rename |
 | `Ctrl+J` | Expand/toggle log |
