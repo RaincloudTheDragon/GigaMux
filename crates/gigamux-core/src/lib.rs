@@ -23,8 +23,9 @@ pub use check::{
 };
 pub use chunk::{chunk_time_range, estimate_total_frames, parse_fps};
 pub use encode::{
-    build_farm_chunked_job, build_farm_ffmpeg_argv, run_batch, write_farm_ffconcat, EncodeEvent,
-    EncodeOptions, FarmChunkedJob, FarmEncodeRequest, FarmFfmpegCommand,
+    build_farm_chunked_job, build_farm_ffmpeg_argv, farm_integrity_for_chunked,
+    farm_integrity_for_single, run_batch, write_farm_ffconcat, EncodeEvent, EncodeOptions,
+    FarmChunkedJob, FarmEncodeRequest, FarmFfmpegCommand,
 };
 pub use ffmpeg_active::{active_ffmpeg_pid, kill_process_tree, ActiveFfmpegGuard};
 pub use flamenco::{

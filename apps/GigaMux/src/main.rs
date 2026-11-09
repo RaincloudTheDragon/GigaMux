@@ -22,14 +22,15 @@ use gigamux_core::check::{
 };
 use gigamux_core::chunk::chunk_time_range;
 use gigamux_core::encode::{
-    build_farm_chunked_job, build_farm_ffmpeg_argv, run_batch, write_farm_ffconcat, EncodeEvent,
-    EncodeOptions, FarmEncodeRequest,
+    build_farm_chunked_job, build_farm_ffmpeg_argv, farm_integrity_for_chunked,
+    farm_integrity_for_single, run_batch, write_farm_ffconcat, EncodeEvent, EncodeOptions,
+    FarmEncodeRequest,
 };
 use gigamux_core::flamenco::{
     cancel_exec_mode_for_manager_version, deploy_gigamux_manager, discover_manager,
     ensure_worker_tags, flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
     make_gigamux_chunked_job, make_gigamux_encode_job, normalize_check_exe_path, ping_manager,
-    submit_job, CancelExecMode, FlamencoTwoway, REQUIRED_WORKER_TAGS,
+    resolve_flamenco_check_exe, submit_job, CancelExecMode, FlamencoTwoway, REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
@@ -2252,15 +2253,22 @@ impl GigaMuxApp {
                     failed += 1;
                     continue;
                 }
+                let mut integrity = farm_integrity_for_chunked(&farm, &job_built);
+                integrity.check_exe = resolve_flamenco_check_exe(
+                    &self.prefs.flamenco_check_exe,
+                    &self.prefs.flamenco_scripts_dir,
+                );
                 let job = match make_gigamux_chunked_job(
                     format!("GigaMux {name}"),
                     exe,
                     &job_built.encode_argvs,
-                    &job_built.concat_argv,
                     &job_built.mux_argv,
+                    &job_built.mux_remux_argv,
+                    job_built.out_expect_dur_s,
                     tag,
                     twoway,
                     cancel_exec,
+                    Some(integrity),
                 ) {
                     Ok(j) => j,
                     Err(e) => {
@@ -2320,6 +2328,11 @@ impl GigaMuxApp {
                 skipped += 1;
                 continue;
             }
+            let mut integrity = farm_integrity_for_single(&farm, &cmd);
+            integrity.check_exe = resolve_flamenco_check_exe(
+                &self.prefs.flamenco_check_exe,
+                &self.prefs.flamenco_scripts_dir,
+            );
             let job = match make_gigamux_encode_job(
                 format!("GigaMux {name}"),
                 exe,
@@ -2327,6 +2340,7 @@ impl GigaMuxApp {
                 tag,
                 twoway,
                 cancel_exec,
+                Some(integrity),
             ) {
                 Ok(j) => j,
                 Err(e) => {

@@ -48,11 +48,16 @@ Assign workers to those tags in Flamenco after probing. Submit with **Worker tag
 
 ## Job type
 
-- Script: [CODE0](../flamenco/GigaMux.js) (also embedded in the app for Deploy)
-- Single encode: one `misc`/`exec` task (`encode_argvs_json` length 1, or legacy `ffmpeg_argv_json`)
-- Chunked encode (sender option): `encode-c0`…`encode-cN` (video-only frame slices) → `concat` task (ffconcat join + mux source audio). Chunk files are named `{stem}.c000of004.{ext}` (Check already ignores these). The submitter writes the `.ffconcat` onto shared storage before POST so workers need no probe.
+Script: [GigaMux.js](../flamenco/GigaMux.js) (bundled for Deploy). Redeploy after GigaMux updates; the Manager keeps its own copy until you do.
 
-When GigaMux ships a newer bundled `GigaMux.js`, redeploy it to the Manager via **Settings → Files → Deploy GigaMux.js…**. The Manager keeps its own copy until you do this, and GigaMux will not be able to submit jobs.
+- **Single:** `encode` → `final-check`
+- **Chunked:** `encode-c*` (`ensure-chunk`) → `mux` (ffconcat + source audio/subs → `.vmux.mkv`) → `remux` (→ final) → `final-check` → `cleanup`
+
+Flamenco soft-fail retries only that task, so `mux` and `remux` stay separate (a remux retry must not re-join chunks). Chunk healthcheck runs in the same task as the encode; `final-check` is separate and may fail the job. Helpers: [flamenco/helpers/README.md](../flamenco/helpers/README.md).
+
+`mux` stages through Matroska so multi-audio MP4 copy does not hit mid-file `-22`; there is no `.vcat` intermediate (join+audio is one pass). On a bad final, requeue `remux` + `final-check` (and `mux` only if `.vmux.mkv` is missing/bad).
+
+Jobs expect `gigamux-check` beside the Manager on shared storage; otherwise set **Worker check helper** to a path with both Win and Linux binaries.
 
 ### Two-way / mixed OS paths
 
@@ -64,10 +69,10 @@ Farm `.ffconcat` lists use **basenames** (chunks next to the list) so Linux work
 
 | Control | Default | Behavior |
 | --- | --- | --- |
-| Chunk encode | off | N equal frame ranges (`2`–`32`), then concat/mux |
+| Chunk encode | off | N equal frame ranges (`2`–`32`), then mux/remux |
 | Only chunk software | on | HW opaque paths stay single-task; software/alpha still chunk |
 
-Skip if the final deliver already exists. Chunk encodes and mux use ffmpeg `-n` (never overwrite).
+Skip if the final deliver already exists (submitter). Chunk argv is submitted as `-n`; `ensure-chunk` / `ensure-out` only force `-y` when rebuilding a bad/missing file.
 
 ## Cancel
 

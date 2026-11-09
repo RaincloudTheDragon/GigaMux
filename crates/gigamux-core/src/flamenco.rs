@@ -102,6 +102,13 @@ pub fn cancel_exec_mode_for_manager_version(version: &str) -> CancelExecMode {
 /// Default worker binary name for hybrid integrity (`PATH` / Flamenco `tools/`).
 pub const DEFAULT_CHECK_EXE: &str = "gigamux-check";
 
+/// One chunk path + expected duration for same-task trailing healthcheck.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FarmChunkCheck {
+    pub path: String,
+    pub expect_dur: f64,
+}
+
 /// Final input→output integrity payload for `gigamux-check final`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FarmFinalCheck {
@@ -122,13 +129,6 @@ impl FarmFinalCheck {
             alpha_container: self.alpha_container,
         }
     }
-}
-
-/// One chunk path + expected duration for same-task trailing healthcheck.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FarmChunkCheck {
-    pub path: String,
-    pub expect_dur: f64,
 }
 
 /// Delete farm intermediates after a successful final check.
@@ -162,6 +162,22 @@ impl Default for FlamencoIntegrity {
             cleanup: None,
         }
     }
+}
+
+fn rewrite_integrity_paths(mut integ: FlamencoIntegrity, tw: Option<FlamencoTwoway<'_>>) -> FlamencoIntegrity {
+    // Absolute check_exe (Manager tools/ on shared storage) must brace like argv paths.
+    integ.check_exe = rewrite_path_arg(&integ.check_exe, tw);
+    for c in &mut integ.chunk_checks {
+        c.path = rewrite_path_arg(&c.path, tw);
+    }
+    if let Some(f) = integ.final_check.as_mut() {
+        f.input = rewrite_path_arg(&f.input, tw);
+        f.output = rewrite_path_arg(&f.output, tw);
+    }
+    if let Some(c) = integ.cleanup.as_mut() {
+        c.dir = rewrite_path_arg(&c.dir, tw);
+    }
+    integ
 }
 
 /// Strip a trailing `.exe` so one path works on Windows (CreateProcess) and Linux.
@@ -209,6 +225,39 @@ pub fn resolve_flamenco_check_exe(override_path: &str, scripts_or_manager: &str)
         return over;
     }
     check_exe_from_deploy_scripts_dir(scripts_or_manager)
+}
+
+fn rewrite_path_arg(arg: &str, tw: Option<FlamencoTwoway<'_>>) -> String {
+    match tw {
+        Some(tw) => rewrite_flamenco_twoway_path(arg, tw),
+        None => arg.to_string(),
+    }
+}
+
+fn integrity_settings_json(integ: &FlamencoIntegrity) -> Result<(String, String, String, String), String> {
+    let check_exe = {
+        let t = integ.check_exe.trim();
+        if t.is_empty() {
+            DEFAULT_CHECK_EXE.to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    let chunk_checks_json = if integ.chunk_checks.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&integ.chunk_checks)
+            .map_err(|e| format!("serialize chunk_checks: {e}"))?
+    };
+    let final_check_json = match &integ.final_check {
+        Some(f) => serde_json::to_string(f).map_err(|e| format!("serialize final_check: {e}"))?,
+        None => String::new(),
+    };
+    let cleanup_json = match &integ.cleanup {
+        Some(c) => serde_json::to_string(c).map_err(|e| format!("serialize cleanup: {e}"))?,
+        None => String::new(),
+    };
+    Ok((check_exe, chunk_checks_json, final_check_json, cleanup_json))
 }
 
 /// Optional two-way path rewrite for argv (Flamenco only HasPrefix-replaces whole setting strings).
@@ -281,6 +330,7 @@ pub fn make_gigamux_encode_job(
     worker_tag: Option<&str>,
     twoway: Option<FlamencoTwoway<'_>>,
     cancel_exec: CancelExecMode,
+    integrity: Option<FlamencoIntegrity>,
 ) -> Result<SubmittedJob, String> {
     if ffmpeg_argv.is_empty() {
         return Err("ffmpeg argv is empty".into());
@@ -293,6 +343,9 @@ pub fn make_gigamux_encode_job(
     // Also set encode_argvs_json (length 1) so newer GigaMux.js prefers the array form.
     let encode_argvs_json =
         serde_json::to_string(&vec![&argv]).map_err(|e| format!("serialize encode_argvs: {e}"))?;
+    let integ = rewrite_integrity_paths(integrity.unwrap_or_default(), twoway);
+    let (check_exe, chunk_checks_json, final_check_json, cleanup_json) =
+        integrity_settings_json(&integ)?;
     let settings = json!({
         "ffmpeg_exe": exe,
         "ffmpeg_argv_json": argv_json,
@@ -300,6 +353,10 @@ pub fn make_gigamux_encode_job(
         "concat_argv_json": "",
         "mux_argv_json": "",
         "cancel_exec": cancel_exec.as_setting(),
+        "check_exe": check_exe,
+        "chunk_checks_json": chunk_checks_json,
+        "final_check_json": final_check_json,
+        "cleanup_json": cleanup_json,
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -311,43 +368,65 @@ pub fn make_gigamux_encode_job(
     })
 }
 
-/// Chunked encode job: N video-only encodes + concat + mux (GigaMux.js task graph).
+/// Chunked encode job: N video-only encodes + stage mux + remux (GigaMux.js task graph).
 pub fn make_gigamux_chunked_job(
     name: impl Into<String>,
     ffmpeg_exe: Option<&str>,
     encode_argvs: &[Vec<String>],
-    concat_argv: &[String],
     mux_argv: &[String],
+    mux_remux_argv: &[String],
+    out_expect_dur_s: f64,
     worker_tag: Option<&str>,
     twoway: Option<FlamencoTwoway<'_>>,
     cancel_exec: CancelExecMode,
+    integrity: Option<FlamencoIntegrity>,
 ) -> Result<SubmittedJob, String> {
     if encode_argvs.is_empty() {
         return Err("encode_argvs is empty".into());
     }
-    if concat_argv.is_empty() || mux_argv.is_empty() {
-        return Err("chunked job requires concat_argv and mux_argv".into());
+    if mux_argv.is_empty() || mux_remux_argv.is_empty() {
+        return Err("chunked job requires mux_argv and mux_remux_argv".into());
+    }
+    if out_expect_dur_s <= 0.0 {
+        return Err(format!("out_expect_dur_s must be > 0 (got {out_expect_dur_s})"));
     }
     let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
     let encode_rewritten: Vec<Vec<String>> = encode_argvs
         .iter()
         .map(|a| rewrite_argv_twoway(a, twoway))
         .collect();
-    let concat_rewritten = rewrite_argv_twoway(concat_argv, twoway);
     let mux_rewritten = rewrite_argv_twoway(mux_argv, twoway);
+    let mux_remux_rewritten = rewrite_argv_twoway(mux_remux_argv, twoway);
     let encode_argvs_json = serde_json::to_string(&encode_rewritten)
         .map_err(|e| format!("serialize encode_argvs: {e}"))?;
-    let concat_argv_json = serde_json::to_string(&concat_rewritten)
-        .map_err(|e| format!("serialize concat_argv: {e}"))?;
-    let mux_argv_json = serde_json::to_string(&mux_rewritten)
-        .map_err(|e| format!("serialize mux_argv: {e}"))?;
+    let mux_argv_json =
+        serde_json::to_string(&mux_rewritten).map_err(|e| format!("serialize mux_argv: {e}"))?;
+    let mux_remux_argv_json = serde_json::to_string(&mux_remux_rewritten)
+        .map_err(|e| format!("serialize mux_remux_argv: {e}"))?;
+    let integ = rewrite_integrity_paths(integrity.unwrap_or_default(), twoway);
+    if !integ.chunk_checks.is_empty() && integ.chunk_checks.len() != encode_argvs.len() {
+        return Err(format!(
+            "chunk_checks length {} != encode_argvs {}",
+            integ.chunk_checks.len(),
+            encode_argvs.len()
+        ));
+    }
+    let (check_exe, chunk_checks_json, final_check_json, cleanup_json) =
+        integrity_settings_json(&integ)?;
+    // concat_argv_json stays empty — stage mux reads ffconcat directly (no `.vcat`).
     let settings = json!({
         "ffmpeg_exe": exe,
         "encode_argvs_json": encode_argvs_json,
-        "concat_argv_json": concat_argv_json,
+        "concat_argv_json": "",
         "mux_argv_json": mux_argv_json,
+        "mux_remux_argv_json": mux_remux_argv_json,
+        "out_expect_dur": out_expect_dur_s,
         "ffmpeg_argv_json": "",
         "cancel_exec": cancel_exec.as_setting(),
+        "check_exe": check_exe,
+        "chunk_checks_json": chunk_checks_json,
+        "final_check_json": final_check_json,
+        "cleanup_json": cleanup_json,
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -534,7 +613,7 @@ pub fn scripts_dir_from_manager_install(manager_dir: &Path) -> Result<PathBuf, S
     let yaml = manager_dir.join("flamenco-manager.yaml");
     if !yaml.is_file() {
         return Err(format!(
-            "{} not found; pick the folder that contains the Flamenco Manager executable",
+            "{} not found; pick the Manager install folder (contains flamenco-manager.yaml)",
             yaml.display()
         ));
     }
@@ -751,6 +830,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn integrity_paths_rewrite_with_twoway() {
+        let integ = FlamencoIntegrity {
+            check_exe: r"Z:\Flamenco\tools\gigamux-check".into(),
+            final_check: Some(FarmFinalCheck {
+                input: r"Z:\GigaMux\in\a.mp4".into(),
+                output: r"Z:\GigaMux\out\a.mp4".into(),
+                opaque_video: OpaqueVideo::Av1,
+                opaque_container: OutContainer::Mp4,
+                alpha_video: AlphaVideo::Vp9,
+                alpha_container: OutContainer::Webm,
+            }),
+            ..FlamencoIntegrity::default()
+        };
+        let argv = vec!["ffmpeg".into(), "-i".into(), r"Z:\GigaMux\in\a.mp4".into()];
+        let job = make_gigamux_encode_job(
+            "t",
+            None,
+            &argv,
+            None,
+            Some(FlamencoTwoway {
+                local_prefix: r"Z:\",
+                var_name: "shared_storage_path",
+            }),
+            CancelExecMode::Direct,
+            Some(integ),
+        )
+        .unwrap();
+        let final_json = job.settings["final_check_json"].as_str().unwrap();
+        assert!(final_json.contains("{shared_storage_path}/GigaMux/in/a.mp4"));
+        assert!(final_json.contains("{shared_storage_path}/GigaMux/out/a.mp4"));
+        assert_eq!(
+            job.settings["check_exe"],
+            "{shared_storage_path}/Flamenco/tools/gigamux-check"
+        );
+    }
+
+    #[test]
     fn check_exe_from_scripts_dir() {
         assert_eq!(
             check_exe_from_deploy_scripts_dir(r"Z:\Flamenco\scripts"),
@@ -822,6 +938,7 @@ mod tests {
                 var_name: "shared_storage_path",
             }),
             CancelExecMode::Direct,
+            None,
         )
         .unwrap();
         let enc = job.settings["encode_argvs_json"].as_str().unwrap();

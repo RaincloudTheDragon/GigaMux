@@ -13,6 +13,7 @@ use crate::chunk::{
     chunk_frame_range, estimate_total_frames, list_chunk_paths, parse_fps, write_ffconcat,
     CHUNK_SEEK_PAD_S,
 };
+use crate::flamenco::{FarmChunkCheck, FarmCleanup, FarmFinalCheck, FlamencoIntegrity};
 use crate::gpu::{encoder_metadata_tags, GpuChoice, HwCatalog};
 use crate::job_log::{JobLog, JobLogKind};
 use crate::probe::{
@@ -135,14 +136,18 @@ pub struct FarmFfmpegCommand {
     pub bitrate_label: String,
 }
 
-/// Chunked Flamenco job: N video-only encodes + concat + mux source audio.
+/// Chunked Flamenco job: N video-only encodes + stage mux (ffconcat+audio) + remux.
 #[derive(Debug, Clone)]
 pub struct FarmChunkedJob {
     pub final_output: PathBuf,
     pub chunk_paths: Vec<PathBuf>,
     pub encode_argvs: Vec<Vec<String>>,
-    pub concat_argv: Vec<String>,
+    /// Stage: ffconcat video + source audio/subs → `{stem}.vmux.mkv` (no `.vcat` intermediate).
     pub mux_argv: Vec<String>,
+    /// Remux: `.vmux.mkv` → final deliver (`-c copy`, all streams); separate Flamenco task.
+    pub mux_remux_argv: Vec<String>,
+    /// Sum of chunk durations (ensure-out expect for vmux / final).
+    pub out_expect_dur_s: f64,
     /// Written by the submitter onto shared storage before POST.
     pub ffconcat_path: PathBuf,
     pub chunk_durations_s: Vec<f64>,
@@ -1552,84 +1557,17 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
             }),
             None,
         );
+        // Submitted as `-n`; `gigamux-check ensure-chunk` only forces `-y` when re-encoding a bad/missing file.
         farm_argv_never_overwrite(&mut argv);
         encode_argvs.push(argv);
     }
 
     let ffconcat_path = req.output_dir.join(format!("{stem}.ffconcat"));
-    let vcat_path = req
-        .output_dir
-        .join(format!("{stem}.vcat.{}", container.ext()));
-    // Concat: stream-copy video only (chunks are -an).
-    let concat_argv = vec![
-        "ffmpeg".into(),
-        "-v".into(),
-        "info".into(),
-        "-y".into(),
-        "-f".into(),
-        "concat".into(),
-        "-safe".into(),
-        "0".into(),
-        "-i".into(),
-        ffconcat_path.to_string_lossy().into_owned(),
-        "-map".into(),
-        "0:v:0".into(),
-        "-c".into(),
-        "copy".into(),
-        vcat_path.to_string_lossy().into_owned(),
-    ];
-    // Mux source audio onto concatenated video → final deliver.
-    let mut mux_argv = vec![
-        "ffmpeg".into(),
-        "-v".into(),
-        "info".into(),
-        "-y".into(),
-        "-i".into(),
-        vcat_path.to_string_lossy().into_owned(),
-        "-i".into(),
-        req.input.to_string_lossy().into_owned(),
-        "-map".into(),
-        "0:v:0".into(),
-        "-map".into(),
-        "1:a?".into(),
-        "-c:v".into(),
-        "copy".into(),
-    ];
-    let raw = audio_codec_name(&info);
-    if raw.is_empty() {
-        mux_argv.push("-an".into());
-    } else {
-        match audio_encode_for(&raw, container) {
-            AudioEncode::Copy => mux_argv.extend(["-c:a".into(), "copy".into()]),
-            AudioEncode::Aac => {
-                let a_k = audio_bitrate_k(&req.input);
-                mux_argv.extend([
-                    "-c:a".into(),
-                    "aac".into(),
-                    "-b:a".into(),
-                    format!("{a_k}k"),
-                ]);
-            }
-            AudioEncode::Opus => {
-                let a_k = audio_bitrate_k(&req.input);
-                mux_argv.extend([
-                    "-c:a".into(),
-                    "libopus".into(),
-                    "-b:a".into(),
-                    format!("{a_k}k"),
-                ]);
-            }
-        }
-    }
-    if req.preserve_obs_metadata {
-        mux_argv.extend([
-            "-map_metadata".into(),
-            "1".into(),
-            "-map_chapters".into(),
-            "1".into(),
-        ]);
-    }
-    if req.write_encoder_metadata {
+    let vmux_path = req.output_dir.join(format!("{stem}.vmux.mkv"));
+    let out_expect_dur_s: f64 = chunk_durations_s.iter().sum();
+
+    // Encoder tags for stage mux + remux (remux alone would leave only Lavf encoder=).
+    let gigamux_meta_tags: Vec<(String, String)> = if req.write_encoder_metadata {
         let gpu = if req.slot.gpu != GpuChoice::Any {
             req.slot.gpu
         } else {
@@ -1657,24 +1595,109 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
         } else {
             None
         };
-        for (k, v) in encoder_metadata_tags(enc_name, hw.as_deref()) {
-            mux_argv.extend(["-metadata".into(), format!("{k}={v}")]);
+        encoder_metadata_tags(enc_name, hw.as_deref())
+    } else {
+        Vec::new()
+    };
+
+    // Stage mux → Matroska in one pass: concat demuxer + source audio/subs (no `.vcat` write).
+    // Skip avoid_negative_ts make_zero — it was shifting chunk video ~44ms ahead of source audio.
+    let mut mux_argv = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-y".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        ffconcat_path.to_string_lossy().into_owned(),
+    ];
+    // Pull source audio priming/start to the zero-based concat video timeline when needed.
+    if let Some(a_start) = first_audio_start_s(&info) {
+        if a_start.abs() > 0.001 {
+            mux_argv.extend(["-itsoffset".into(), format!("{:.6}", -a_start)]);
         }
     }
     mux_argv.extend([
-        "-avoid_negative_ts".into(),
-        "make_zero".into(),
-        final_output.to_string_lossy().into_owned(),
+        "-i".into(),
+        req.input.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "1:a?".into(),
+        "-map".into(),
+        "1:s?".into(),
+        "-c:v".into(),
+        "copy".into(),
     ]);
-    // Never overwrite an existing final deliver on the worker.
-    farm_argv_never_overwrite(&mut mux_argv);
+    let raw = audio_codec_name(&info);
+    if raw.is_empty() {
+        mux_argv.push("-an".into());
+    } else {
+        match audio_encode_for(&raw, container) {
+            AudioEncode::Copy => mux_argv.extend(["-c:a".into(), "copy".into()]),
+            AudioEncode::Aac => {
+                let a_k = audio_bitrate_k(&req.input);
+                mux_argv.extend([
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    format!("{a_k}k"),
+                ]);
+            }
+            AudioEncode::Opus => {
+                let a_k = audio_bitrate_k(&req.input);
+                mux_argv.extend([
+                    "-c:a".into(),
+                    "libopus".into(),
+                    "-b:a".into(),
+                    format!("{a_k}k"),
+                ]);
+            }
+        }
+    }
+    // Copy any mapped subtitle bitstreams (optional `1:s?` may map nothing).
+    mux_argv.extend(["-c:s".into(), "copy".into()]);
+    if req.preserve_obs_metadata {
+        mux_argv.extend([
+            "-map_metadata".into(),
+            "1".into(),
+            "-map_chapters".into(),
+            "1".into(),
+        ]);
+    }
+    for (k, v) in &gigamux_meta_tags {
+        mux_argv.extend(["-metadata".into(), format!("{k}={v}")]);
+    }
+    mux_argv.push(vmux_path.to_string_lossy().into_owned());
+
+    // Remux → final container (bitstream copy; separate Flamenco task so soft-fail never re-joins).
+    let mut mux_remux_argv = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-y".into(),
+        "-i".into(),
+        vmux_path.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0".into(),
+        "-c".into(),
+        "copy".into(),
+    ];
+    for (k, v) in &gigamux_meta_tags {
+        mux_remux_argv.extend(["-metadata".into(), format!("{k}={v}")]);
+    }
+    mux_remux_argv.push(final_output.to_string_lossy().into_owned());
 
     Ok(FarmChunkedJob {
         final_output,
         chunk_paths,
         encode_argvs,
-        concat_argv,
         mux_argv,
+        mux_remux_argv,
+        out_expect_dur_s,
         ffconcat_path,
         chunk_durations_s,
         bitrate_k,
@@ -1682,9 +1705,91 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
     })
 }
 
+/// First audio stream `start_time` from ffprobe JSON (seconds), if present.
+fn first_audio_start_s(info: &serde_json::Value) -> Option<f64> {
+    let streams = info.get("streams")?.as_array()?;
+    for s in streams {
+        if s.get("codec_type").and_then(|v| v.as_str()) != Some("audio") {
+            continue;
+        }
+        return s.get("start_time").and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|t| t.parse().ok()))
+        });
+    }
+    None
+}
+
 /// Write the job's ffconcat list (call before submit so workers see it on shared storage).
 pub fn write_farm_ffconcat(job: &FarmChunkedJob) -> Result<(), String> {
     write_ffconcat(&job.chunk_paths, &job.chunk_durations_s, &job.ffconcat_path)
+}
+
+fn path_string(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+fn farm_final_check(input: &Path, output: &Path, slot: &EncodeSlot) -> FarmFinalCheck {
+    FarmFinalCheck {
+        input: path_string(input),
+        output: path_string(output),
+        opaque_video: slot.opaque_video,
+        opaque_container: slot.opaque_container,
+        alpha_video: slot.alpha_video,
+        alpha_container: slot.alpha_container,
+    }
+}
+
+/// Hybrid integrity for a single-file farm encode (final check only; no chunk cleanup).
+pub fn farm_integrity_for_single(
+    req: &FarmEncodeRequest,
+    cmd: &FarmFfmpegCommand,
+) -> FlamencoIntegrity {
+    FlamencoIntegrity {
+        final_check: Some(farm_final_check(&req.input, &cmd.output, &req.slot)),
+        cleanup: None,
+        ..FlamencoIntegrity::default()
+    }
+}
+
+/// Hybrid integrity for a chunked farm job (per-chunk expects + final + cleanup).
+pub fn farm_integrity_for_chunked(
+    req: &FarmEncodeRequest,
+    job: &FarmChunkedJob,
+) -> FlamencoIntegrity {
+    let stem = job
+        .final_output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out")
+        .to_string();
+    let ext = job
+        .final_output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4")
+        .to_string();
+    let chunk_checks: Vec<FarmChunkCheck> = job
+        .chunk_paths
+        .iter()
+        .zip(job.chunk_durations_s.iter())
+        .map(|(p, &dur)| FarmChunkCheck {
+            path: path_string(p),
+            expect_dur: dur,
+        })
+        .collect();
+    let chunks = chunk_checks.len() as u32;
+    FlamencoIntegrity {
+        chunk_checks,
+        final_check: Some(farm_final_check(&req.input, &job.final_output, &req.slot)),
+        cleanup: Some(FarmCleanup {
+            dir: path_string(&req.output_dir),
+            stem,
+            ext,
+            chunks,
+        }),
+        ..FlamencoIntegrity::default()
+    }
 }
 
 #[cfg(test)]

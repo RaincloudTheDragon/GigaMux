@@ -44,7 +44,14 @@ pub fn file_info(path: &Path) -> Result<Value, String> {
         .output()
         .map_err(|e| format!("ffprobe failed to start: {e}"))?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+        // `-v quiet` often yields empty stderr (e.g. moov-not-found mid-encode).
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if err.is_empty() {
+            return Err(format!(
+                "ffprobe error: exit {:?} (no stderr; file incomplete or unreadable?)",
+                out.status.code()
+            ));
+        }
         return Err(format!("ffprobe error: {err}"));
     }
     serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe json: {e}"))
