@@ -234,8 +234,11 @@ impl PreviewCacheEntry {
     }
 
     /// Chips / basic meta are usable (bitrates + thumb may still be loading).
+    /// Probe *errors* are not ready — a mid-encode `ffprobe` miss must not stick forever.
     fn ready(&self) -> bool {
-        !self.pending && self.summary.is_some() && self.schema == MediaSummary::SCHEMA
+        !self.pending
+            && self.schema == MediaSummary::SCHEMA
+            && matches!(self.summary.as_ref(), Some(Ok(_)))
     }
 
     /// Ready and still matches the file on disk at `path`.
@@ -1511,6 +1514,12 @@ impl GigaMuxApp {
                 entry.pending = false;
                 entry.bitrates_ready = false;
                 entry.schema = MediaSummary::SCHEMA;
+                // Failed probe: drop stale thumb so the UI doesn't show a picture + "ffprobe error".
+                if summary.is_err() {
+                    entry.thumb = None;
+                    entry.texture = None;
+                    entry.bitrates_ready = false;
+                }
                 entry.summary = Some(summary);
                 entry.source_path = source_path;
                 entry.file_size = file_size;
