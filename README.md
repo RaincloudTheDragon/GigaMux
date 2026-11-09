@@ -36,7 +36,7 @@ Your codec choices in GigaMux:
 
 - Windows desktop app (egui shell in this repo).
 - `ffmpeg` on `PATH`. Encoding works with a normal build; **VMAF** needs a full build that includes the `libvmaf` filter (e.g. [gyan.dev full](https://www.gyan.dev/ffmpeg/builds/)).
-- Hardware encode (NVENC / QSV where available) is optional; software encoders are always selectable. GigaMux probes NVENC Compute SM → generation (and QSV when present). With **multiple** NVENC GPUs, each Targets row (including each test slot) can pick a different device/gen. Optional **Write encoder metadata** (default on) stamps `GigaMux_encoder` / `GigaMux_hw` into outputs.
+- Hardware encode (NVENC / QSV where available) is optional; software encoders are always selectable. GigaMux probes NVENC Compute SM → generation (and QSV when present). With **multiple** NVENC GPUs, each Targets row (including each test slot) can pick a different device/gen. Optional **Write encoder metadata** (default on) stamps OBS-style `encoder` / `GigaMux_version` (workspace version + short git SHA on pre-release builds), plus `GigaMux_encoder` / `GigaMux_hw`. MP4 needs `-movflags +use_metadata_tags` so custom tags are visible to ffprobe; Lavf may still own the raw `encoder` atom — the UI Encoder row prefers `GigaMux_version` when present.
 
 ### Quick start
 

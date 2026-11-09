@@ -55,7 +55,7 @@ Script: [GigaMux.js](../flamenco/GigaMux.js) (bundled for Deploy). Redeploy afte
 
 Flamenco soft-fail retries only that task, so `mux` and `remux` stay separate (a remux retry must not re-join chunks). Chunk healthcheck runs in the same task as the encode; `final-check` is separate and may fail the job. Helpers: [flamenco/helpers/README.md](../flamenco/helpers/README.md).
 
-`mux` / `remux` run `setts=TS-STARTPTS` so A/V start times land at zero; residual skew on Check/farm final is a Low WARN only (does not hard-fail or block cleanup). MP4 remux uses `-movflags +use_metadata_tags` so `GigaMux_*` tags show in ffprobe.
+`mux` / `remux` run `setts=TS-STARTPTS` so A/V start times land at zero; residual skew on Check/farm final is a Low WARN only (does not hard-fail or block cleanup). Local MP4 encode and farm MP4 remux use `-movflags +use_metadata_tags` so `GigaMux_version` / `GigaMux_*` tags show in ffprobe (Lavf may still overwrite the standard `encoder` tag).
 
 `mux` stages through Matroska so multi-audio MP4 copy does not hit mid-file `-22`; there is no `.vcat` intermediate (join+audio is one pass). On a bad final, requeue `remux` + `final-check` (and `mux` only if `.vmux.mkv` is missing/bad).
 
