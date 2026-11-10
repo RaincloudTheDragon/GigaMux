@@ -13,7 +13,7 @@ jobs:
   helpers-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build Linux gigamux-check
         run: cargo build -p gigamux-check --release
@@ -26,7 +26,7 @@ jobs:
     runs-on: windows-latest
     needs: helpers-linux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build GigaMux + Windows helper
         run: cargo build -p GigaMux -p gigamux-check --release
