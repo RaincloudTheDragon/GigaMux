@@ -99,7 +99,7 @@ Farm `.ffconcat` lists use **basenames** (chunks next to the list) so Linux work
 | Chunk encode | off | N equal frame ranges (`2`–`32`), then mux/remux |
 | Only chunk software | on | HW opaque paths stay single-task; software/alpha still chunk |
 
-Skip if the final deliver already exists (submitter). Chunk argv is submitted as `-n`; `ensure-chunk` / `ensure-out` only force `-y` when rebuilding a bad/missing file.
+Skip if the final deliver already exists (submitter). Chunk argv is submitted as `-n`; `ensure-chunk` / `ensure-out` only force `-y` when rebuilding a bad/missing file. Batch submit shows a progress bar (and taskbar fill) and keeps the UI responsive; Esc cancels remaining jobs after the in-flight POST.
 
 ## Cancel
 

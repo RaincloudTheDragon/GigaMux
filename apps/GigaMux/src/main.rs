@@ -148,6 +148,8 @@ enum JobKind {
     Encode,
     Check,
     Vmaf,
+    /// Background Flamenco batch submit (progress bar; UI stays responsive).
+    FarmSubmit,
 }
 
 /// Left-rail category in the Settings second window.
@@ -181,11 +183,40 @@ fn check_severity_color(sev: CheckSeverity) -> egui::Color32 {
     }
 }
 
+/// Progress from a background Flamenco submit batch.
+enum FarmSubmitEvent {
+    Log(String),
+    Started { total: usize },
+    /// About to build/submit this input (`index` is 1-based).
+    Item {
+        index: usize,
+        total: usize,
+        name: String,
+    },
+    /// One job POSTed — UI must `track_farm_job`.
+    Tracked {
+        job_id: String,
+        name: String,
+        out_name: String,
+        want_separate_vmaf: bool,
+    },
+    /// Current item finished (ok / skip / fail) — advances the progress fill.
+    ItemDone,
+}
+
 enum AppEvent {
     Encode(EncodeEvent),
     CheckDone(Result<CheckReport, String>),
     Vmaf(VmafEvent),
     VmafDone(Result<VmafReport, String>),
+    FarmSubmit(FarmSubmitEvent),
+    FarmSubmitDone {
+        ok: usize,
+        skipped: usize,
+        failed: usize,
+        total: usize,
+        script_hint: Option<String>,
+    },
 }
 
 /// Incremental preview worker messages (fast chips first, then peeks + thumb).
@@ -2291,20 +2322,13 @@ impl GigaMuxApp {
         });
     }
 
-    /// True when farm encode for this input would use HW opaque (not alpha / not CPU).
-    fn farm_path_is_hw_opaque(&self, input: &Path, slot: &EncodeSlot) -> bool {
-        let Ok(info) = file_info(input) else {
-            return slot.use_hardware
-                && (slot.opaque_video.is_nvenc() || slot.opaque_video.is_qsv());
-        };
-        if video_has_alpha(&info) {
-            return false;
-        }
-        slot.use_hardware && (slot.opaque_video.is_nvenc() || slot.opaque_video.is_qsv())
-    }
 
     /// Submit the given inputs to Flamenco (one job each; stock worker `exec` via `GigaMux.js`).
+    /// Validates on the UI thread, then posts jobs from a worker so large batches stay responsive.
     fn submit_flamenco_encode(&mut self, names: Vec<String>, farm_vmaf: FarmVmafMode) {
+        if self.busy {
+            return;
+        }
         let url = self.prefs.flamenco_manager_url.trim().to_string();
         if url.is_empty() {
             self.alert_error_with(
@@ -2360,8 +2384,6 @@ impl GigaMuxApp {
                 Some(t.to_string())
             }
         };
-        let exe = exe_owned.as_deref();
-        let tag = tag_owned.as_deref();
         let want_chunk = self.prefs.flamenco_chunking;
         let chunk_n = self.prefs.flamenco_chunks.clamp(2, 32);
         let only_soft = self.prefs.flamenco_only_chunk_software;
@@ -2384,94 +2406,226 @@ impl GigaMuxApp {
                 t.to_string()
             }
         };
-        let twoway = if twoway_local.is_empty() {
-            None
-        } else {
-            Some(FlamencoTwoway {
-                local_prefix: twoway_local.as_str(),
-                var_name: twoway_var.as_str(),
-            })
-        };
-        if twoway.is_none() {
+        if twoway_local.is_empty() {
             self.push_session(
                 "Flamenco: shared path prefix empty — Linux workers will see Windows paths; set Settings → Files → Shared path prefix",
             );
         }
-        // ≤3.9: stub cancel helper (warn). 3.10-beta+: direct ffmpeg exec (Worker kill PR).
-        let manager_ver = ping_manager(&url).unwrap_or_else(|_| "unknown".into());
-        let cancel_exec = cancel_exec_mode_for_manager_version(&manager_ver);
-        if cancel_exec == CancelExecMode::LegacyStub {
-            self.push_session(format!(
-                "Flamenco: Manager {manager_ver} ≤3.9 — Windows Cancel may leave ffmpeg running until a cancel helper ships; prefer 3.10-beta Workers with the kill PR"
-            ));
-        }
-        let mut ok = 0usize;
-        let mut skipped = 0usize;
-        let mut failed = 0usize;
-        // Pop once for missing/old GigaMux.js; further submits would hit the same Manager error.
-        let mut script_alerted = false;
-        for name in &names {
-            let input = self.prefs.input_dir.join(name);
-            if !input.is_file() {
-                self.push_session(format!("Flamenco: input not found: {name}"));
-                failed += 1;
-                continue;
-            }
-            let hw_opaque = self.farm_path_is_hw_opaque(&input, &slot);
-            let use_chunks = want_chunk && !(only_soft && hw_opaque);
-            let farm = FarmEncodeRequest {
-                input: input.clone(),
-                output_dir: self.prefs.output_dir.clone(),
-                gpu: slot.gpu,
-                hw: self.hw.clone(),
-                preserve_obs_metadata: self.prefs.preserve_obs_metadata,
-                write_encoder_metadata: self.prefs.write_encoder_metadata,
-                use_peak_bitrate: self.prefs.use_peak_bitrate,
-                slot: slot.clone(),
-                // Farm: one full deliver (not testN_ multi-slot).
-                test_batch: None,
-                chunks: if use_chunks { chunk_n } else { 1 },
-            };
 
-            if use_chunks {
-                let job_built = match build_farm_chunked_job(&farm) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        self.push_session(format!("Flamenco chunk argv: {e}"));
+        let input_dir = self.prefs.input_dir.clone();
+        let output_dir = self.prefs.output_dir.clone();
+        let hw = self.hw.clone();
+        let preserve_obs_metadata = self.prefs.preserve_obs_metadata;
+        let write_encoder_metadata = self.prefs.write_encoder_metadata;
+        let use_peak_bitrate = self.prefs.use_peak_bitrate;
+        let check_exe = self.prefs.flamenco_check_exe.clone();
+        let scripts_dir_owned = self.prefs.flamenco_scripts_dir.clone();
+        let total = names.len();
+
+        self.cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&self.cancel);
+        let (tx, rx) = mpsc::channel();
+        self.busy = true;
+        self.job = Some(JobKind::FarmSubmit);
+        self.encode_progress = None;
+        self.event_rx = Some(rx);
+        self.push_session(format!("Flamenco submit started ({total} job{})…", if total == 1 { "" } else { "s" }));
+
+        thread::spawn(move || {
+            // ≤3.9: stub cancel helper (warn). 3.10-beta+: direct ffmpeg exec (Worker kill PR).
+            let manager_ver = ping_manager(&url).unwrap_or_else(|_| "unknown".into());
+            let cancel_exec = cancel_exec_mode_for_manager_version(&manager_ver);
+            if cancel_exec == CancelExecMode::LegacyStub {
+                let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                    "Flamenco: Manager {manager_ver} ≤3.9 — Windows Cancel may leave ffmpeg running until a cancel helper ships; prefer 3.10-beta Workers with the kill PR"
+                ))));
+            }
+
+            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Started { total }));
+            let mut ok = 0usize;
+            let mut skipped = 0usize;
+            let mut failed = 0usize;
+            let mut script_hint: Option<String> = None;
+
+            for (i, name) in names.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(
+                        "Flamenco submit: cancelled — remaining jobs skipped".into(),
+                    )));
+                    break;
+                }
+                let index = i + 1;
+                let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Item {
+                    index,
+                    total,
+                    name: name.clone(),
+                }));
+
+                let input = input_dir.join(name);
+                if !input.is_file() {
+                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                        "Flamenco: input not found: {name}"
+                    ))));
+                    failed += 1;
+                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                    continue;
+                }
+                let hw_opaque = farm_path_is_hw_opaque(&input, &slot);
+                let use_chunks = want_chunk && !(only_soft && hw_opaque);
+                let req = FarmEncodeRequest {
+                    input: input.clone(),
+                    output_dir: output_dir.clone(),
+                    gpu: slot.gpu,
+                    hw: hw.clone(),
+                    preserve_obs_metadata,
+                    write_encoder_metadata,
+                    use_peak_bitrate,
+                    slot: slot.clone(),
+                    // Farm: one full deliver (not testN_ multi-slot).
+                    test_batch: None,
+                    chunks: if use_chunks { chunk_n } else { 1 },
+                };
+                let twoway = if twoway_local.is_empty() {
+                    None
+                } else {
+                    Some(FlamencoTwoway {
+                        local_prefix: twoway_local.as_str(),
+                        var_name: twoway_var.as_str(),
+                    })
+                };
+                let exe = exe_owned.as_deref();
+                let tag = tag_owned.as_deref();
+
+                if use_chunks {
+                    let job_built = match build_farm_chunked_job(&req) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco chunk argv: {e}"
+                            ))));
+                            failed += 1;
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                            continue;
+                        }
+                    };
+                    let out_name = job_built
+                        .final_output
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| job_built.final_output.display().to_string());
+                    if job_built.final_output.is_file() {
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco skip (exists): {out_name}"
+                        ))));
+                        skipped += 1;
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                        continue;
+                    }
+                    if let Err(e) = write_farm_ffconcat(&job_built) {
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco ffconcat: {e}"
+                        ))));
                         failed += 1;
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                        continue;
+                    }
+                    let mut integrity = farm_integrity_for_chunked(&req, &job_built);
+                    integrity.check_exe =
+                        resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
+                    if farm_vmaf == FarmVmafMode::Attached {
+                        integrity.vmaf = Some(farm_vmaf_spec(&req.input, &job_built.final_output));
+                    }
+                    let job = match make_gigamux_chunked_job(
+                        format!("GigaMux {name}"),
+                        exe,
+                        &job_built.encode_argvs,
+                        &job_built.mux_argv,
+                        &job_built.mux_remux_argv,
+                        job_built.out_expect_dur_s,
+                        tag,
+                        twoway,
+                        cancel_exec,
+                        Some(integrity),
+                    ) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco job: {e}"
+                            ))));
+                            failed += 1;
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                            continue;
+                        }
+                    };
+                    match submit_job(&url, &job) {
+                        Ok(id) => {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco submitted: job {id}; {name} → {out_name} ({} chunks, {}k / {})",
+                                chunk_n, job_built.bitrate_k, job_built.bitrate_label
+                            ))));
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
+                                job_id: id,
+                                name: name.clone(),
+                                out_name,
+                                want_separate_vmaf: farm_vmaf == FarmVmafMode::Separate,
+                            }));
+                            ok += 1;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco submit failed ({name}): {e}"
+                            ))));
+                            failed += 1;
+                            if let Some(hint) = flamenco_script_hint(&e) {
+                                script_hint = Some(hint.to_string());
+                                let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                                break;
+                            }
+                        }
+                    }
+                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                    continue;
+                }
+
+                if want_chunk && only_soft && hw_opaque {
+                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                        "Flamenco: {name} HW opaque — single encode (only-chunk-software)"
+                    ))));
+                }
+                let cmd = match build_farm_ffmpeg_argv(&req) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco argv: {e}"
+                        ))));
+                        failed += 1;
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                         continue;
                     }
                 };
-                let out_name = job_built
-                    .final_output
+                let out_name = cmd
+                    .output
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| job_built.final_output.display().to_string());
-                if job_built.final_output.is_file() {
-                    self.push_session(format!("Flamenco skip (exists): {out_name}"));
+                    .unwrap_or_else(|| cmd.output.display().to_string());
+                // Same as local encode: never replace an existing deliver (do not submit).
+                if cmd.output.is_file() {
+                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                        "Flamenco skip (exists): {out_name}"
+                    ))));
                     skipped += 1;
+                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                     continue;
                 }
-                if let Err(e) = write_farm_ffconcat(&job_built) {
-                    self.push_session(format!("Flamenco ffconcat: {e}"));
-                    failed += 1;
-                    continue;
-                }
-                let mut integrity = farm_integrity_for_chunked(&farm, &job_built);
-                integrity.check_exe = resolve_flamenco_check_exe(
-                    &self.prefs.flamenco_check_exe,
-                    &self.prefs.flamenco_scripts_dir,
-                );
+                let mut integrity = farm_integrity_for_single(&req, &cmd);
+                integrity.check_exe = resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
                 if farm_vmaf == FarmVmafMode::Attached {
-                    integrity.vmaf = Some(farm_vmaf_spec(&farm.input, &job_built.final_output));
+                    integrity.vmaf = Some(farm_vmaf_spec(&req.input, &cmd.output));
                 }
-                let job = match make_gigamux_chunked_job(
+                let job = match make_gigamux_encode_job(
                     format!("GigaMux {name}"),
                     exe,
-                    &job_built.encode_argvs,
-                    &job_built.mux_argv,
-                    &job_built.mux_remux_argv,
-                    job_built.out_expect_dur_s,
+                    &cmd.argv,
                     tag,
                     twoway,
                     cancel_exec,
@@ -2479,143 +2633,51 @@ impl GigaMuxApp {
                 ) {
                     Ok(j) => j,
                     Err(e) => {
-                        self.push_session(format!("Flamenco job: {e}"));
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco job: {e}"
+                        ))));
                         failed += 1;
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                         continue;
                     }
                 };
                 match submit_job(&url, &job) {
                     Ok(id) => {
-                        self.push_session(format!(
-                            "Flamenco submitted: job {id}; {name} → {out_name} ({} chunks, {}k / {})",
-                            chunk_n, job_built.bitrate_k, job_built.bitrate_label
-                        ));
-                        self.track_farm_job(
-                            id,
-                            name.clone(),
-                            out_name.clone(),
-                            farm_vmaf == FarmVmafMode::Separate,
-                        );
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco submitted: job {id}; {name} → {out_name} ({}k / {})",
+                            cmd.bitrate_k, cmd.bitrate_label
+                        ))));
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
+                            job_id: id,
+                            name: name.clone(),
+                            out_name,
+                            want_separate_vmaf: farm_vmaf == FarmVmafMode::Separate,
+                        }));
                         ok += 1;
                     }
                     Err(e) => {
-                        self.push_session(format!("Flamenco submit failed ({name}): {e}"));
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco submit failed ({name}): {e}"
+                        ))));
                         failed += 1;
-                        if !script_alerted {
-                            if let Some(hint) = flamenco_script_hint(&e) {
-                                self.alert_error_with(
-                                    "Flamenco",
-                                    hint,
-                                    AlertAfterOk::OpenSettingsFiles,
-                                );
-                                script_alerted = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            if want_chunk && only_soft && hw_opaque {
-                self.push_session(format!(
-                    "Flamenco: {name} HW opaque — single encode (only-chunk-software)"
-                ));
-            }
-            let cmd = match build_farm_ffmpeg_argv(&farm) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.push_session(format!("Flamenco argv: {e}"));
-                    failed += 1;
-                    continue;
-                }
-            };
-            let out_name = cmd
-                .output
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| cmd.output.display().to_string());
-            // Same as local encode: never replace an existing deliver (do not submit).
-            if cmd.output.is_file() {
-                self.push_session(format!("Flamenco skip (exists): {out_name}"));
-                skipped += 1;
-                continue;
-            }
-            let mut integrity = farm_integrity_for_single(&farm, &cmd);
-            integrity.check_exe = resolve_flamenco_check_exe(
-                &self.prefs.flamenco_check_exe,
-                &self.prefs.flamenco_scripts_dir,
-            );
-            if farm_vmaf == FarmVmafMode::Attached {
-                integrity.vmaf = Some(farm_vmaf_spec(&farm.input, &cmd.output));
-            }
-            let job = match make_gigamux_encode_job(
-                format!("GigaMux {name}"),
-                exe,
-                &cmd.argv,
-                tag,
-                twoway,
-                cancel_exec,
-                Some(integrity),
-            ) {
-                Ok(j) => j,
-                Err(e) => {
-                    self.push_session(format!("Flamenco job: {e}"));
-                    failed += 1;
-                    continue;
-                }
-            };
-            match submit_job(&url, &job) {
-                Ok(id) => {
-                    self.push_session(format!(
-                        "Flamenco submitted: job {id}; {name} → {out_name} ({}k / {})",
-                        cmd.bitrate_k, cmd.bitrate_label
-                    ));
-                    self.track_farm_job(
-                        id,
-                        name.clone(),
-                        out_name.clone(),
-                        farm_vmaf == FarmVmafMode::Separate,
-                    );
-                    ok += 1;
-                }
-                Err(e) => {
-                    self.push_session(format!("Flamenco submit failed ({name}): {e}"));
-                    failed += 1;
-                    if !script_alerted {
                         if let Some(hint) = flamenco_script_hint(&e) {
-                            self.alert_error_with(
-                                "Flamenco",
-                                hint,
-                                AlertAfterOk::OpenSettingsFiles,
-                            );
-                            script_alerted = true;
+                            script_hint = Some(hint.to_string());
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                             break;
                         }
                     }
                 }
+                let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
             }
-        }
-        if failed > 0 && !script_alerted {
-            self.alert_error(
-                "Flamenco",
-                format!(
-                    "Flamenco batch: submitted={ok} skipped={skipped} failed={failed} (of {})",
-                    names.len()
-                ),
-            );
-        } else if names.len() > 1 || skipped > 0 {
-            self.push_session(format!(
-                "Flamenco batch: submitted={ok} skipped={skipped} failed={failed} (of {})",
-                names.len()
-            ));
-        }
-        if ok > 0 {
-            let _ = prefs::save(&self.prefs);
-            // Surface the farm panel so status/logtail are one click away after submit.
-            self.farm_panel_open = true;
-            self.farm_force_poll = true;
-        }
+
+            let _ = tx.send(AppEvent::FarmSubmitDone {
+                ok,
+                skipped,
+                failed,
+                total,
+                script_hint,
+            });
+        });
     }
 
     /// Remember a job id from this session for the Farm panel (not persisted).
@@ -3121,17 +3183,27 @@ impl GigaMuxApp {
         });
     }
 
-    /// Request cancel of the running encode/VMAF (kills in-flight ffmpeg tree, then stops the batch).
+    /// Request cancel of the running encode/VMAF/farm-submit (kills in-flight ffmpeg when applicable).
     fn cancel_encode(&mut self) {
-        // Shared cancel flag for encode + VMAF (both drive ffmpeg).
-        if matches!(self.job, Some(JobKind::Encode | JobKind::Vmaf)) && self.busy {
-            // Resume a Shutter-paused tree first, then tree-kill immediately (don't wait for the worker's 50ms poll — Esc spam was orphaning Chocolatey-shim grandchildren).
-            self.resume_ffmpeg_if_suspended();
-            if let Some(pid) = active_ffmpeg_pid() {
-                kill_process_tree(pid);
+        if !self.busy {
+            return;
+        }
+        match self.job {
+            Some(JobKind::Encode | JobKind::Vmaf) => {
+                // Resume a Shutter-paused tree first, then tree-kill immediately (don't wait for the worker's 50ms poll — Esc spam was orphaning Chocolatey-shim grandchildren).
+                self.resume_ffmpeg_if_suspended();
+                if let Some(pid) = active_ffmpeg_pid() {
+                    kill_process_tree(pid);
+                }
+                self.cancel.store(true, Ordering::Relaxed);
+                self.push_session("cancel requested…");
             }
-            self.cancel.store(true, Ordering::Relaxed);
-            self.push_session("cancel requested…");
+            Some(JobKind::FarmSubmit) => {
+                // Finish the in-flight HTTP POST, then skip remaining names.
+                self.cancel.store(true, Ordering::Relaxed);
+                self.push_session("Flamenco submit: cancel requested (finishing current job)…");
+            }
+            Some(JobKind::Check) | None => {}
         }
     }
 
@@ -4251,6 +4323,9 @@ impl GigaMuxApp {
                 self.pending_recycle_delete = None;
             } else if self.pending_flamenco.is_some() {
                 self.pending_flamenco = None;
+            } else if self.busy && matches!(self.job, Some(JobKind::FarmSubmit)) {
+                // Prefer cancel over closing the Farm panel opened mid-submit.
+                self.cancel_encode();
             } else if self.farm_panel_open {
                 self.farm_panel_open = false;
             } else if self.delete_queue.is_some() {
@@ -4821,6 +4896,86 @@ impl GigaMuxApp {
                                 self.alert_error("VMAF", msg);
                             }
                         }
+                    }
+                }
+                AppEvent::FarmSubmit(FarmSubmitEvent::Log(msg)) => {
+                    self.push_session(msg);
+                }
+                AppEvent::FarmSubmit(FarmSubmitEvent::Started { total }) => {
+                    // Discrete job count (no media duration) — batch_frac uses file-index path.
+                    let now = Instant::now();
+                    self.encode_progress = Some(EncodeProgress {
+                        total_files: total,
+                        total_duration_s: 0.0,
+                        file_index: 0,
+                        file_total: total,
+                        file_name: String::new(),
+                        file_duration_s: 1.0,
+                        file_out_time_s: 0.0,
+                        completed_duration_s: 0.0,
+                        batch_started: now,
+                        file_started: now,
+                        live_texture: None,
+                    });
+                }
+                AppEvent::FarmSubmit(FarmSubmitEvent::Item {
+                    index,
+                    total,
+                    name,
+                }) => {
+                    if let Some(p) = &mut self.encode_progress {
+                        p.file_index = index;
+                        p.file_total = total;
+                        p.file_name = name;
+                        p.file_duration_s = 1.0;
+                        p.file_out_time_s = 0.0;
+                        p.file_started = Instant::now();
+                    }
+                }
+                AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
+                    job_id,
+                    name,
+                    out_name,
+                    want_separate_vmaf,
+                }) => {
+                    self.track_farm_job(job_id, name, out_name, want_separate_vmaf);
+                    // Surface the farm panel on the first tracked job this batch.
+                    if !self.farm_panel_open {
+                        self.farm_panel_open = true;
+                    }
+                    self.farm_force_poll = true;
+                }
+                AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone) => {
+                    if let Some(p) = &mut self.encode_progress {
+                        p.file_out_time_s = p.file_duration_s;
+                    }
+                }
+                AppEvent::FarmSubmitDone {
+                    ok,
+                    skipped,
+                    failed,
+                    total,
+                    script_hint,
+                } => {
+                    finished = true;
+                    if let Some(hint) = script_hint {
+                        self.alert_error_with("Flamenco", hint, AlertAfterOk::OpenSettingsFiles);
+                    } else if failed > 0 {
+                        self.alert_error(
+                            "Flamenco",
+                            format!(
+                                "Flamenco batch: submitted={ok} skipped={skipped} failed={failed} (of {total})"
+                            ),
+                        );
+                    } else if total > 1 || skipped > 0 {
+                        self.push_session(format!(
+                            "Flamenco batch: submitted={ok} skipped={skipped} failed={failed} (of {total})"
+                        ));
+                    }
+                    if ok > 0 {
+                        let _ = prefs::save(&self.prefs);
+                        self.farm_panel_open = true;
+                        self.farm_force_poll = true;
                     }
                 }
             }
@@ -6200,6 +6355,7 @@ impl GigaMuxApp {
                                 Some(JobKind::Encode) => "Encoding…",
                                 Some(JobKind::Check) => "Checking…",
                                 Some(JobKind::Vmaf) => "VMAF…",
+                                Some(JobKind::FarmSubmit) => "Submitting…",
                                 None => "Busy…",
                             };
                             ui.label(label);
@@ -6349,18 +6505,26 @@ impl GigaMuxApp {
         );
     }
 
-    /// Dual encode/VMAF bars sit in their own bottom panel (above the log), so the log strip never clips them.
+    /// Dual encode/VMAF/farm-submit bars sit in their own bottom panel (above the log), so the log strip never clips them.
     fn ui_progress_panel(&mut self, ui: &mut egui::Ui) {
         let Some(prog) = self.encode_progress.as_ref() else {
             return;
         };
         let is_vmaf = matches!(self.job, Some(JobKind::Vmaf));
+        let is_farm = matches!(self.job, Some(JobKind::FarmSubmit));
         let file_caption = if prog.file_name.is_empty() {
             if is_vmaf {
                 "Current pair".into()
+            } else if is_farm {
+                "Submitting…".into()
             } else {
                 "Current".into()
             }
+        } else if is_farm {
+            format!(
+                "Submitting {} ({}/{})",
+                prog.file_name, prog.file_index, prog.file_total
+            )
         } else {
             format!(
                 "{} ({}/{})",
@@ -6374,6 +6538,12 @@ impl GigaMuxApp {
         let batch_caption = if is_vmaf {
             format!(
                 "All pairs ({} file{})",
+                prog.total_files,
+                if prog.total_files == 1 { "" } else { "s" }
+            )
+        } else if is_farm {
+            format!(
+                "All jobs ({} file{})",
                 prog.total_files,
                 if prog.total_files == 1 { "" } else { "s" }
             )
@@ -8729,6 +8899,18 @@ fn log_line_color(line: &str) -> egui::Color32 {
     } else {
         egui::Color32::from_rgb(200, 200, 200)
     }
+}
+
+/// True when farm encode for this input would use HW opaque (not alpha / not CPU).
+fn farm_path_is_hw_opaque(input: &Path, slot: &EncodeSlot) -> bool {
+    let Ok(info) = file_info(input) else {
+        return slot.use_hardware
+            && (slot.opaque_video.is_nvenc() || slot.opaque_video.is_qsv());
+    };
+    if video_has_alpha(&info) {
+        return false;
+    }
+    slot.use_hardware && (slot.opaque_video.is_nvenc() || slot.opaque_video.is_qsv())
 }
 
 fn trim_log(lines: &mut Vec<String>) {
