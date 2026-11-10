@@ -108,6 +108,13 @@ const JOB_TYPE = {
             default: "",
             description: "JSON array of {input,output,sidecar} — VMAF-only job (no encode)",
         },
+        {
+            key: "probe_out_dir",
+            type: "string",
+            required: false,
+            default: "",
+            description: "When set: farm-probe only; gigamux-check farm-probe <dir> (no encode)",
+        },
     ],
 };
 
@@ -274,6 +281,17 @@ function compileJob(job) {
     const cancelMode = cancelExecMode(settings);
     const vmafPairs = parseVmafPairs(settings.vmaf_pairs_json);
     const vmafAttached = parseVmafSpec(settings.vmaf_json, "vmaf_json");
+
+    // Farm HW probe: write {dir}/{host}.json for GigaMux inventory (no encode).
+    const probeOut =
+        typeof settings.probe_out_dir === "string" ? settings.probe_out_dir.trim() : "";
+    if (probeOut.length > 0) {
+        print("GigaMux compileJob: farm-probe out=", probeOut, " check_exe=", checkExe);
+        const task = author.Task("farm-probe", "misc");
+        addCheckExec(task, checkExe, ["farm-probe", probeOut]);
+        job.addTask(task);
+        return;
+    }
 
     // VMAF-only job: no encode graph.
     if (vmafPairs !== null) {

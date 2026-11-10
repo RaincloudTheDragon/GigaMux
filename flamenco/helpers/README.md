@@ -4,7 +4,7 @@
 
 | File | Platform |
 | --- | --- |
-| `gigamux-check.exe` | Windows workers (`ensure-chunk` / `ensure-out` / `ensure-vmaf` / `final` / `cleanup`) |
+| `gigamux-check.exe` | Windows workers (`ensure-chunk` / `ensure-out` / `ensure-vmaf` / `final` / `cleanup` / `farm-probe`) |
 | `gigamux-check` | Linux workers (ELF, no extension) |
 
 ## End users (release)

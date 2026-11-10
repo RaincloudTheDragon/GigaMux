@@ -28,11 +28,15 @@ use gigamux_core::encode::{
 };
 use gigamux_core::flamenco::{
     cancel_exec_mode_for_manager_version, deploy_gigamux_manager, discover_manager,
-    ensure_worker_tags, fetch_job_status, fetch_job_tasks, fetch_task_log, flamenco_job_terminal,
+    assign_workers_from_farm_probe, delete_probe_pin_tags, ensure_worker_tags, farm_probe_out_dir,
+    fetch_job_status, fetch_job_tasks, fetch_task_log, fetch_workers, flamenco_job_terminal,
     flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
-    make_gigamux_chunked_job, make_gigamux_encode_job, make_gigamux_vmaf_job, manager_web_url,
-    normalize_check_exe_path, pick_log_task, ping_manager, resolve_flamenco_check_exe, submit_job,
-    CancelExecMode, FarmVmafMode, FarmVmafSpec, FlamencoTwoway, REQUIRED_WORKER_TAGS,
+    make_gigamux_chunked_job, make_gigamux_encode_job, make_gigamux_probe_job,
+    make_gigamux_vmaf_job, manager_web_url, merge_farm_probe_dir, normalize_check_exe_path,
+    pick_log_task, pin_worker_for_probe, ping_manager, resolve_flamenco_check_exe,
+    restore_worker_tags_after_probe, submit_job, worker_status_probeable, CancelExecMode,
+    FarmProbeInventory, FarmVmafMode, FarmVmafSpec, FlamencoTwoway, ProbeWorkerPin,
+    REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{
@@ -389,6 +393,8 @@ struct GigaMuxApp {
     farm_poll_inflight: bool,
     farm_last_poll_at: Option<Instant>,
     farm_force_poll: bool,
+    /// After Probe Farm submits, merge+ensure+assign once all gm-… pins are cleared.
+    farm_probe_await_apply: bool,
     /// Cached Flamenco logo texture for the Farm toolbar button.
     farm_logo_tex: Option<egui::TextureHandle>,
     /// Important error modal (session log still gets the line; panel stays collapsed).
@@ -659,6 +665,8 @@ struct FarmSessionJob {
     want_separate_vmaf: bool,
     /// Separate-mode VMAF follow-up already submitted (or skipped).
     vmaf_followup_done: bool,
+    /// Farm-probe pin: restore prior worker tags once this job reaches a terminal status.
+    probe_tag_restore: Option<ProbeWorkerPin>,
 }
 
 /// One task logtail snapshot from a farm poll (merged on the UI thread).
@@ -824,6 +832,7 @@ impl GigaMuxApp {
             farm_poll_inflight: false,
             farm_last_poll_at: None,
             farm_force_poll: false,
+            farm_probe_await_apply: false,
             farm_logo_tex: None,
             pending_alert: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
@@ -2221,6 +2230,7 @@ impl GigaMuxApp {
             self.prefs.flamenco_only_chunk_software = d.flamenco_only_chunk_software;
             self.prefs.flamenco_twoway_local = d.flamenco_twoway_local;
             self.prefs.flamenco_twoway_var = d.flamenco_twoway_var;
+            self.prefs.flamenco_farm_probe = d.flamenco_farm_probe;
             touched_prefs = true;
             parts.push("misc".into());
         }
@@ -2687,6 +2697,7 @@ impl GigaMuxApp {
         name: String,
         out_name: String,
         want_separate_vmaf: bool,
+        probe_tag_restore: Option<ProbeWorkerPin>,
     ) {
         self.farm_selected_id = Some(job_id.clone());
         self.farm_jobs.push(FarmSessionJob {
@@ -2702,10 +2713,226 @@ impl GigaMuxApp {
             task_last_tail: HashMap::new(),
             want_separate_vmaf,
             vmaf_followup_done: false,
+            probe_tag_restore,
         });
         self.farm_log_tail.clear();
         self.farm_log_task_label.clear();
         self.farm_force_poll = true;
+    }
+
+    /// Create coarse + inventory gen tags on the Manager.
+    fn ensure_flamenco_tags(&mut self) {
+        let url = self.prefs.flamenco_manager_url.clone();
+        if url.trim().is_empty() {
+            self.alert_error("Flamenco", "set Flamenco Manager URL first");
+            return;
+        }
+        match ensure_worker_tags(&url, Some(&self.prefs.flamenco_farm_probe)) {
+            Ok(created) if created.is_empty() => {
+                self.push_session("Flamenco tags: already present");
+            }
+            Ok(created) => {
+                self.push_session(format!("Flamenco tags created: {}", created.join(", ")));
+            }
+            Err(e) => self.alert_error("Flamenco", format!("Flamenco tags: {e}")),
+        }
+    }
+
+    /// Merge probe JSON from the output share into prefs (no Ensure / assign).
+    fn merge_flamenco_farm_probe(&mut self) {
+        if !prefs::dir_ok(&self.prefs.output_dir) {
+            self.alert_error("Flamenco", "set output folder before merging farm probe");
+            return;
+        }
+        let dir = farm_probe_out_dir(&self.prefs.output_dir);
+        match merge_farm_probe_dir(&dir) {
+            Ok(from_disk) => {
+                self.prefs.flamenco_farm_probe.merge_from(&from_disk);
+                let _ = prefs::save(&self.prefs);
+                let inv = &self.prefs.flamenco_farm_probe;
+                self.push_session(format!(
+                    "Flamenco farm probe merge: hosts={} gens=[{}] qsv={} vmaf={} ({})",
+                    inv.hosts.len(),
+                    inv.nvenc_gens.join(", "),
+                    inv.has_qsv,
+                    inv.has_vmaf,
+                    dir.display()
+                ));
+            }
+            Err(e) => self.alert_error("Flamenco", format!("farm probe merge: {e}")),
+        }
+    }
+
+    /// Merge share JSON → prefs, Ensure tags, assign capability tags on matching workers.
+    fn apply_flamenco_farm_probe(&mut self) {
+        if !prefs::dir_ok(&self.prefs.output_dir) {
+            self.alert_error("Flamenco", "set output folder before applying farm probe");
+            return;
+        }
+        let url = self.prefs.flamenco_manager_url.trim().to_string();
+        if url.is_empty() {
+            self.alert_error("Flamenco", "set Flamenco Manager URL first");
+            return;
+        }
+        self.merge_flamenco_farm_probe();
+        self.ensure_flamenco_tags();
+        let dir = farm_probe_out_dir(&self.prefs.output_dir);
+        match assign_workers_from_farm_probe(&url, &dir) {
+            Ok(rep) => {
+                for line in &rep.assigned {
+                    self.push_session(format!("Flamenco farm-probe assign: {line}"));
+                }
+                for host in &rep.unmatched {
+                    self.push_session(format!(
+                        "Flamenco farm-probe assign: no worker named {host:?}"
+                    ));
+                }
+                if rep.assigned.is_empty() && rep.unmatched.is_empty() {
+                    self.push_session("Flamenco farm-probe assign: no host JSON yet");
+                }
+            }
+            Err(e) => self.alert_error("Flamenco", format!("farm probe assign: {e}")),
+        }
+    }
+
+    /// Merge existing probe JSON, Ensure tags, then one farm-probe job per non-offline worker (temp pin tag).
+    fn probe_flamenco_farm(&mut self) {
+        let url = self.prefs.flamenco_manager_url.trim().to_string();
+        if url.is_empty() {
+            self.alert_error("Flamenco", "set Flamenco Manager URL first");
+            return;
+        }
+        if !prefs::dir_ok(&self.prefs.output_dir) {
+            self.alert_error("Flamenco", "set output folder (probe JSON is written there)");
+            return;
+        }
+        self.merge_flamenco_farm_probe();
+        self.ensure_flamenco_tags();
+        // Drop leftover gm-… pins from prior runs (definitions linger after worker restore).
+        match delete_probe_pin_tags(&url) {
+            Ok(gone) if !gone.is_empty() => {
+                self.push_session(format!(
+                    "Flamenco farm-probe: removed {} leftover pin tag(s)",
+                    gone.len()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => self.push_session(format!("Flamenco farm-probe: cleanup pin tags: {e}")),
+        }
+
+        let out_dir = farm_probe_out_dir(&self.prefs.output_dir);
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.alert_error("Flamenco", format!("probe dir: {e}"));
+            return;
+        }
+        let workers = match fetch_workers(&url) {
+            Ok(w) => w,
+            Err(e) => {
+                self.alert_error("Flamenco", format!("list workers: {e}"));
+                return;
+            }
+        };
+        let targets: Vec<_> = workers
+            .into_iter()
+            .filter(|w| worker_status_probeable(&w.status))
+            .collect();
+        if targets.is_empty() {
+            self.alert_error("Flamenco", "no probeable workers (all offline/error?)");
+            return;
+        }
+        let check_exe = resolve_flamenco_check_exe(
+            &self.prefs.flamenco_check_exe,
+            &self.prefs.flamenco_scripts_dir,
+        );
+        let mut twoway_local = self.prefs.flamenco_twoway_local.trim().to_string();
+        if twoway_local.is_empty() {
+            if let Some(inferred) = infer_twoway_local_prefix(&self.prefs.input_dir) {
+                twoway_local = inferred;
+            }
+        }
+        let twoway_var = {
+            let t = self.prefs.flamenco_twoway_var.trim();
+            if t.is_empty() {
+                "shared_storage_path".to_string()
+            } else {
+                t.to_string()
+            }
+        };
+        let twoway = if twoway_local.is_empty() {
+            None
+        } else {
+            Some(FlamencoTwoway {
+                local_prefix: twoway_local.as_str(),
+                var_name: twoway_var.as_str(),
+            })
+        };
+
+        // One job per worker: append a unique gm-… tag, submit tagged probe, restore tags when done.
+        let mut ok = 0usize;
+        for w in &targets {
+            let pin = match pin_worker_for_probe(&url, w) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.push_session(format!(
+                        "Flamenco farm-probe pin {}: {e}",
+                        if w.name.is_empty() { w.id.as_str() } else { w.name.as_str() }
+                    ));
+                    continue;
+                }
+            };
+            let label = if pin.worker_name.is_empty() {
+                pin.tag_name.clone()
+            } else {
+                pin.worker_name.clone()
+            };
+            let job = match make_gigamux_probe_job(
+                format!("GigaMux farm-probe {label}"),
+                &check_exe,
+                &out_dir,
+                Some(pin.tag_name.as_str()),
+                twoway,
+            ) {
+                Ok(j) => j,
+                Err(e) => {
+                    let _ = restore_worker_tags_after_probe(&url, &pin);
+                    self.push_session(format!("Flamenco probe job build ({label}): {e}"));
+                    continue;
+                }
+            };
+            let pin_tag = pin.tag_name.clone();
+            match submit_job(&url, &job) {
+                Ok(id) => {
+                    self.track_farm_job(
+                        id.clone(),
+                        format!("farm-probe-{label}"),
+                        format!("probe→{}", out_dir.display()),
+                        false,
+                        Some(pin),
+                    );
+                    self.push_session(format!(
+                        "Flamenco farm-probe submitted: job {id} → {label} (tag {pin_tag})"
+                    ));
+                    ok += 1;
+                }
+                Err(e) => {
+                    let _ = restore_worker_tags_after_probe(&url, &pin);
+                    self.push_session(format!("Flamenco farm-probe submit failed ({label}): {e}"));
+                    if let Some(hint) = flamenco_script_hint(&e) {
+                        self.alert_error_with("Flamenco", hint, AlertAfterOk::OpenSettingsFiles);
+                        break;
+                    }
+                }
+            }
+        }
+        if ok > 0 {
+            self.farm_panel_open = true;
+            self.farm_force_poll = true;
+            self.farm_probe_await_apply = true;
+            self.push_session(format!(
+                "Flamenco farm-probe: {ok}/{} workers pinned — when all finish, tags restore, gm-… pins delete, then merge + Ensure + assign capabilities.",
+                targets.len()
+            ));
+        }
     }
 
     /// Import `*.vmaf.json` sidecars from the output folder into preview_cache.
@@ -2875,7 +3102,13 @@ impl GigaMuxApp {
         match submit_job(&url, &job) {
             Ok(id) => {
                 self.push_session(format!("Farm VMAF submitted: job {id}; {track_label}"));
-                self.track_farm_job(id, track_label.to_string(), track_label.to_string(), false);
+                self.track_farm_job(
+                    id,
+                    track_label.to_string(),
+                    track_label.to_string(),
+                    false,
+                    None,
+                );
                 self.farm_panel_open = true;
             }
             Err(e) => {
@@ -2927,6 +3160,7 @@ impl GigaMuxApp {
     /// Apply a background poll result onto session rows / log pane.
     fn apply_farm_poll(&mut self, result: FarmPollResult) {
         let mut completed_followups: Vec<(String, String)> = Vec::new();
+        let mut probe_restores: Vec<ProbeWorkerPin> = Vec::new();
         for row in result.rows {
             if let Some(job) = self.farm_jobs.iter_mut().find(|j| j.job_id == row.job_id) {
                 let was_terminal = flamenco_job_terminal(&job.status);
@@ -2934,6 +3168,12 @@ impl GigaMuxApp {
                 job.worker = row.worker;
                 job.task_name = row.task_name;
                 job.error = row.error;
+                // Farm-probe pins: restore prior tags once the job leaves the queue (any terminal).
+                if !was_terminal && flamenco_job_terminal(&row.status) {
+                    if let Some(pin) = job.probe_tag_restore.take() {
+                        probe_restores.push(pin);
+                    }
+                }
                 // Separate farm VMAF: chain a `vmaf`-tagged job when encode completes.
                 if !was_terminal
                     && row.status.eq_ignore_ascii_case("completed")
@@ -2944,6 +3184,33 @@ impl GigaMuxApp {
                     completed_followups.push((job.name.clone(), job.out_name.clone()));
                 }
             }
+        }
+        let mgr = self.prefs.flamenco_manager_url.trim().to_string();
+        for pin in probe_restores {
+            let host = if pin.worker_name.is_empty() {
+                pin.worker_id.as_str()
+            } else {
+                pin.worker_name.as_str()
+            };
+            match restore_worker_tags_after_probe(&mgr, &pin) {
+                Ok(()) => self.push_session(format!(
+                    "Flamenco farm-probe: restored tags on {host}, deleted {}",
+                    pin.tag_name
+                )),
+                Err(e) => self.push_session(format!(
+                    "Flamenco farm-probe: restore/delete pin on {host} failed: {e}"
+                )),
+            }
+        }
+        // Last pin cleared → fold former Merge probe + worker assignment into Probe Farm.
+        if self.farm_probe_await_apply
+            && !self
+                .farm_jobs
+                .iter()
+                .any(|j| j.probe_tag_restore.is_some())
+        {
+            self.farm_probe_await_apply = false;
+            self.apply_flamenco_farm_probe();
         }
         for (in_name, out_name) in completed_followups {
             self.submit_farm_vmaf_followup(&in_name, &out_name);
@@ -2994,7 +3261,12 @@ impl GigaMuxApp {
             }
         }
 
-        if !self.farm_panel_open {
+        // Keep polling while the panel is open, or while farm-probe pins still need tag restore.
+        let need_probe_restore = self
+            .farm_jobs
+            .iter()
+            .any(|j| j.probe_tag_restore.is_some());
+        if !self.farm_panel_open && !need_probe_restore {
             return;
         }
         if self.farm_jobs.is_empty() {
@@ -4938,7 +5210,7 @@ impl GigaMuxApp {
                     out_name,
                     want_separate_vmaf,
                 }) => {
-                    self.track_farm_job(job_id, name, out_name, want_separate_vmaf);
+                    self.track_farm_job(job_id, name, out_name, want_separate_vmaf, None);
                     // Surface the farm panel on the first tracked job this batch.
                     if !self.farm_panel_open {
                         self.farm_panel_open = true;
@@ -6417,7 +6689,7 @@ impl GigaMuxApp {
                                         .min_size(egui::vec2(108.0, 28.0)),
                                 )
                                 .on_hover_text(
-                                    "Open Flamenco sender for the Input selection, or every input when none are selected. Settings → Files: Find Manager, Deploy JS, Ensure tags.",
+                                    "Open Flamenco sender for the Input selection, or every input when none are selected. Settings → Files: Find Manager, Deploy JS, Probe Farm.",
                                 )
                                 .on_disabled_hover_text(
                                     "Set Flamenco Manager URL (or Find) in Settings → Files",
@@ -7245,35 +7517,53 @@ impl GigaMuxApp {
                     }
                 }
             }
-            let can_tags = !self.prefs.flamenco_manager_url.trim().is_empty();
-            if ui
-                .add_enabled(can_tags, egui::Button::new("Ensure tags"))
+            let can_probe = !self.prefs.flamenco_manager_url.trim().is_empty();
+            let probe_btn = ui
+                .add_enabled(can_probe, egui::Button::new("Probe Farm"))
                 .on_hover_text(format!(
-                    "Create missing worker tags via REST: {}",
+                    "Probe every non-offline worker; when done: merge JSON, Ensure tags ({}), and assign capabilities. Right-click to clear prefs inventory (share JSON kept).",
                     REQUIRED_WORKER_TAGS
                         .iter()
                         .map(|(n, _)| *n)
                         .collect::<Vec<_>>()
                         .join(", ")
                 ))
-                .on_disabled_hover_text("Set Manager URL (or Find) first")
-                .clicked()
-            {
-                let url = self.prefs.flamenco_manager_url.clone();
-                match ensure_worker_tags(&url) {
-                    Ok(created) if created.is_empty() => {
-                        self.push_session("Flamenco tags: already present");
-                    }
-                    Ok(created) => {
-                        self.push_session(format!(
-                            "Flamenco tags created: {}",
-                            created.join(", ")
-                        ));
-                    }
-                    Err(e) => self.alert_error("Flamenco", format!("Flamenco tags: {e}")),
-                }
+                .on_disabled_hover_text("Set Manager URL (or Find) first");
+            if probe_btn.clicked() {
+                self.probe_flamenco_farm();
             }
+            probe_btn.context_menu(|ui| {
+                if ui
+                    .button("Clear probe inventory")
+                    .on_hover_text("Clear farm probe inventory in prefs (does not delete JSON on the share).")
+                    .clicked()
+                {
+                    self.prefs.flamenco_farm_probe = FarmProbeInventory::default();
+                    let _ = prefs::save(&self.prefs);
+                    self.push_session("Flamenco farm probe inventory cleared");
+                    ui.close();
+                }
+            });
         });
+        {
+            let inv = &self.prefs.flamenco_farm_probe;
+            let gens = if inv.nvenc_gens.is_empty() {
+                "(none — Probe Farm)".into()
+            } else {
+                inv.nvenc_gens.join(", ")
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "Farm probe: hosts={} gens={} qsv={} vmaf={}",
+                    inv.hosts.len(),
+                    gens,
+                    inv.has_qsv,
+                    inv.has_vmaf
+                ))
+                .small()
+                .weak(),
+            );
+        }
         ui.horizontal(|ui| {
             ui.label("Worker check helper");
             if ui
@@ -7309,19 +7599,37 @@ impl GigaMuxApp {
         });
         ui.horizontal(|ui| {
             ui.label("Worker tag");
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.prefs.flamenco_worker_tag)
-                        .desired_width(180.0)
-                        .hint_text("(optional)"),
-                )
-                .on_hover_text(
-                    "Tag name or UUID for submitted jobs. Empty = tagless. Use Ensure tags first for nvenc/qsv/vmaf.",
-                )
-                .changed()
-            {
-                let _ = prefs::save(&self.prefs);
-            }
+            let allowed = self.prefs.flamenco_farm_probe.allowed_submit_tags();
+            let cur = self.prefs.flamenco_worker_tag.trim().to_string();
+            let cur_label = if cur.is_empty() {
+                "(tagless)".to_string()
+            } else {
+                cur.clone()
+            };
+            egui::ComboBox::from_id_salt("settings_flamenco_worker_tag")
+                .selected_text(cur_label)
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    for tag in &allowed {
+                        let label = if tag.is_empty() {
+                            "(tagless)"
+                        } else {
+                            tag.as_str()
+                        };
+                        if ui
+                            .selectable_label(self.prefs.flamenco_worker_tag.trim() == tag, label)
+                            .clicked()
+                        {
+                            self.prefs.flamenco_worker_tag = tag.clone();
+                            let _ = prefs::save(&self.prefs);
+                        }
+                    }
+                });
+            ui.label(
+                egui::RichText::new("nvenc-{gen} only after Probe Farm")
+                    .small()
+                    .weak(),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("Worker ffmpeg");
@@ -7809,12 +8117,40 @@ impl GigaMuxApp {
                 }
                 ui.add_space(8.0);
 
-                ui.label("Worker tag (optional)");
-                ui.add(
-                    egui::TextEdit::singleline(&mut prompt.worker_tag)
-                        .desired_width(280.0)
-                        .hint_text("nvenc / qsv / …"),
-                );
+                ui.horizontal(|ui| {
+                    ui.label("Worker tag");
+                    let allowed = self.prefs.flamenco_farm_probe.allowed_submit_tags();
+                    // Drop stale gen pins that are no longer in inventory.
+                    if !allowed.iter().any(|t| t == &prompt.worker_tag) {
+                        prompt.worker_tag = if allowed.iter().any(|t| t == "nvenc") {
+                            "nvenc".into()
+                        } else {
+                            String::new()
+                        };
+                    }
+                    let cur_label = if prompt.worker_tag.is_empty() {
+                        "(tagless)".to_string()
+                    } else {
+                        prompt.worker_tag.clone()
+                    };
+                    egui::ComboBox::from_id_salt("flamenco_send_worker_tag")
+                        .selected_text(cur_label)
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            for tag in &allowed {
+                                let label = if tag.is_empty() {
+                                    "(tagless)"
+                                } else {
+                                    tag.as_str()
+                                };
+                                ui.selectable_value(&mut prompt.worker_tag, tag.clone(), label);
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Coarse pools always listed; nvenc-{gen} only after Probe Farm sees that generation.",
+                        );
+                });
                 ui.label("ffmpeg on worker (optional)");
                 ui.add(
                     egui::TextEdit::singleline(&mut prompt.ffmpeg_exe)

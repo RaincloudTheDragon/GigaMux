@@ -7,6 +7,7 @@
 //! - `gigamux-check chunk <path> <expect_dur_secs>`
 //! - `gigamux-check final <input> <output> <opaque_video> <opaque_container> <alpha_video> <alpha_container>`
 //! - `gigamux-check cleanup <dir> <stem> <ext> <chunks>`
+//! - `gigamux-check farm-probe <out_dir>` (write `{host}.json` GPU/QSV/VMAF inventory)
 
 use std::env;
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ use gigamux_core::check::{
     check_chunk_file, check_output_pair, cleanup_farm_intermediates, ensure_chunk_file,
     ensure_out_file,
 };
-use gigamux_core::flamenco::FarmFinalCheck;
+use gigamux_core::flamenco::{write_farm_probe_report, FarmFinalCheck};
 use gigamux_core::targets::{AlphaVideo, OutContainer, OpaqueVideo};
 use gigamux_core::vmaf::ensure_vmaf;
 
@@ -52,7 +53,7 @@ fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let Some(cmd) = args.next() else {
         eprintln!(
-            "usage: gigamux-check ensure-chunk|ensure-out|ensure-vmaf|chunk|final|cleanup …"
+            "usage: gigamux-check ensure-chunk|ensure-out|ensure-vmaf|chunk|final|cleanup|farm-probe …"
         );
         return ExitCode::from(2);
     };
@@ -195,6 +196,23 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             cleanup_farm_intermediates(PathBuf::from(dir).as_path(), &stem, &ext, chunks)
+        }
+        "farm-probe" => {
+            let dir = args.next().unwrap_or_default();
+            if dir.is_empty() {
+                eprintln!("farm-probe: need <out_dir>");
+                return ExitCode::from(2);
+            }
+            match write_farm_probe_report(PathBuf::from(dir).as_path()) {
+                Ok(path) => {
+                    println!("gigamux-check farm-probe: ok {}", path.display());
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("gigamux-check farm-probe: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         other => {
             eprintln!("unknown command {other:?}");

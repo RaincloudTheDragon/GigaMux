@@ -19,15 +19,25 @@ const SSDP_ST: &str = "urn:flamenco:manager:0";
 const SSDP_UUID: &str = "aa80bc5f-d0af-46b8-8630-23bd7e80ec4d";
 const SSDP_ADDR: &str = "239.255.255.250:1900";
 
-/// Tags GigaMux expects on the Manager (create-if-missing). Workers are assigned separately.
+/// Coarse Flamenco pools (always Ensure'd). Gen tags (`nvenc-ada`, …) are created only after farm probe.
 pub const REQUIRED_WORKER_TAGS: &[(&str, &str)] = &[
-    ("nvenc", "NVENC-capable ffmpeg (opaque hardware encode)"),
-    ("qsv", "QSV-capable ffmpeg (VP9 QSV opaque)"),
+    ("nvenc", "NVENC-capable ffmpeg (opaque hardware encode; any generation)"),
+    ("qsv", "QSV-capable ffmpeg (VP9 QSV opaque / hybrid color)"),
     ("vmaf", "ffmpeg build with libvmaf"),
+    ("cpu", "Software / libvpx alpha chunks and remux tooling"),
 ];
 
+/// Description for a probe-gated `nvenc-{gen}` tag.
+pub fn nvenc_gen_tag_description(slug: &str) -> String {
+    use crate::gpu::NvencGeneration;
+    match NvencGeneration::from_farm_tag_slug(slug) {
+        Some(g) => format!("{} — pin opaque NVENC jobs to this generation", g.label()),
+        None => format!("NVENC generation pool ({slug})"),
+    }
+}
+
 /// Body for `POST /api/v3/jobs` (Flamenco `SubmittedJob`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmittedJob {
     pub name: String,
     #[serde(rename = "type")]
@@ -566,11 +576,35 @@ fn flamenco_http_text(result: Result<ureq::Response, ureq::Error>) -> Result<(u1
     }
 }
 
+/// Resolve a worker tag **name or UUID** to the Manager tag UUID (required on submit).
+pub fn resolve_worker_tag_uuid(manager_url: &str, tag: &str) -> Result<Option<String>, String> {
+    let t = tag.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let tags = fetch_worker_tags(manager_url)?;
+    if let Some((id, _)) = tags.iter().find(|(id, _)| id.eq_ignore_ascii_case(t)) {
+        return Ok(Some(id.clone()));
+    }
+    if let Some((id, _)) = tags.iter().find(|(_, name)| name.eq_ignore_ascii_case(t)) {
+        return Ok(Some(id.clone()));
+    }
+    Err(format!(
+        "unknown worker tag {t:?} — run Ensure tags (and assign workers in Manager) first"
+    ))
+}
+
 /// POST a job to Flamenco Manager. Returns the job id from the response when present.
+///
+/// Flamenco persists `worker_tag` as a **UUID** (`FetchWorkerTagByUUID`); names like `nvenc` must be resolved first or StoreAuthoredJob fails with HTTP 500.
 pub fn submit_job(manager_url: &str, job: &SubmittedJob) -> Result<String, String> {
+    let mut job = job.clone();
+    if let Some(tag) = job.worker_tag.take() {
+        job.worker_tag = resolve_worker_tag_uuid(manager_url, &tag)?;
+    }
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/jobs");
-    let body = serde_json::to_vec(job).map_err(|e| format!("serialize job: {e}"))?;
+    let body = serde_json::to_vec(&job).map_err(|e| format!("serialize job: {e}"))?;
     let (status, text) = flamenco_http_text(
         ureq::post(&url)
             .set("Content-Type", "application/json")
@@ -1100,15 +1134,270 @@ pub fn fetch_worker_tags(manager_url: &str) -> Result<Vec<(String, String)>, Str
     Ok(out)
 }
 
-/// Create any missing tags from [`REQUIRED_WORKER_TAGS`]. Returns names that were created.
-pub fn ensure_worker_tags(manager_url: &str) -> Result<Vec<String>, String> {
+/// Manager worker list row (`GET /api/v3/worker-mgt/workers`).
+#[derive(Debug, Clone)]
+pub struct FlamencoWorkerSummary {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+}
+
+/// Temporary tag pin used so one farm-probe job targets exactly one worker; restore prior tags and delete the pin when the job ends.
+#[derive(Debug, Clone)]
+pub struct ProbeWorkerPin {
+    pub worker_id: String,
+    pub worker_name: String,
+    pub tag_id: String,
+    pub tag_name: String,
+    pub previous_tag_ids: Vec<String>,
+}
+
+/// Whether Probe Farm should submit a job for this worker status (skip offline/error).
+pub fn worker_status_probeable(status: &str) -> bool {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "offline" | "error" => false,
+        _ => true,
+    }
+}
+
+/// Short unique tag name for pinning a single worker during farm probe (`gm-` + first 8 hex of id).
+pub fn probe_pin_tag_name(worker_id: &str) -> String {
+    let compact: String = worker_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(8)
+        .collect();
+    format!("gm-{compact}")
+}
+
+/// List workers known to the Manager.
+pub fn fetch_workers(manager_url: &str) -> Result<Vec<FlamencoWorkerSummary>, String> {
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/worker-mgt/workers");
+    let resp = ureq::get(&url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .map_err(|e| format!("fetch workers: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .into_string()
+        .map_err(|e| format!("fetch workers read: {e}"))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("fetch workers HTTP {status}: {text}"));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("workers JSON: {e}"))?;
+    let arr = v
+        .get("workers")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for w in arr {
+        let id = w.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let name = w
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let st = w
+            .get("status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !id.is_empty() {
+            out.push(FlamencoWorkerSummary {
+                id,
+                name,
+                status: st,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Tag UUIDs currently assigned to a worker (`GET …/workers/{id}` → `tags[].id`).
+pub fn fetch_worker_tag_ids(manager_url: &str, worker_id: &str) -> Result<Vec<String>, String> {
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/worker-mgt/workers/{worker_id}");
+    let resp = ureq::get(&url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .map_err(|e| format!("fetch worker: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .into_string()
+        .map_err(|e| format!("fetch worker read: {e}"))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("fetch worker HTTP {status}: {text}"));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("worker JSON: {e}"))?;
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("tags").and_then(|t| t.as_array()) {
+        for t in arr {
+            if let Some(id) = t.get("id").and_then(|x| x.as_str()) {
+                if !id.is_empty() {
+                    out.push(id.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Replace a worker's tag membership (`POST …/workers/{id}/settags`).
+pub fn set_worker_tags(
+    manager_url: &str,
+    worker_id: &str,
+    tag_ids: &[String],
+) -> Result<(), String> {
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/worker-mgt/workers/{worker_id}/settags");
+    let body = json!({ "tag_ids": tag_ids });
+    let (status, text) = flamenco_http_text(
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_json(&body),
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(format!("settags HTTP {status}: {text}"));
+    }
+    Ok(())
+}
+
+/// Ensure a named tag exists; returns its UUID (create response or existing list).
+pub fn ensure_named_worker_tag(
+    manager_url: &str,
+    name: &str,
+    description: &str,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("empty tag name".into());
+    }
     let existing = fetch_worker_tags(manager_url)?;
-    let have: HashSet<String> = existing.into_iter().map(|(_, n)| n).collect();
+    if let Some((id, _)) = existing.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)) {
+        return Ok(id.clone());
+    }
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/worker-mgt/tags");
+    let body = json!({ "name": name, "description": description });
+    let (status, text) = flamenco_http_text(
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_json(&body),
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(format!("create tag {name} HTTP {status}: {text}"));
+    }
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+        if !id.is_empty() {
+            return Ok(id.to_string());
+        }
+    }
+    // Fallback: re-list (create may have succeeded without an id field).
+    let existing = fetch_worker_tags(manager_url)?;
+    existing
+        .into_iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(name))
+        .map(|(id, _)| id)
+        .ok_or_else(|| format!("create tag {name}: no id in response"))
+}
+
+/// `DELETE /api/v3/worker-mgt/tag/{tag_id}` — removes the tag and any worker assignments.
+pub fn delete_worker_tag(manager_url: &str, tag_id: &str) -> Result<(), String> {
+    let id = tag_id.trim();
+    if id.is_empty() {
+        return Err("empty tag id".into());
+    }
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/worker-mgt/tag/{id}");
+    let (status, text) = flamenco_http_text(ureq::delete(&url).call())?;
+    if !(200..300).contains(&status) {
+        return Err(format!("delete tag HTTP {status}: {text}"));
+    }
+    Ok(())
+}
+
+/// Delete leftover GigaMux farm-probe pin tags (`gm-…`). Safe when no probe job is using them.
+pub fn delete_probe_pin_tags(manager_url: &str) -> Result<Vec<String>, String> {
+    let tags = fetch_worker_tags(manager_url)?;
+    let mut deleted = Vec::new();
+    for (id, name) in tags {
+        if !name.to_ascii_lowercase().starts_with("gm-") {
+            continue;
+        }
+        delete_worker_tag(manager_url, &id)?;
+        deleted.push(name);
+    }
+    Ok(deleted)
+}
+
+/// Append a unique `gm-…` tag to one worker so a probe job can target only that host; caller must restore+delete.
+pub fn pin_worker_for_probe(
+    manager_url: &str,
+    worker: &FlamencoWorkerSummary,
+) -> Result<ProbeWorkerPin, String> {
+    let tag_name = probe_pin_tag_name(&worker.id);
+    let tag_id = ensure_named_worker_tag(
+        manager_url,
+        &tag_name,
+        "GigaMux farm-probe pin (temporary; deleted after probe)",
+    )?;
+    let previous_tag_ids = fetch_worker_tag_ids(manager_url, &worker.id)?;
+    let mut next = previous_tag_ids.clone();
+    if !next.iter().any(|id| id.eq_ignore_ascii_case(&tag_id)) {
+        next.push(tag_id.clone());
+    }
+    set_worker_tags(manager_url, &worker.id, &next)?;
+    Ok(ProbeWorkerPin {
+        worker_id: worker.id.clone(),
+        worker_name: worker.name.clone(),
+        tag_id,
+        tag_name,
+        previous_tag_ids,
+    })
+}
+
+/// Restore the worker's prior tags, then delete the temporary `gm-…` pin tag.
+pub fn restore_worker_tags_after_probe(
+    manager_url: &str,
+    pin: &ProbeWorkerPin,
+) -> Result<(), String> {
+    set_worker_tags(manager_url, &pin.worker_id, &pin.previous_tag_ids)?;
+    delete_worker_tag(manager_url, &pin.tag_id)
+}
+
+/// Create missing coarse tags plus any `nvenc-{gen}` slugs in `inventory`. Returns names created.
+pub fn ensure_worker_tags(
+    manager_url: &str,
+    inventory: Option<&FarmProbeInventory>,
+) -> Result<Vec<String>, String> {
+    let existing = fetch_worker_tags(manager_url)?;
+    let mut have: HashSet<String> = existing.into_iter().map(|(_, n)| n).collect();
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/worker-mgt/tags");
     let mut created = Vec::new();
-    for &(name, description) in REQUIRED_WORKER_TAGS {
-        if have.contains(name) {
+    let mut wanted: Vec<(String, String)> = REQUIRED_WORKER_TAGS
+        .iter()
+        .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+        .collect();
+    if let Some(inv) = inventory {
+        for slug in &inv.nvenc_gens {
+            if crate::gpu::NvencGeneration::from_farm_tag_slug(slug).is_none() {
+                continue;
+            }
+            let name = if slug.starts_with("nvenc-") {
+                slug.clone()
+            } else {
+                format!("nvenc-{slug}")
+            };
+            let desc = nvenc_gen_tag_description(&name);
+            wanted.push((name, desc));
+        }
+    }
+    for (name, description) in wanted {
+        if have.contains(&name) {
             continue;
         }
         let body = json!({ "name": name, "description": description });
@@ -1123,9 +1412,441 @@ pub fn ensure_worker_tags(manager_url: &str) -> Result<Vec<String>, String> {
         if !(200..300).contains(&status) {
             return Err(format!("create tag {name} HTTP {status}: {text}"));
         }
-        created.push(name.to_string());
+        have.insert(name.clone());
+        created.push(name);
     }
     Ok(created)
+}
+
+/// Persisted union of farm probe host reports (prefs).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FarmProbeInventory {
+    /// Flamenco tag slugs seen on the farm (`nvenc-ada`, …).
+    #[serde(default)]
+    pub nvenc_gens: Vec<String>,
+    /// Hostnames that contributed probe JSON (until Clear).
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub has_qsv: bool,
+    #[serde(default)]
+    pub has_vmaf: bool,
+    /// True once any host probe completed (soft/cpu pool usable).
+    #[serde(default)]
+    pub has_cpu: bool,
+}
+
+impl FarmProbeInventory {
+    /// Merge another host/dir aggregate into this inventory (union; never drops gens).
+    pub fn merge_from(&mut self, other: &FarmProbeInventory) {
+        for g in &other.nvenc_gens {
+            let slug = normalize_nvenc_gen_slug(g);
+            if !slug.is_empty() && !self.nvenc_gens.iter().any(|x| x == &slug) {
+                self.nvenc_gens.push(slug);
+            }
+        }
+        for h in &other.hosts {
+            if !h.is_empty() && !self.hosts.iter().any(|x| x == h) {
+                self.hosts.push(h.clone());
+            }
+        }
+        self.has_qsv |= other.has_qsv;
+        self.has_vmaf |= other.has_vmaf;
+        self.has_cpu |= other.has_cpu;
+        self.nvenc_gens.sort();
+        self.hosts.sort();
+    }
+
+    /// Tags the Send dialog may offer (empty string = tagless).
+    pub fn allowed_submit_tags(&self) -> Vec<String> {
+        let mut out = vec![String::new(), "nvenc".into()];
+        for g in &self.nvenc_gens {
+            let slug = normalize_nvenc_gen_slug(g);
+            if !slug.is_empty() && !out.iter().any(|x| x == &slug) {
+                out.push(slug);
+            }
+        }
+        out.push("qsv".into());
+        out.push("cpu".into());
+        // vmaf is hardcoded for VMAF-only jobs; still list for prefs default clarity.
+        out.push("vmaf".into());
+        out
+    }
+}
+
+fn normalize_nvenc_gen_slug(s: &str) -> String {
+    let t = s.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return String::new();
+    }
+    if let Some(g) = crate::gpu::NvencGeneration::from_farm_tag_slug(&t) {
+        return g.farm_tag_slug().unwrap_or("").to_string();
+    }
+    String::new()
+}
+
+/// One worker's probe JSON on shared storage (`{out_dir}/{host}.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FarmProbeHostReport {
+    pub host: String,
+    /// Full tag slugs (`nvenc-ada`).
+    pub nvenc_gens: Vec<String>,
+    pub has_qsv: bool,
+    pub has_vmaf: bool,
+    pub has_cpu: bool,
+}
+
+impl FarmProbeHostReport {
+    fn into_inventory(self) -> FarmProbeInventory {
+        FarmProbeInventory {
+            nvenc_gens: self.nvenc_gens,
+            hosts: if self.host.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.host]
+            },
+            has_qsv: self.has_qsv,
+            has_vmaf: self.has_vmaf,
+            has_cpu: self.has_cpu,
+        }
+    }
+}
+
+/// Probe this machine and write `{out_dir}/{hostname}.json` (Flamenco worker / local).
+pub fn write_farm_probe_report(out_dir: &Path) -> Result<PathBuf, String> {
+    use crate::gpu::probe_local_encoders;
+    use crate::vmaf::libvmaf_available;
+
+    let host = farm_probe_hostname();
+    let catalog = probe_local_encoders();
+    let mut gens: Vec<String> = catalog
+        .nvenc
+        .iter()
+        .filter_map(|d| d.generation.farm_tag_slug().map(|s| s.to_string()))
+        .collect();
+    gens.sort();
+    gens.dedup();
+    let report = FarmProbeHostReport {
+        host: host.clone(),
+        nvenc_gens: gens,
+        has_qsv: catalog.qsv.is_some(),
+        has_vmaf: libvmaf_available(),
+        has_cpu: true,
+    };
+    fs::create_dir_all(out_dir).map_err(|e| format!("farm-probe mkdir: {e}"))?;
+    let safe_host: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = out_dir.join(format!("{safe_host}.json"));
+    let text = serde_json::to_string_pretty(&report).map_err(|e| format!("farm-probe json: {e}"))?;
+    fs::write(&path, text).map_err(|e| format!("farm-probe write {}: {e}", path.display()))?;
+    // Also print a parseable line for task logs.
+    println!(
+        "GIGAMUX_FARM_PROBE host={} gens={} qsv={} vmaf={}",
+        report.host,
+        report.nvenc_gens.join(","),
+        report.has_qsv,
+        report.has_vmaf
+    );
+    Ok(path)
+}
+
+fn farm_probe_hostname() -> String {
+    // Windows workers set COMPUTERNAME. Linux often has HOSTNAME only as a bash local (not exported), so Flamenco `exec` children never see it — fall through to `hostname(1)` / gethostname.
+    for key in ["COMPUTERNAME", "HOSTNAME", "HOST"] {
+        if let Ok(v) = std::env::var(key) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        if out.status.success() {
+            let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes a NUL-terminated name into `buf`.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len()) };
+        if rc == 0 {
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return t.to_string();
+                }
+            }
+        }
+    }
+    "unknown-host".into()
+}
+
+/// Load per-host probe JSON files from `out_dir` (skips unreadable / invalid).
+pub fn load_farm_probe_reports(out_dir: &Path) -> Result<Vec<FarmProbeHostReport>, String> {
+    let mut out = Vec::new();
+    if !out_dir.is_dir() {
+        return Ok(out);
+    }
+    let entries = fs::read_dir(out_dir).map_err(|e| format!("farm-probe read dir: {e}"))?;
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let report: FarmProbeHostReport = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        out.push(report);
+    }
+    Ok(out)
+}
+
+/// Read all `*.json` probe reports under `out_dir` into one inventory (union).
+pub fn merge_farm_probe_dir(out_dir: &Path) -> Result<FarmProbeInventory, String> {
+    let mut inv = FarmProbeInventory::default();
+    for report in load_farm_probe_reports(out_dir)? {
+        inv.merge_from(&report.into_inventory());
+    }
+    Ok(inv)
+}
+
+/// Coarse pools + `nvenc-{gen}` (+ leftover `gm-` pins) that GigaMux owns for auto-assign.
+pub fn is_gigamux_managed_tag(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    if n.starts_with("gm-") {
+        return true;
+    }
+    if n == "nvenc" || n == "qsv" || n == "vmaf" || n == "cpu" {
+        return true;
+    }
+    crate::gpu::NvencGeneration::from_farm_tag_slug(&n).is_some()
+}
+
+/// Capability tags implied by one host probe (names, not UUIDs).
+pub fn desired_capability_tags(report: &FarmProbeHostReport) -> Vec<String> {
+    let mut tags = Vec::new();
+    if report.has_cpu {
+        tags.push("cpu".into());
+    }
+    if report.has_qsv {
+        tags.push("qsv".into());
+    }
+    if report.has_vmaf {
+        tags.push("vmaf".into());
+    }
+    let mut gens = Vec::new();
+    for g in &report.nvenc_gens {
+        let slug = normalize_nvenc_gen_slug(g);
+        if !slug.is_empty() && !gens.iter().any(|x| x == &slug) {
+            gens.push(slug);
+        }
+    }
+    if !gens.is_empty() {
+        tags.push("nvenc".into());
+        tags.extend(gens);
+    }
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+/// Result of matching probe JSON hosts to Manager workers and applying capability tags.
+#[derive(Debug, Clone, Default)]
+pub struct FarmProbeAssignReport {
+    /// `worker: tag,tag,…`
+    pub assigned: Vec<String>,
+    /// Probe hosts with no matching Manager worker name.
+    pub unmatched: Vec<String>,
+}
+
+/// Tag ids currently on a worker, with names (`GET …/workers/{id}`).
+pub fn fetch_worker_tag_membership(
+    manager_url: &str,
+    worker_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/worker-mgt/workers/{worker_id}");
+    let resp = ureq::get(&url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .map_err(|e| format!("fetch worker: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .into_string()
+        .map_err(|e| format!("fetch worker read: {e}"))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("fetch worker HTTP {status}: {text}"));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("worker JSON: {e}"))?;
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("tags").and_then(|t| t.as_array()) {
+        for t in arr {
+            let id = t.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let name = t
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !id.is_empty() {
+                out.push((id, name));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Match each probe host report to a Manager worker (case-insensitive name) and set capability tags.
+///
+/// Replaces GigaMux-managed tags (`nvenc`, `nvenc-*`, `qsv`, `vmaf`, `cpu`, `gm-*`) with the probe set; leaves any other tags alone.
+pub fn assign_workers_from_farm_probe(
+    manager_url: &str,
+    out_dir: &Path,
+) -> Result<FarmProbeAssignReport, String> {
+    let reports = load_farm_probe_reports(out_dir)?;
+    let workers = fetch_workers(manager_url)?;
+    let all_tags = fetch_worker_tags(manager_url)?;
+    let resolve = |name: &str| -> Result<String, String> {
+        all_tags
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name))
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| format!("tag {name:?} missing — Ensure tags first"))
+    };
+
+    let mut report = FarmProbeAssignReport::default();
+    for host_report in &reports {
+        let host = host_report.host.trim();
+        if host.is_empty() || host.eq_ignore_ascii_case("unknown-host") {
+            report.unmatched.push(host_report.host.clone());
+            continue;
+        }
+        let Some(worker) = workers
+            .iter()
+            .find(|w| w.name.eq_ignore_ascii_case(host))
+        else {
+            report.unmatched.push(host.to_string());
+            continue;
+        };
+        let desired_names = desired_capability_tags(host_report);
+        let mut desired_ids = Vec::new();
+        for name in &desired_names {
+            desired_ids.push(resolve(name)?);
+        }
+        let current = fetch_worker_tag_membership(manager_url, &worker.id)?;
+        let mut next: Vec<String> = current
+            .iter()
+            .filter(|(_, name)| !is_gigamux_managed_tag(name))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &desired_ids {
+            if !next.iter().any(|x| x.eq_ignore_ascii_case(id)) {
+                next.push(id.clone());
+            }
+        }
+        // Skip no-op settags when membership already matches.
+        let mut cur_ids: Vec<String> = current.iter().map(|(id, _)| id.clone()).collect();
+        cur_ids.sort();
+        let mut next_sorted = next.clone();
+        next_sorted.sort();
+        if cur_ids == next_sorted {
+            report.assigned.push(format!(
+                "{}: {} (unchanged)",
+                worker.name,
+                if desired_names.is_empty() {
+                    "(none)".into()
+                } else {
+                    desired_names.join(",")
+                }
+            ));
+            continue;
+        }
+        set_worker_tags(manager_url, &worker.id, &next)?;
+        report.assigned.push(format!(
+            "{}: {}",
+            worker.name,
+            if desired_names.is_empty() {
+                "(none)".into()
+            } else {
+                desired_names.join(",")
+            }
+        ));
+    }
+    Ok(report)
+}
+
+/// Default shared folder for probe JSON (under output dir).
+pub fn farm_probe_out_dir(output_dir: &Path) -> PathBuf {
+    output_dir.join("gigamux-farm-probe")
+}
+
+/// Submit a short farm-probe job (`gigamux-check farm-probe <dir>`).
+///
+/// Shaped like a single-task encode so Manager accepts it without requiring a new settings key / job-type reload: `ffmpeg_exe` is the check binary, argv is `farm-probe <out_dir>`.
+pub fn make_gigamux_probe_job(
+    name: impl Into<String>,
+    check_exe: &str,
+    probe_out_dir: &Path,
+    worker_tag: Option<&str>,
+    twoway: Option<FlamencoTwoway<'_>>,
+) -> Result<SubmittedJob, String> {
+    let exe_check = if check_exe.trim().is_empty() {
+        DEFAULT_CHECK_EXE.to_string()
+    } else {
+        check_exe.trim().to_string()
+    };
+    let out = probe_out_dir.to_string_lossy().into_owned();
+    let out = match twoway {
+        Some(tw) => rewrite_flamenco_twoway_path(&out, tw),
+        None => out,
+    };
+    let check_rewritten = match twoway {
+        Some(tw) => rewrite_flamenco_twoway_path(&exe_check, tw),
+        None => exe_check,
+    };
+    // Logical argv[0] is ignored by GigaMux.js; worker exec uses ffmpeg_exe (= check binary).
+    let argv = vec![
+        "gigamux-check".to_string(),
+        "farm-probe".to_string(),
+        out.clone(),
+    ];
+    // Prefer dedicated probe_out_dir when Manager has the redeployed script; encode_argvs always present so compile/persist never hits the empty-argv 400 (and works on older JS too).
+    make_gigamux_encode_job(
+        name,
+        Some(check_rewritten.as_str()),
+        &argv,
+        worker_tag,
+        None, // paths already braced above; avoid double-rewrite of check/out
+        CancelExecMode::Direct,
+        Some(FlamencoIntegrity {
+            check_exe: check_rewritten.clone(),
+            ..FlamencoIntegrity::default()
+        }),
+    )
+    .map(|mut job| {
+        // New JS short-circuits on probe_out_dir; older JS runs the encode argv (same command).
+        if let Some(obj) = job.settings.as_object_mut() {
+            obj.insert("probe_out_dir".into(), json!(out));
+        }
+        job
+    })
 }
 
 #[cfg(test)]
@@ -1277,6 +1998,29 @@ mod tests {
             cancel_exec_mode_for_manager_version(""),
             CancelExecMode::LegacyStub
         );
+    }
+
+    #[test]
+    fn probe_pin_helpers() {
+        assert_eq!(
+            probe_pin_tag_name("4312d68c-ea6d-4566-9bf6-e9f09be48ceb"),
+            "gm-4312d68c"
+        );
+        assert!(worker_status_probeable("awake"));
+        assert!(worker_status_probeable("asleep"));
+        assert!(!worker_status_probeable("offline"));
+        assert!(!worker_status_probeable("error"));
+        assert!(is_gigamux_managed_tag("nvenc-turing"));
+        assert!(is_gigamux_managed_tag("gm-abc"));
+        assert!(!is_gigamux_managed_tag("GPU-EEVEE"));
+        let tags = desired_capability_tags(&FarmProbeHostReport {
+            host: "godzilla".into(),
+            nvenc_gens: vec!["nvenc-turing".into()],
+            has_qsv: false,
+            has_vmaf: false,
+            has_cpu: true,
+        });
+        assert_eq!(tags, vec!["cpu", "nvenc", "nvenc-turing"]);
     }
 
     #[test]

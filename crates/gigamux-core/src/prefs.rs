@@ -171,6 +171,9 @@ pub struct Prefs {
     /// Flamenco two-way variable name (default `shared_storage_path`).
     #[serde(default = "default_flamenco_twoway_var")]
     pub flamenco_twoway_var: String,
+    /// Union of farm probe host reports (gates `nvenc-{gen}` in Send dialog).
+    #[serde(default)]
+    pub flamenco_farm_probe: crate::flamenco::FarmProbeInventory,
 }
 
 fn default_flamenco_twoway_var() -> String {
@@ -211,6 +214,7 @@ impl Default for Prefs {
             flamenco_only_chunk_software: true,
             flamenco_twoway_local: String::new(),
             flamenco_twoway_var: "shared_storage_path".into(),
+            flamenco_farm_probe: crate::flamenco::FarmProbeInventory::default(),
         }
     }
 }

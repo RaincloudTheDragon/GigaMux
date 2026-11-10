@@ -29,16 +29,23 @@ pub use encode::{
 };
 pub use ffmpeg_active::{active_ffmpeg_pid, kill_process_tree, ActiveFfmpegGuard};
 pub use flamenco::{
-    cancel_exec_mode_for_manager_version, check_exe_from_deploy_scripts_dir, deploy_gigamux_js,
-    deploy_gigamux_manager, discover_manager, ensure_worker_tags, fetch_job_status, fetch_job_tasks,
-    fetch_task_log, fetch_task_logtail, fetch_worker_tags, flamenco_job_terminal, flamenco_script_hint,
-    infer_twoway_local_prefix, local_gigamux_js_present, make_gigamux_chunked_job,
-    make_gigamux_encode_job, make_gigamux_vmaf_job, manager_web_url, normalize_check_exe_path,
-    pick_log_task, ping_manager, resolve_flamenco_check_exe, rewrite_flamenco_twoway_path,
-    scripts_dir_from_manager_install, submit_job, CancelExecMode, DeployReport, FarmChunkCheck,
-    FarmCleanup, FarmFinalCheck, FarmVmafMode, FarmVmafSpec, FlamencoIntegrity, FlamencoJobStatus,
-    FlamencoTaskSummary, FlamencoTwoway, SubmittedJob, DEFAULT_CHECK_EXE, GIGAMUX_JS,
-    REQUIRED_WORKER_TAGS,
+    assign_workers_from_farm_probe, cancel_exec_mode_for_manager_version,
+    check_exe_from_deploy_scripts_dir, delete_probe_pin_tags, delete_worker_tag, deploy_gigamux_js,
+    deploy_gigamux_manager, desired_capability_tags, discover_manager, ensure_named_worker_tag,
+    ensure_worker_tags, farm_probe_out_dir, fetch_job_status, fetch_job_tasks, fetch_task_log,
+    fetch_task_logtail, fetch_worker_tag_ids, fetch_worker_tag_membership, fetch_worker_tags,
+    fetch_workers, flamenco_job_terminal, flamenco_script_hint, infer_twoway_local_prefix,
+    is_gigamux_managed_tag, load_farm_probe_reports, local_gigamux_js_present,
+    make_gigamux_chunked_job, make_gigamux_encode_job, make_gigamux_probe_job,
+    make_gigamux_vmaf_job, manager_web_url, merge_farm_probe_dir, normalize_check_exe_path,
+    nvenc_gen_tag_description, pick_log_task, pin_worker_for_probe, ping_manager,
+    probe_pin_tag_name, resolve_flamenco_check_exe, resolve_worker_tag_uuid,
+    restore_worker_tags_after_probe, rewrite_flamenco_twoway_path, scripts_dir_from_manager_install,
+    set_worker_tags, submit_job, worker_status_probeable, write_farm_probe_report, CancelExecMode,
+    DeployReport, FarmChunkCheck, FarmCleanup, FarmFinalCheck, FarmProbeAssignReport,
+    FarmProbeHostReport, FarmProbeInventory, FarmVmafMode, FarmVmafSpec, FlamencoIntegrity,
+    FlamencoJobStatus, FlamencoTaskSummary, FlamencoTwoway, FlamencoWorkerSummary, ProbeWorkerPin,
+    SubmittedJob, DEFAULT_CHECK_EXE, GIGAMUX_JS, REQUIRED_WORKER_TAGS,
 };
 pub use job_log::{
     encode_event_line, encode_logs_dir, job_logs_dir, vmaf_event_line, EncodeJobLog, JobLog,

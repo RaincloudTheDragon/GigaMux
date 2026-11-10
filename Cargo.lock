@@ -1326,6 +1326,7 @@ dependencies = [
  "chrono",
  "directories",
  "flate2",
+ "libc",
  "regex",
  "serde",
  "serde_json",

@@ -105,6 +105,40 @@ impl NvencGeneration {
             Self::Blackwell => "NVENC9_Blackwell",
         }
     }
+
+    /// Flamenco worker tag for this generation (`nvenc-ada`), or `None` for Unknown.
+    pub fn farm_tag_slug(self) -> Option<&'static str> {
+        match self {
+            Self::Unknown => None,
+            Self::Kepler => Some("nvenc-kepler"),
+            Self::Maxwell1 => Some("nvenc-maxwell"),
+            Self::Maxwell2 => Some("nvenc-maxwell2"),
+            Self::Pascal => Some("nvenc-pascal"),
+            Self::Volta => Some("nvenc-volta"),
+            Self::Turing => Some("nvenc-turing"),
+            Self::Ampere => Some("nvenc-ampere"),
+            Self::Ada => Some("nvenc-ada"),
+            Self::Blackwell => Some("nvenc-blackwell"),
+        }
+    }
+
+    /// Parse a farm tag slug (`nvenc-ada` or bare `ada`) back to a generation.
+    pub fn from_farm_tag_slug(s: &str) -> Option<Self> {
+        let t = s.trim().to_ascii_lowercase();
+        let t = t.strip_prefix("nvenc-").unwrap_or(&t);
+        match t {
+            "kepler" => Some(Self::Kepler),
+            "maxwell" | "maxwell1" => Some(Self::Maxwell1),
+            "maxwell2" => Some(Self::Maxwell2),
+            "pascal" => Some(Self::Pascal),
+            "volta" => Some(Self::Volta),
+            "turing" => Some(Self::Turing),
+            "ampere" => Some(Self::Ampere),
+            "ada" => Some(Self::Ada),
+            "blackwell" => Some(Self::Blackwell),
+            _ => None,
+        }
+    }
 }
 
 /// Map Compute SM + marketing name → NVENC generation.

@@ -9,7 +9,7 @@ GigaMux submits jobs to a stock Flamenco Manager/Worker. `GigaMux.js` authors `m
 | **Find** | UPnP/SSDP discovery (`urn:flamenco:manager:0`), same idea as Flamenco workers. Manager needs `autodiscoverable` enabled. |
 | **Deploy GigaMux…** | File browser: **Manager install only** (folder with `flamenco-manager.yaml`). Writes `scripts/GigaMux.js` plus `tools/gigamux-check.exe` and `tools/gigamux-check` (Linux). Releases ship both helpers under `helpers/` next to the app; from-source, prebuild into `flamenco/helpers/` — see that README. Linux `+x` on SMB: Samba `create mask` / `force create mode` of `06xx` strips execute on create; use something like `0775` so Windows deploys keep owner `+x` for Linux workers that `execve` the helper off the share. |
 | **Worker check helper** | Absolute path workers use for `gigamux-check` (two-way braced). Deploy sets it to `{ManagerInstall}/tools/gigamux-check`, which **assumes the Manager install itself is on shared storage**. If Manager is local-only, browse/enter a shared path that has both Win + Linux helper binaries. |
-| **Ensure tags** | `POST /api/v3/worker-mgt/tags` for missing `nvenc`, `qsv`, `vmaf`. Does not assign workers to tags; do that in Flamenco's worker UI. |
+| **Probe Farm** | One button: probe every non-offline worker (`gm-…` pin, then restore+delete), merge host JSON into prefs, Ensure coarse + `nvenc-{gen}` tags, and **assign** capabilities on workers whose Manager name matches the probe hostname. Right-click → clear prefs inventory only. |
 | **Flamenco** (main UI) | Builds ffmpeg argv locally and `POST /api/v3/jobs` (`type: GigaMux`). Uses the Input selection when that side is active; with no Input selection, sends **every** listed input (one job each). |
 | **Farm** (Flamenco mark button) | Separate OS window for jobs submitted this GigaMux run: status + colored Manager log tail. Opens after a successful submit; closing the window does not cancel jobs. |
 
@@ -44,17 +44,23 @@ Check for the encoders/filters your jobs need before tagging or submitting.
 
 ## Worker tags
 
-Flamenco: jobs with a `worker_tag` only run on workers in that tag; tagless jobs are available to all workers; tagless workers only take tagless jobs.
+Flamenco: jobs with a `worker_tag` only run on workers in that tag; tagless jobs are available to all workers; tagless workers only take tagless jobs. Flamenco assigns **one worker tag per job** (not per task) — you cannot put QSV color on one pool and software alpha on another inside a single job graph.
 
-GigaMux **Ensure tags** creates:
+GigaMux **Ensure tags** creates coarse pools always; **gen tags only after farm probe**:
 
 | Name | Intended use |
 | --- | --- |
-| `nvenc` | Opaque HW encode |
-| `qsv` | VP9 QSV opaque |
+| `nvenc` | Opaque NVENC (any generation) |
+| `nvenc-{gen}` | Pin opaque NVENC to a generation (`nvenc-turing`, `nvenc-ampere`, `nvenc-ada`, …) — created when Probe Farm sees that gen |
+| `qsv` | VP9 QSV opaque / future hybrid **color** jobs |
 | `vmaf` | VMAF-only jobs (Separate / batch) |
+| `cpu` | Software / libvpx alpha chunks and remux tooling |
 
-Flamenco assigns **one worker tag per job** (not per task). Assign workers to tags in Flamenco after probing. Submit with **Worker tag** set to the name (or UUID) when the job must stay on a tagged pool.
+Workers may hold multiple tags (e.g. `nvenc` + `nvenc-ada`). Probe Farm sets GigaMux-managed membership from host JSON (other tags left alone). Send dialog lists coarse tags plus **only probed** `nvenc-{gen}` values. GigaMux submits the tag **UUID** (names are resolved at POST); Manager rejects unknown UUIDs with HTTP 500 on persist.
+
+### QSV hybrid (future) = job chain
+
+Local QSV+libvpx alpha hybrid stays one machine. On the farm, split across jobs (same idea as Separate VMAF): **color** job tagged `qsv`, **alpha** job tagged `cpu` (chunkable across soft workers), **remux** when both artifacts exist on the share. Not implemented yet; single-job hybrid remains refused.
 
 ## Job type
 
@@ -110,7 +116,8 @@ Upstream Flamenco currently has a bug where the Windows workers are not killed u
 ## Limitations
 
 - Local (non-Flamenco) encode has no chunking.
-- QSV+libvpx alpha hybrid is refused for chunked farm jobs; use software alpha or opaque.
+- QSV+libvpx alpha hybrid is refused on the farm until the color/alpha/remux job chain ships; use software alpha or opaque.
+- Farm probe uses one job per worker via temporary `gm-…` pin tags (not the coarse `nvenc` pool); pins are deleted after each job. Batch end merges JSON and assigns capability tags by hostname↔worker name; re-run Probe Farm after new workers appear.
 - No seam-scan on the farm (Python-only locally today).
 - Local VMAF (manual or idle auto) scores leftover `*.cNNNofMMM.*` chunks against the source frame range implied by the filename; Check/`check_chunk_file` must pass first (incomplete mid-farm chunks are skipped / blocked like bad finals).
 - Attached farm VMAF requires `libvmaf` on encode-tag workers; Separate/batch use the `vmaf` tag.
