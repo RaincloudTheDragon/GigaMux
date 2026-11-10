@@ -3,6 +3,7 @@
 //! Commands (exit 0 = ok, non-zero = fail task):
 //! - `gigamux-check ensure-chunk <path> <expect_dur> <ffmpeg_exe> -- <ffmpeg argv…>` (argv includes leading program name; do **not** nest paths in JSON: Flamenco two-way expands `{var}` to `W:\…` and breaks JSON escapes)
 //! - `gigamux-check ensure-out <path> <expect_dur> <ffmpeg_exe> -- <ffmpeg argv…>` (same for mux stage vmux / remux final; rebuilds incomplete leftovers)
+//! - `gigamux-check ensure-vmaf <ref> <dist> <sidecar> [ffmpeg_exe]` (reuse sidecar score; else libvmaf + write)
 //! - `gigamux-check chunk <path> <expect_dur_secs>`
 //! - `gigamux-check final <input> <output> <opaque_video> <opaque_container> <alpha_video> <alpha_container>`
 //! - `gigamux-check cleanup <dir> <stem> <ext> <chunks>`
@@ -17,6 +18,7 @@ use gigamux_core::check::{
 };
 use gigamux_core::flamenco::FarmFinalCheck;
 use gigamux_core::targets::{AlphaVideo, OutContainer, OpaqueVideo};
+use gigamux_core::vmaf::ensure_vmaf;
 
 fn parse_opaque_video(s: &str) -> Result<OpaqueVideo, String> {
     match s.to_ascii_lowercase().as_str() {
@@ -49,7 +51,9 @@ fn parse_container(s: &str) -> Result<OutContainer, String> {
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let Some(cmd) = args.next() else {
-        eprintln!("usage: gigamux-check ensure-chunk|ensure-out|chunk|final|cleanup …");
+        eprintln!(
+            "usage: gigamux-check ensure-chunk|ensure-out|ensure-vmaf|chunk|final|cleanup …"
+        );
         return ExitCode::from(2);
     };
     /// Shared `--` / legacy JSON argv parsing for ensure-* commands.
@@ -102,6 +106,29 @@ fn main() -> ExitCode {
                 Err(e) => {
                     eprintln!("{e}");
                     return ExitCode::from(2);
+                }
+            }
+        }
+        "ensure-vmaf" => {
+            let reference = PathBuf::from(args.next().unwrap_or_default());
+            let distorted = PathBuf::from(args.next().unwrap_or_default());
+            let sidecar = PathBuf::from(args.next().unwrap_or_default());
+            let ffmpeg_exe = args.next().unwrap_or_else(|| "ffmpeg".into());
+            if reference.as_os_str().is_empty()
+                || distorted.as_os_str().is_empty()
+                || sidecar.as_os_str().is_empty()
+            {
+                eprintln!("ensure-vmaf: need <ref> <dist> <sidecar> [ffmpeg_exe]");
+                return ExitCode::from(2);
+            }
+            match ensure_vmaf(&reference, &distorted, &sidecar, &ffmpeg_exe) {
+                Ok(score) => {
+                    println!("gigamux-check ensure-vmaf: ok score={score:.6}");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("gigamux-check ensure-vmaf: {e}");
+                    return ExitCode::FAILURE;
                 }
             }
         }

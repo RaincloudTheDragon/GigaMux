@@ -23,19 +23,21 @@ use gigamux_core::check::{
 use gigamux_core::chunk::chunk_time_range;
 use gigamux_core::encode::{
     build_farm_chunked_job, build_farm_ffmpeg_argv, farm_integrity_for_chunked,
-    farm_integrity_for_single, run_batch, write_farm_ffconcat, EncodeEvent, EncodeOptions,
-    FarmEncodeRequest,
+    farm_integrity_for_single, farm_vmaf_spec, run_batch, write_farm_ffconcat, EncodeEvent,
+    EncodeOptions, FarmEncodeRequest,
 };
 use gigamux_core::flamenco::{
     cancel_exec_mode_for_manager_version, deploy_gigamux_manager, discover_manager,
     ensure_worker_tags, fetch_job_status, fetch_job_tasks, fetch_task_log, flamenco_job_terminal,
     flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
-    make_gigamux_chunked_job, make_gigamux_encode_job, manager_web_url, normalize_check_exe_path,
-    pick_log_task, ping_manager, resolve_flamenco_check_exe, submit_job, CancelExecMode,
-    FlamencoTwoway, REQUIRED_WORKER_TAGS,
+    make_gigamux_chunked_job, make_gigamux_encode_job, make_gigamux_vmaf_job, manager_web_url,
+    normalize_check_exe_path, pick_log_task, ping_manager, resolve_flamenco_check_exe, submit_job,
+    CancelExecMode, FarmVmafMode, FarmVmafSpec, FlamencoTwoway, REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
-use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
+use gigamux_core::vmaf::{
+    libvmaf_available, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path, VmafEvent, VmafReport,
+};
 use gigamux_core::gpu::{probe_local_encoders, GpuChoice, HwCatalog};
 use gigamux_core::job_log;
 use gigamux_core::prefs::{self, EncodeSlot, Prefs};
@@ -622,6 +624,10 @@ struct FarmSessionJob {
     task_logs: HashMap<String, String>,
     /// Per-task last raw Manager logtail (for overlap/delta merge).
     task_last_tail: HashMap<String, String>,
+    /// This encode job asked for Separate farm VMAF when submitted.
+    want_separate_vmaf: bool,
+    /// Separate-mode VMAF follow-up already submitted (or skipped).
+    vmaf_followup_done: bool,
 }
 
 /// One task logtail snapshot from a farm poll (merged on the UI thread).
@@ -663,6 +669,8 @@ struct FlamencoSubmitPrompt {
     chunks: u32,
     /// Only chunk software/alpha paths; HW opaque stays single-task.
     only_chunk_software: bool,
+    /// Farm VMAF for this send only (default Off; not persisted).
+    farm_vmaf: FarmVmafMode,
     /// Duration (s) of the first selected input for the chunk estimate label.
     estimate_duration_s: f64,
     /// Basename used for the estimate label.
@@ -1846,6 +1854,8 @@ impl GigaMuxApp {
         } else {
             self.start_preview_cache();
         }
+        // Farm scores on shared storage → preview_cache (before scrub so twins stay live).
+        self.import_vmaf_sidecars_from_output();
         // Output deleted/renamed → drop orphaned input (and vice versa) VMAF so meta stays live.
         if self.scrub_stale_vmaf() {
             self.save_preview_cache_to_disk();
@@ -2275,6 +2285,7 @@ impl GigaMuxApp {
             chunking: self.prefs.flamenco_chunking,
             chunks: self.prefs.flamenco_chunks.clamp(2, 32),
             only_chunk_software: self.prefs.flamenco_only_chunk_software,
+            farm_vmaf: FarmVmafMode::Off,
             estimate_duration_s,
             estimate_name,
         });
@@ -2293,7 +2304,7 @@ impl GigaMuxApp {
     }
 
     /// Submit the given inputs to Flamenco (one job each; stock worker `exec` via `GigaMux.js`).
-    fn submit_flamenco_encode(&mut self, names: Vec<String>) {
+    fn submit_flamenco_encode(&mut self, names: Vec<String>, farm_vmaf: FarmVmafMode) {
         let url = self.prefs.flamenco_manager_url.trim().to_string();
         if url.is_empty() {
             self.alert_error_with(
@@ -2451,6 +2462,9 @@ impl GigaMuxApp {
                     &self.prefs.flamenco_check_exe,
                     &self.prefs.flamenco_scripts_dir,
                 );
+                if farm_vmaf == FarmVmafMode::Attached {
+                    integrity.vmaf = Some(farm_vmaf_spec(&farm.input, &job_built.final_output));
+                }
                 let job = match make_gigamux_chunked_job(
                     format!("GigaMux {name}"),
                     exe,
@@ -2476,7 +2490,12 @@ impl GigaMuxApp {
                             "Flamenco submitted: job {id}; {name} → {out_name} ({} chunks, {}k / {})",
                             chunk_n, job_built.bitrate_k, job_built.bitrate_label
                         ));
-                        self.track_farm_job(id, name.clone(), out_name.clone());
+                        self.track_farm_job(
+                            id,
+                            name.clone(),
+                            out_name.clone(),
+                            farm_vmaf == FarmVmafMode::Separate,
+                        );
                         ok += 1;
                     }
                     Err(e) => {
@@ -2527,6 +2546,9 @@ impl GigaMuxApp {
                 &self.prefs.flamenco_check_exe,
                 &self.prefs.flamenco_scripts_dir,
             );
+            if farm_vmaf == FarmVmafMode::Attached {
+                integrity.vmaf = Some(farm_vmaf_spec(&farm.input, &cmd.output));
+            }
             let job = match make_gigamux_encode_job(
                 format!("GigaMux {name}"),
                 exe,
@@ -2549,7 +2571,12 @@ impl GigaMuxApp {
                         "Flamenco submitted: job {id}; {name} → {out_name} ({}k / {})",
                         cmd.bitrate_k, cmd.bitrate_label
                     ));
-                    self.track_farm_job(id, name.clone(), out_name.clone());
+                    self.track_farm_job(
+                        id,
+                        name.clone(),
+                        out_name.clone(),
+                        farm_vmaf == FarmVmafMode::Separate,
+                    );
                     ok += 1;
                 }
                 Err(e) => {
@@ -2592,7 +2619,13 @@ impl GigaMuxApp {
     }
 
     /// Remember a job id from this session for the Farm panel (not persisted).
-    fn track_farm_job(&mut self, job_id: String, name: String, out_name: String) {
+    fn track_farm_job(
+        &mut self,
+        job_id: String,
+        name: String,
+        out_name: String,
+        want_separate_vmaf: bool,
+    ) {
         self.farm_selected_id = Some(job_id.clone());
         self.farm_jobs.push(FarmSessionJob {
             job_id,
@@ -2605,10 +2638,191 @@ impl GigaMuxApp {
             log_task_order: Vec::new(),
             task_logs: HashMap::new(),
             task_last_tail: HashMap::new(),
+            want_separate_vmaf,
+            vmaf_followup_done: false,
         });
         self.farm_log_tail.clear();
         self.farm_log_task_label.clear();
         self.farm_force_poll = true;
+    }
+
+    /// Import `*.vmaf.json` sidecars from the output folder into preview_cache.
+    fn import_vmaf_sidecars_from_output(&mut self) {
+        let out_dir = self.prefs.output_dir.clone();
+        if !out_dir.is_dir() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&out_dir) else {
+            return;
+        };
+        let mut imported = 0usize;
+        for ent in entries.flatten() {
+            let path = ent.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".vmaf.json") {
+                continue;
+            }
+            let Some(sc) = read_vmaf_sidecar(&path) else {
+                continue;
+            };
+            // Sidecar is `{deliver}.vmaf.json` — recover deliver basename.
+            let out_name = name
+                .strip_suffix(".vmaf.json")
+                .unwrap_or(&sc.output)
+                .to_string();
+            let already = self
+                .preview_cache
+                .get(&Self::preview_key(FileSide::Output, &out_name))
+                .and_then(|e| e.vmaf_score)
+                .is_some();
+            if already {
+                continue;
+            }
+            self.persist_vmaf_score(&sc.input, &out_name, sc.score);
+            imported += 1;
+        }
+        if imported > 0 {
+            self.push_session(format!("imported {imported} farm VMAF sidecar(s)"));
+        }
+    }
+
+    /// Separate-mode follow-up after an encode job completes.
+    fn submit_farm_vmaf_followup(&mut self, in_name: &str, out_name: &str) {
+        let in_path = self.prefs.input_dir.join(in_name);
+        let out_path = self.prefs.output_dir.join(out_name);
+        let sidecar = vmaf_sidecar_path(&out_path);
+        if read_vmaf_sidecar(&sidecar).is_some()
+            || self
+                .live_vmaf_score(FileSide::Output, out_name)
+                .is_some()
+        {
+            self.push_session(format!("Farm VMAF skip (already scored): {out_name}"));
+            self.import_vmaf_sidecars_from_output();
+            return;
+        }
+        if !out_path.is_file() {
+            self.push_session(format!("Farm VMAF skip (missing output): {out_name}"));
+            return;
+        }
+        let spec = farm_vmaf_spec(&in_path, &out_path);
+        self.submit_farm_vmaf_job(format!("GigaMux VMAF {out_name}"), &[spec], out_name);
+    }
+
+    /// Right-click VMAF: submit VMAF-only farm job(s) for unscored completed finals.
+    fn submit_farm_vmaf_batch(&mut self) {
+        let url = self.prefs.flamenco_manager_url.trim().to_string();
+        if url.is_empty() {
+            self.alert_error("Farm VMAF", "set Flamenco Manager URL first");
+            return;
+        }
+        if self.busy {
+            return;
+        }
+        self.import_vmaf_sidecars_from_output();
+        let unscored = self.unscored_output_names();
+        let mut pairs: Vec<FarmVmafSpec> = Vec::new();
+        for out_name in &unscored {
+            if is_chunk_filename(out_name) {
+                continue; // farm VMAF is finals-only
+            }
+            let out_path = self.prefs.output_dir.join(out_name);
+            if !out_path.is_file() {
+                continue;
+            }
+            if read_vmaf_sidecar(&vmaf_sidecar_path(&out_path)).is_some() {
+                continue;
+            }
+            let Some(in_name) = self.counterpart_name(FileSide::Output, out_name) else {
+                continue;
+            };
+            let in_path = self.prefs.input_dir.join(&in_name);
+            if !in_path.is_file() {
+                continue;
+            }
+            pairs.push(farm_vmaf_spec(&in_path, &out_path));
+        }
+        if pairs.is_empty() {
+            self.push_session("Farm VMAF batch: nothing unscored to submit");
+            return;
+        }
+        let n = pairs.len();
+        let label = if n == 1 {
+            pairs[0]
+                .output
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("out")
+                .to_string()
+        } else {
+            format!("{n} outputs")
+        };
+        self.submit_farm_vmaf_job(format!("GigaMux VMAF batch ({n})"), &pairs, &label);
+    }
+
+    /// Submit a VMAF-only Flamenco job (worker tag `vmaf`).
+    fn submit_farm_vmaf_job(&mut self, job_name: String, pairs: &[FarmVmafSpec], track_label: &str) {
+        let url = self.prefs.flamenco_manager_url.trim().to_string();
+        if url.is_empty() {
+            self.push_session("Farm VMAF: Manager URL empty");
+            return;
+        }
+        let exe = {
+            let t = self.prefs.flamenco_ffmpeg_exe.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        };
+        let check_exe = resolve_flamenco_check_exe(
+            &self.prefs.flamenco_check_exe,
+            &self.prefs.flamenco_scripts_dir,
+        );
+        let twoway = {
+            let local = self.prefs.flamenco_twoway_local.trim();
+            let var = self.prefs.flamenco_twoway_var.trim();
+            if local.is_empty() {
+                None
+            } else {
+                Some(FlamencoTwoway {
+                    local_prefix: local,
+                    var_name: if var.is_empty() {
+                        "shared_storage_path"
+                    } else {
+                        var
+                    },
+                })
+            }
+        };
+        let job = match make_gigamux_vmaf_job(
+            job_name,
+            exe,
+            pairs,
+            Some("vmaf"),
+            twoway,
+            &check_exe,
+        ) {
+            Ok(j) => j,
+            Err(e) => {
+                self.push_session(format!("Farm VMAF job: {e}"));
+                return;
+            }
+        };
+        match submit_job(&url, &job) {
+            Ok(id) => {
+                self.push_session(format!("Farm VMAF submitted: job {id}; {track_label}"));
+                self.track_farm_job(id, track_label.to_string(), track_label.to_string(), false);
+                self.farm_panel_open = true;
+            }
+            Err(e) => {
+                self.push_session(format!("Farm VMAF submit failed: {e}"));
+                if let Some(hint) = flamenco_script_hint(&e) {
+                    self.alert_error_with("Flamenco", hint, AlertAfterOk::OpenSettingsFiles);
+                }
+            }
+        }
     }
 
     /// Drop completed/canceled/failed rows from the session list.
@@ -2650,14 +2864,30 @@ impl GigaMuxApp {
 
     /// Apply a background poll result onto session rows / log pane.
     fn apply_farm_poll(&mut self, result: FarmPollResult) {
+        let mut completed_followups: Vec<(String, String)> = Vec::new();
         for row in result.rows {
             if let Some(job) = self.farm_jobs.iter_mut().find(|j| j.job_id == row.job_id) {
-                job.status = row.status;
+                let was_terminal = flamenco_job_terminal(&job.status);
+                job.status = row.status.clone();
                 job.worker = row.worker;
                 job.task_name = row.task_name;
                 job.error = row.error;
+                // Separate farm VMAF: chain a `vmaf`-tagged job when encode completes.
+                if !was_terminal
+                    && row.status.eq_ignore_ascii_case("completed")
+                    && job.want_separate_vmaf
+                    && !job.vmaf_followup_done
+                {
+                    job.vmaf_followup_done = true;
+                    completed_followups.push((job.name.clone(), job.out_name.clone()));
+                }
             }
         }
+        for (in_name, out_name) in completed_followups {
+            self.submit_farm_vmaf_followup(&in_name, &out_name);
+        }
+        // Import any new sidecars written by attached/separate farm VMAF.
+        self.import_vmaf_sidecars_from_output();
         // Merge every task logtail into the selected job (append; never replace earlier tasks).
         if result.selected_id.as_ref() == self.farm_selected_id.as_ref() {
             if let (Some(sel), Some(chunks)) = (result.selected_id.as_ref(), result.log_chunks) {
@@ -4193,10 +4423,17 @@ impl GigaMuxApp {
     }
 
     /// Output basenames that exist on disk but have no cached VMAF score yet.
+    /// Farm `*.vmaf.json` sidecars count as scored so idle/local VMAF won't redo them.
     fn unscored_output_names(&self) -> HashSet<String> {
         self.names_for(FileSide::Output)
             .into_iter()
-            .filter(|n| self.live_vmaf_score(FileSide::Output, n).is_none())
+            .filter(|n| {
+                if self.live_vmaf_score(FileSide::Output, n).is_some() {
+                    return false;
+                }
+                let side = vmaf_sidecar_path(&self.prefs.output_dir.join(n));
+                read_vmaf_sidecar(&side).is_none()
+            })
             .collect()
     }
 
@@ -5983,11 +6220,14 @@ impl GigaMuxApp {
                             egui::Button::new("VMAF").min_size(egui::vec2(120.0, 28.0)),
                         )
                         .on_hover_text(
-                            "libvmaf all input→output pairs. Right-click a file for one pair. Esc cancels.",
+                            "libvmaf all input→output pairs. Right-click a file for one pair; right-click this button to farm-VMAF unscored finals (tag `vmaf`). Esc cancels.",
                         )
                         .on_disabled_hover_text(disabled_hint);
                     if vmaf.clicked() {
                         self.start_vmaf(None);
+                    }
+                    if vmaf.secondary_clicked() {
+                        self.submit_farm_vmaf_batch();
                     }
                 }
                 ui.add_space(6.0);
@@ -7445,6 +7685,39 @@ impl GigaMuxApp {
                         "Only chunk software (HW opaque stays single)",
                     );
                 }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Farm VMAF");
+                    egui::ComboBox::from_id_salt("flamenco_send_farm_vmaf")
+                        .selected_text(match prompt.farm_vmaf {
+                            FarmVmafMode::Off => "Off",
+                            FarmVmafMode::Attached => "Attached",
+                            FarmVmafMode::Separate => "Separate",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut prompt.farm_vmaf, FarmVmafMode::Off, "Off");
+                            ui.selectable_value(
+                                &mut prompt.farm_vmaf,
+                                FarmVmafMode::Attached,
+                                "Attached",
+                            )
+                            .on_hover_text(
+                                "Trailing ensure-vmaf on this encode job (same worker tag — those workers need libvmaf).",
+                            );
+                            ui.selectable_value(
+                                &mut prompt.farm_vmaf,
+                                FarmVmafMode::Separate,
+                                "Separate",
+                            )
+                            .on_hover_text(
+                                "After encode completes, submit a VMAF-only job tagged `vmaf`.",
+                            );
+                        });
+                })
+                .response
+                .on_hover_text(
+                    "Per send only (default Off). Attached uses the encode tag; Separate uses `vmaf`. Sidecar skips redo.",
+                );
 
                 if let Some(p) = self.pending_flamenco.as_mut() {
                     p.worker_tag = prompt.worker_tag.clone();
@@ -7452,6 +7725,7 @@ impl GigaMuxApp {
                     p.chunking = prompt.chunking;
                     p.chunks = prompt.chunks.clamp(2, 32);
                     p.only_chunk_software = prompt.only_chunk_software;
+                    p.farm_vmaf = prompt.farm_vmaf;
                 }
 
                 ui.add_space(10.0);
@@ -7475,8 +7749,9 @@ impl GigaMuxApp {
                         self.prefs.flamenco_only_chunk_software = prompt.only_chunk_software;
                         let _ = prefs::save(&self.prefs);
                         let names = prompt.names;
+                        let farm_vmaf = prompt.farm_vmaf;
                         self.pending_flamenco = None;
-                        self.submit_flamenco_encode(names);
+                        self.submit_flamenco_encode(names, farm_vmaf);
                     }
                 });
             });

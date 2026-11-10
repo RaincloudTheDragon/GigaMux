@@ -52,18 +52,33 @@ GigaMux **Ensure tags** creates:
 | --- | --- |
 | `nvenc` | Opaque HW encode |
 | `qsv` | VP9 QSV opaque |
-| `vmaf` | Farm VMAF (later) |
+| `vmaf` | VMAF-only jobs (Separate / batch) |
 
-Assign workers to those tags in Flamenco after probing. Submit with **Worker tag** set to the name (or UUID) when the job must stay on a tagged pool.
+Flamenco assigns **one worker tag per job** (not per task). Assign workers to tags in Flamenco after probing. Submit with **Worker tag** set to the name (or UUID) when the job must stay on a tagged pool.
 
 ## Job type
 
 Script: [GigaMux.js](../flamenco/GigaMux.js) (bundled for Deploy). Redeploy after GigaMux updates; the Manager keeps its own copy until you do.
 
-- **Single:** `encode` → `final-check`
-- **Chunked:** `encode-c*` (`ensure-chunk`) → `mux` (ffconcat + source audio/subs → `.vmux.mkv`) → `remux` (→ final) → `final-check` → `cleanup`
+- **Single:** `encode` → `final-check` → optional `vmaf`
+- **Chunked:** `encode-c*` (`ensure-chunk`) → `mux` (ffconcat + source audio/subs → `.vmux.mkv`) → `remux` (→ final) → `final-check` → `cleanup` → optional `vmaf`
+- **VMAF-only:** `vmaf` / `vmaf-i` tasks from `vmaf_pairs_json` (no encode); submit with tag `vmaf`
 
 Flamenco soft-fail retries only that task, so `mux` and `remux` stay separate (a remux retry must not re-join chunks). Chunk healthcheck runs in the same task as the encode; `final-check` is separate and may fail the job. Helpers: [flamenco/helpers/README.md](../flamenco/helpers/README.md).
+
+### Farm VMAF
+
+**Send to Flamenco** dialog → **Farm VMAF** (default Off; not persisted):
+
+| Mode | Behavior |
+| --- | --- |
+| Off | No farm VMAF tasks |
+| Attached | Trailing `ensure-vmaf` on the encode job (same encode worker tag — those workers need `libvmaf`) |
+| Separate | After encode **completed**, submit a VMAF-only job tagged `vmaf` |
+
+Right-click the main **VMAF** button to submit a VMAF-only job for unscored completed finals (tag `vmaf`).
+
+`gigamux-check ensure-vmaf` writes `{deliver}.vmaf.json` next to the output and **skips** ffmpeg when that sidecar already has a score (soft-fail/retry never redoes heavy scoring). GigaMux imports sidecars into the preview cache on list refresh / farm poll; local idle VMAF treats a valid sidecar as already scored. Redeploy `GigaMux.js` and update worker `gigamux-check` after this change.
 
 `mux` / `remux` run `setts=TS-STARTPTS` so A/V start times land at zero; residual skew on Check/farm final is a Low WARN only (does not hard-fail or block cleanup). Local MP4 encode and farm MP4 remux use `-movflags +use_metadata_tags` so `GigaMux_version` / `GigaMux_*` tags show in ffprobe (Lavf may still overwrite the standard `encoder` tag).
 
@@ -98,6 +113,6 @@ Upstream Flamenco currently has a bug where the Windows workers are not killed u
 - QSV+libvpx alpha hybrid is refused for chunked farm jobs; use software alpha or opaque.
 - No seam-scan on the farm (Python-only locally today).
 - Local VMAF (manual or idle auto) scores leftover `*.cNNNofMMM.*` chunks against the source frame range implied by the filename; Check/`check_chunk_file` must pass first (incomplete mid-farm chunks are skipped / blocked like bad finals).
-- Farm VMAF only after workers with `libvmaf` are tagged and confirmed.
+- Attached farm VMAF requires `libvmaf` on encode-tag workers; Separate/batch use the `vmaf` tag.
 - SSDP Find does not configure Manager; URL is written to prefs when a Manager answers `/api/v3/version`.
 - Whether or not cancellation works depends on Worker build and (for ≤3.9) GigaMux’s legacy circumvention path.

@@ -24,8 +24,8 @@ pub use check::{
 pub use chunk::{chunk_time_range, estimate_total_frames, parse_fps};
 pub use encode::{
     build_farm_chunked_job, build_farm_ffmpeg_argv, farm_integrity_for_chunked,
-    farm_integrity_for_single, run_batch, write_farm_ffconcat, EncodeEvent, EncodeOptions,
-    FarmChunkedJob, FarmEncodeRequest, FarmFfmpegCommand,
+    farm_integrity_for_single, farm_vmaf_spec, run_batch, write_farm_ffconcat, EncodeEvent,
+    EncodeOptions, FarmChunkedJob, FarmEncodeRequest, FarmFfmpegCommand,
 };
 pub use ffmpeg_active::{active_ffmpeg_pid, kill_process_tree, ActiveFfmpegGuard};
 pub use flamenco::{
@@ -33,11 +33,12 @@ pub use flamenco::{
     deploy_gigamux_manager, discover_manager, ensure_worker_tags, fetch_job_status, fetch_job_tasks,
     fetch_task_log, fetch_task_logtail, fetch_worker_tags, flamenco_job_terminal, flamenco_script_hint,
     infer_twoway_local_prefix, local_gigamux_js_present, make_gigamux_chunked_job,
-    make_gigamux_encode_job, manager_web_url, normalize_check_exe_path, pick_log_task, ping_manager,
-    resolve_flamenco_check_exe, rewrite_flamenco_twoway_path, scripts_dir_from_manager_install,
-    submit_job, CancelExecMode, DeployReport, FarmChunkCheck, FarmCleanup, FarmFinalCheck,
-    FlamencoIntegrity, FlamencoJobStatus, FlamencoTaskSummary, FlamencoTwoway, SubmittedJob,
-    DEFAULT_CHECK_EXE, GIGAMUX_JS, REQUIRED_WORKER_TAGS,
+    make_gigamux_encode_job, make_gigamux_vmaf_job, manager_web_url, normalize_check_exe_path,
+    pick_log_task, ping_manager, resolve_flamenco_check_exe, rewrite_flamenco_twoway_path,
+    scripts_dir_from_manager_install, submit_job, CancelExecMode, DeployReport, FarmChunkCheck,
+    FarmCleanup, FarmFinalCheck, FarmVmafMode, FarmVmafSpec, FlamencoIntegrity, FlamencoJobStatus,
+    FlamencoTaskSummary, FlamencoTwoway, SubmittedJob, DEFAULT_CHECK_EXE, GIGAMUX_JS,
+    REQUIRED_WORKER_TAGS,
 };
 pub use job_log::{
     encode_event_line, encode_logs_dir, job_logs_dir, vmaf_event_line, EncodeJobLog, JobLog,
@@ -63,4 +64,7 @@ pub use targets::{
     strip_test_prefix, AlphaVideo, AudioEncode, OpaqueVideo, OutContainer, OutputTargets,
     TestBatch,
 };
-pub use vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport, VmafResult};
+pub use vmaf::{
+    ensure_vmaf, libvmaf_available, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path,
+    write_vmaf_sidecar, VmafEvent, VmafReport, VmafResult, VmafSidecar,
+};

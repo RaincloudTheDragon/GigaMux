@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::check::{check_chunk_file, is_chunk_filename, list_media};
@@ -81,6 +82,153 @@ pub fn libvmaf_available() -> bool {
     };
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines().any(|l| l.contains("libvmaf"))
+}
+
+/// On-disk farm/local VMAF score next to a deliver (`clip.mp4.vmaf.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmafSidecar {
+    pub version: u32,
+    pub score: f64,
+    pub input: String,
+    pub output: String,
+}
+
+/// Sidecar path: `{output_path}.vmaf.json`.
+pub fn vmaf_sidecar_path(output: &Path) -> PathBuf {
+    let mut s = output.as_os_str().to_os_string();
+    s.push(".vmaf.json");
+    PathBuf::from(s)
+}
+
+/// Read a finite-score sidecar, or `None` if missing/invalid.
+pub fn read_vmaf_sidecar(path: &Path) -> Option<VmafSidecar> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let sc: VmafSidecar = serde_json::from_str(&raw).ok()?;
+    if sc.version == 0 || !sc.score.is_finite() {
+        return None;
+    }
+    Some(sc)
+}
+
+/// Atomic write of a VMAF sidecar (temp + rename).
+pub fn write_vmaf_sidecar(path: &Path, sc: &VmafSidecar) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("vmaf sidecar mkdir: {e}"))?;
+    }
+    // Append `.tmp` — do not use `with_extension` (would clobber `.vmaf.json`).
+    let tmp = {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    let body = serde_json::to_string_pretty(sc).map_err(|e| format!("vmaf sidecar json: {e}"))?;
+    std::fs::write(&tmp, body).map_err(|e| format!("vmaf sidecar write: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("vmaf sidecar rename: {e}")
+    })
+}
+
+/// Farm/worker path: skip if sidecar has a score, else run libvmaf and write sidecar.
+/// `ffmpeg_exe` empty → `"ffmpeg"`. Prints `VMAF score: …` / skip note on stdout for task logs.
+pub fn ensure_vmaf(
+    reference: &Path,
+    distorted: &Path,
+    sidecar: &Path,
+    ffmpeg_exe: &str,
+) -> Result<f64, String> {
+    if let Some(sc) = read_vmaf_sidecar(sidecar) {
+        println!(
+            "ensure-vmaf: reuse sidecar {} (score {:.6})",
+            sidecar.display(),
+            sc.score
+        );
+        return Ok(sc.score);
+    }
+    if !reference.is_file() {
+        return Err(format!("ensure-vmaf: reference missing: {}", reference.display()));
+    }
+    if !distorted.is_file() {
+        return Err(format!("ensure-vmaf: distorted missing: {}", distorted.display()));
+    }
+    let exe = {
+        let t = ffmpeg_exe.trim();
+        if t.is_empty() {
+            "ffmpeg"
+        } else {
+            t
+        }
+    };
+    let score = run_vmaf_pair_exe(exe, reference, distorted)?;
+    let in_name = reference
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| reference.display().to_string());
+    let out_name = distorted
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| distorted.display().to_string());
+    write_vmaf_sidecar(
+        sidecar,
+        &VmafSidecar {
+            version: 1,
+            score,
+            input: in_name,
+            output: out_name,
+        },
+    )?;
+    println!("ensure-vmaf: wrote {} (score {:.6})", sidecar.display(), score);
+    Ok(score)
+}
+
+/// Blocking libvmaf with a specific ffmpeg binary (no cancel / UI progress).
+fn run_vmaf_pair_exe(ffmpeg_exe: &str, reference: &Path, distorted: &Path) -> Result<f64, String> {
+    let threads = n_threads().to_string();
+    let filter = format!(
+        "[0:v]setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
+    );
+    let out = Command::new(ffmpeg_exe)
+        .args([
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            &reference.to_string_lossy(),
+            "-i",
+            &distorted.to_string_lossy(),
+            "-filter_complex",
+            &filter,
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("ffmpeg spawn: {e}"))?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    let mut score = None;
+    let mut tail: VecDeque<String> = VecDeque::new();
+    for line in err.lines() {
+        push_stderr_tail(&mut tail, line);
+        if let Some(s) = parse_vmaf_score(line) {
+            score = Some(s);
+        }
+    }
+    if let Some(s) = score {
+        return Ok(s);
+    }
+    if !out.status.success() {
+        return Err(format_ffmpeg_fail(&out.status, &tail));
+    }
+    Err(if tail.is_empty() {
+        "VMAF score not found in ffmpeg output (is libvmaf enabled?)".into()
+    } else {
+        format!(
+            "VMAF score not found in ffmpeg output (is libvmaf enabled?): {}",
+            tail.iter().cloned().collect::<Vec<_>>().join(" | ")
+        )
+    })
 }
 
 fn parse_vmaf_score(line: &str) -> Option<f64> {
@@ -724,4 +872,33 @@ pub fn run_vmaf(
     }
     on_event(VmafEvent::Finished { ok, failed });
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_path_and_round_trip() {
+        let out = PathBuf::from("clip.mp4");
+        let side = vmaf_sidecar_path(&out);
+        assert_eq!(side, PathBuf::from("clip.mp4.vmaf.json"));
+        let dir = std::env::temp_dir().join(format!("gigamux_vmaf_side_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.mp4.vmaf.json");
+        write_vmaf_sidecar(
+            &path,
+            &VmafSidecar {
+                version: 1,
+                score: 97.5,
+                input: "a.mkv".into(),
+                output: "a.mp4".into(),
+            },
+        )
+        .unwrap();
+        let sc = read_vmaf_sidecar(&path).expect("read");
+        assert!((sc.score - 97.5).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

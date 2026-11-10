@@ -141,6 +141,26 @@ pub struct FarmCleanup {
     pub chunks: u32,
 }
 
+/// Farm VMAF mode on the Flamenco send dialog (not a persisted pref). Default off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FarmVmafMode {
+    /// No farm VMAF tasks / follow-up jobs.
+    #[default]
+    Off,
+    /// Trailing `vmaf` task on the encode job (same worker tag; those workers need libvmaf).
+    Attached,
+    /// After encode completes, submit a separate VMAF-only job tagged `vmaf`.
+    Separate,
+}
+
+/// One farm VMAF pair for `gigamux-check ensure-vmaf` (attached or VMAF-only job).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FarmVmafSpec {
+    pub input: String,
+    pub output: String,
+    pub sidecar: String,
+}
+
 /// Integrity settings embedded in a GigaMux Flamenco job (hybrid model).
 #[derive(Debug, Clone)]
 pub struct FlamencoIntegrity {
@@ -151,6 +171,8 @@ pub struct FlamencoIntegrity {
     pub final_check: Option<FarmFinalCheck>,
     /// Only run after successful final check (chunked jobs).
     pub cleanup: Option<FarmCleanup>,
+    /// Trailing VMAF on the encode job (after final-check).
+    pub vmaf: Option<FarmVmafSpec>,
 }
 
 impl Default for FlamencoIntegrity {
@@ -160,6 +182,7 @@ impl Default for FlamencoIntegrity {
             chunk_checks: Vec::new(),
             final_check: None,
             cleanup: None,
+            vmaf: None,
         }
     }
 }
@@ -176,6 +199,11 @@ fn rewrite_integrity_paths(mut integ: FlamencoIntegrity, tw: Option<FlamencoTwow
     }
     if let Some(c) = integ.cleanup.as_mut() {
         c.dir = rewrite_path_arg(&c.dir, tw);
+    }
+    if let Some(v) = integ.vmaf.as_mut() {
+        v.input = rewrite_path_arg(&v.input, tw);
+        v.output = rewrite_path_arg(&v.output, tw);
+        v.sidecar = rewrite_path_arg(&v.sidecar, tw);
     }
     integ
 }
@@ -234,7 +262,9 @@ fn rewrite_path_arg(arg: &str, tw: Option<FlamencoTwoway<'_>>) -> String {
     }
 }
 
-fn integrity_settings_json(integ: &FlamencoIntegrity) -> Result<(String, String, String, String), String> {
+fn integrity_settings_json(
+    integ: &FlamencoIntegrity,
+) -> Result<(String, String, String, String, String), String> {
     let check_exe = {
         let t = integ.check_exe.trim();
         if t.is_empty() {
@@ -257,7 +287,17 @@ fn integrity_settings_json(integ: &FlamencoIntegrity) -> Result<(String, String,
         Some(c) => serde_json::to_string(c).map_err(|e| format!("serialize cleanup: {e}"))?,
         None => String::new(),
     };
-    Ok((check_exe, chunk_checks_json, final_check_json, cleanup_json))
+    let vmaf_json = match &integ.vmaf {
+        Some(v) => serde_json::to_string(v).map_err(|e| format!("serialize vmaf: {e}"))?,
+        None => String::new(),
+    };
+    Ok((
+        check_exe,
+        chunk_checks_json,
+        final_check_json,
+        cleanup_json,
+        vmaf_json,
+    ))
 }
 
 /// Optional two-way path rewrite for argv (Flamenco only HasPrefix-replaces whole setting strings).
@@ -344,7 +384,7 @@ pub fn make_gigamux_encode_job(
     let encode_argvs_json =
         serde_json::to_string(&vec![&argv]).map_err(|e| format!("serialize encode_argvs: {e}"))?;
     let integ = rewrite_integrity_paths(integrity.unwrap_or_default(), twoway);
-    let (check_exe, chunk_checks_json, final_check_json, cleanup_json) =
+    let (check_exe, chunk_checks_json, final_check_json, cleanup_json, vmaf_json) =
         integrity_settings_json(&integ)?;
     let settings = json!({
         "ffmpeg_exe": exe,
@@ -357,6 +397,8 @@ pub fn make_gigamux_encode_job(
         "chunk_checks_json": chunk_checks_json,
         "final_check_json": final_check_json,
         "cleanup_json": cleanup_json,
+        "vmaf_json": vmaf_json,
+        "vmaf_pairs_json": "",
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -411,7 +453,7 @@ pub fn make_gigamux_chunked_job(
             encode_argvs.len()
         ));
     }
-    let (check_exe, chunk_checks_json, final_check_json, cleanup_json) =
+    let (check_exe, chunk_checks_json, final_check_json, cleanup_json, vmaf_json) =
         integrity_settings_json(&integ)?;
     // concat_argv_json stays empty — stage mux reads ffconcat directly (no `.vcat`).
     let settings = json!({
@@ -427,6 +469,65 @@ pub fn make_gigamux_chunked_job(
         "chunk_checks_json": chunk_checks_json,
         "final_check_json": final_check_json,
         "cleanup_json": cleanup_json,
+        "vmaf_json": vmaf_json,
+        "vmaf_pairs_json": "",
+    });
+    Ok(SubmittedJob {
+        name: name.into(),
+        job_type: "GigaMux".into(),
+        submitter_platform: "windows".into(),
+        priority: 50,
+        settings,
+        worker_tag: tag,
+    })
+}
+
+/// VMAF-only Flamenco job (`vmaf` tag): one `ensure-vmaf` task per pair.
+pub fn make_gigamux_vmaf_job(
+    name: impl Into<String>,
+    ffmpeg_exe: Option<&str>,
+    pairs: &[FarmVmafSpec],
+    worker_tag: Option<&str>,
+    twoway: Option<FlamencoTwoway<'_>>,
+    check_exe: &str,
+) -> Result<SubmittedJob, String> {
+    if pairs.is_empty() {
+        return Err("vmaf pairs is empty".into());
+    }
+    let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
+    let mut rewritten = Vec::with_capacity(pairs.len());
+    for p in pairs {
+        rewritten.push(FarmVmafSpec {
+            input: rewrite_path_arg(&p.input, twoway),
+            output: rewrite_path_arg(&p.output, twoway),
+            sidecar: rewrite_path_arg(&p.sidecar, twoway),
+        });
+    }
+    let pairs_json =
+        serde_json::to_string(&rewritten).map_err(|e| format!("serialize vmaf_pairs: {e}"))?;
+    let check = {
+        let t = check_exe.trim();
+        let raw = if t.is_empty() {
+            DEFAULT_CHECK_EXE
+        } else {
+            t
+        };
+        rewrite_path_arg(raw, twoway)
+    };
+    let settings = json!({
+        "ffmpeg_exe": exe,
+        "ffmpeg_argv_json": "",
+        "encode_argvs_json": "",
+        "concat_argv_json": "",
+        "mux_argv_json": "",
+        "mux_remux_argv_json": "",
+        "cancel_exec": CancelExecMode::Direct.as_setting(),
+        "check_exe": check,
+        "chunk_checks_json": "",
+        "final_check_json": "",
+        "cleanup_json": "",
+        "vmaf_json": "",
+        "vmaf_pairs_json": pairs_json,
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -951,9 +1052,12 @@ pub fn flamenco_script_hint(err_or_body: &str) -> Option<&'static str> {
         )
     } else if lower.contains("ffmpeg_argv_json is required")
         || (lower.contains("encode_argvs_json") && lower.contains("required"))
+        || lower.contains("vmaf_pairs_json")
+        || lower.contains("vmaf_json")
+        || lower.contains("ensure-vmaf")
     {
         Some(
-            "Manager has an old/incompatible GigaMux.js. Settings → Files → Deploy GigaMux… then retry",
+            "Manager has an old/incompatible GigaMux.js (or outdated gigamux-check). Settings → Files → Deploy GigaMux… then retry",
         )
     } else {
         None

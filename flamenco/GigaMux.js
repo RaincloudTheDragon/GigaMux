@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Unlicense
 // Job type GigaMux: ffmpeg argv(s) from the GigaMux submitter.
-// Single file: one misc/exec (+ optional final-check).
-// Chunked: N ensure-chunk encodes → mux (ensure-out vmux from ffconcat+audio) → remux (ensure-out final) → final-check/cleanup.
+// Single file: one misc/exec (+ optional final-check + optional trailing vmaf).
+// Chunked: N ensure-chunk encodes → mux (ensure-out vmux from ffconcat+audio) → remux (ensure-out final) → final-check/cleanup → optional vmaf.
+// VMAF-only: vmaf_pairs_json → N ensure-vmaf tasks (no encode); submit with worker tag `vmaf`.
 // mux and remux are separate Flamenco tasks so remux soft-fail never re-runs the stage join (same reason we used to split concat from mux).
 // Deploy via Settings → Files → Deploy GigaMux… (Manager install → scripts/ + tools/ helpers).
 
@@ -92,6 +93,20 @@ const JOB_TYPE = {
             required: false,
             default: "",
             description: "JSON FarmCleanup: runs after successful final check only",
+        },
+        {
+            key: "vmaf_json",
+            type: "string",
+            required: false,
+            default: "",
+            description: "JSON {input,output,sidecar} — trailing ensure-vmaf after final-check (same job tag)",
+        },
+        {
+            key: "vmaf_pairs_json",
+            type: "string",
+            required: false,
+            default: "",
+            description: "JSON array of {input,output,sidecar} — VMAF-only job (no encode)",
         },
     ],
 };
@@ -196,6 +211,59 @@ function addEnsureOut(task, checkExe, exe, outPath, expectDur, argv) {
     ].concat(argv));
 }
 
+function parseVmafSpec(raw, label) {
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+        return null;
+    }
+    let spec;
+    try {
+        spec = JSON.parse(raw);
+    } catch (e) {
+        throw "GigaMux: " + label + ": " + e;
+    }
+    if (!spec || typeof spec.input !== "string" || typeof spec.output !== "string" || typeof spec.sidecar !== "string") {
+        throw "GigaMux: " + label + " needs input, output, sidecar strings";
+    }
+    if (!spec.input || !spec.output || !spec.sidecar) {
+        throw "GigaMux: " + label + " paths must be non-empty";
+    }
+    return spec;
+}
+
+function parseVmafPairs(raw) {
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+        return null;
+    }
+    let arr;
+    try {
+        arr = JSON.parse(raw);
+    } catch (e) {
+        throw "GigaMux: vmaf_pairs_json: " + e;
+    }
+    if (!Array.isArray(arr) || arr.length === 0) {
+        throw "GigaMux: vmaf_pairs_json must be a non-empty JSON array";
+    }
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+        const p = arr[i];
+        if (!p || typeof p.input !== "string" || typeof p.output !== "string" || typeof p.sidecar !== "string") {
+            throw "GigaMux: vmaf_pairs_json[" + i + "] needs input, output, sidecar";
+        }
+        out.push(p);
+    }
+    return out;
+}
+
+function addEnsureVmaf(task, checkExe, exe, spec) {
+    addCheckExec(task, checkExe, [
+        "ensure-vmaf",
+        spec.input,
+        spec.output,
+        spec.sidecar,
+        exe,
+    ]);
+}
+
 function compileJob(job) {
     const settings = job.settings;
     const exe = settings.ffmpeg_exe || "ffmpeg";
@@ -204,6 +272,20 @@ function compileJob(job) {
             ? settings.check_exe.trim()
             : "gigamux-check";
     const cancelMode = cancelExecMode(settings);
+    const vmafPairs = parseVmafPairs(settings.vmaf_pairs_json);
+    const vmafAttached = parseVmafSpec(settings.vmaf_json, "vmaf_json");
+
+    // VMAF-only job: no encode graph.
+    if (vmafPairs !== null) {
+        print("GigaMux compileJob: vmaf-only pairs=", vmafPairs.length, " check_exe=", checkExe);
+        for (let i = 0; i < vmafPairs.length; i++) {
+            const name = vmafPairs.length === 1 ? "vmaf" : "vmaf-" + i;
+            const task = author.Task(name, "misc");
+            addEnsureVmaf(task, checkExe, exe, vmafPairs[i]);
+            job.addTask(task);
+        }
+        return;
+    }
 
     let encodeArgvs = null;
     const encRaw = settings.encode_argvs_json;
@@ -217,7 +299,7 @@ function compileJob(job) {
         // Legacy single-task payload.
         const legacy = parseArgvJson(settings.ffmpeg_argv_json, "ffmpeg_argv_json");
         if (!legacy) {
-            throw "GigaMux: encode_argvs_json or ffmpeg_argv_json is required";
+            throw "GigaMux: encode_argvs_json or ffmpeg_argv_json is required (or vmaf_pairs_json for VMAF-only)";
         }
         encodeArgvs = [legacy];
     }
@@ -257,7 +339,9 @@ function compileJob(job) {
         " final_check=",
         finalCheckRaw.length > 0,
         " cleanup=",
-        cleanupRaw.length > 0
+        cleanupRaw.length > 0,
+        " vmaf_attached=",
+        vmafAttached !== null
     );
     if (cancelMode === "legacy_stub") {
         print("GigaMux: cancel_exec=legacy_stub — Windows cancel helper not shipped; using direct ffmpeg exec");
@@ -357,7 +441,19 @@ function compileJob(job) {
         }
         finalTask.addDependency(gateTask);
         job.addTask(finalTask);
+        gateTask = finalTask;
     } else if (cleanupRaw.length > 0) {
         throw "GigaMux: cleanup_json requires final_check_json (cleanup runs after successful final check)";
+    }
+
+    // Trailing VMAF after final-check (or encode/remux when no final-check). Same job worker tag.
+    if (vmafAttached !== null) {
+        if (!gateTask) {
+            throw "GigaMux: vmaf_json requires encode/mux/final-check tasks";
+        }
+        const vmafTask = author.Task("vmaf", "misc");
+        addEnsureVmaf(vmafTask, checkExe, exe, vmafAttached);
+        vmafTask.addDependency(gateTask);
+        job.addTask(vmafTask);
     }
 }

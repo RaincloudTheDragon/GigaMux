@@ -13,7 +13,8 @@ use crate::chunk::{
     chunk_frame_range, estimate_total_frames, list_chunk_paths, parse_fps, write_ffconcat,
     CHUNK_SEEK_PAD_S,
 };
-use crate::flamenco::{FarmChunkCheck, FarmCleanup, FarmFinalCheck, FlamencoIntegrity};
+use crate::flamenco::{FarmChunkCheck, FarmCleanup, FarmFinalCheck, FarmVmafSpec, FlamencoIntegrity};
+use crate::vmaf::vmaf_sidecar_path;
 use crate::gpu::{encoder_metadata_tags, GpuChoice, HwCatalog};
 use crate::job_log::{JobLog, JobLogKind};
 use crate::probe::{
@@ -1759,6 +1760,15 @@ fn farm_final_check(input: &Path, output: &Path, slot: &EncodeSlot) -> FarmFinal
         opaque_container: slot.opaque_container,
         alpha_video: slot.alpha_video,
         alpha_container: slot.alpha_container,
+    }
+}
+
+/// Paths for trailing / separate farm VMAF (`ensure-vmaf` + sidecar next to deliver).
+pub fn farm_vmaf_spec(input: &Path, output: &Path) -> FarmVmafSpec {
+    FarmVmafSpec {
+        input: path_string(input),
+        output: path_string(output),
+        sidecar: path_string(&vmaf_sidecar_path(output)),
     }
 }
 
