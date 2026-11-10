@@ -14,7 +14,7 @@ regex = { workspace = true }
 trash = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
-ureq = { version = "2", default-features = false, features = ["json"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
