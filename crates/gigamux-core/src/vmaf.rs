@@ -1,6 +1,6 @@
 //! VMAF compare: input (reference) vs output (distorted) via ffmpeg `libvmaf`.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,10 +12,21 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::check::list_media;
+use crate::check::{check_chunk_file, is_chunk_filename, list_media};
+use crate::chunk::{
+    chunk_frame_range, estimate_total_frames, parse_chunk_filename, parse_fps, CHUNK_SEEK_PAD_S,
+};
 use crate::job_log::{JobLog, JobLogKind};
 use crate::probe::{file_info, video_has_alpha};
 use crate::targets::{OutputTargets, TestBatch};
+
+/// Optional reference trim for chunk VMAF (distorted is already the chunk, PTS0).
+#[derive(Debug, Clone, Copy)]
+pub struct VmafRefTrim {
+    pub start_frame: u64,
+    pub frame_count: u64,
+    pub fps: f64,
+}
 
 /// One file pair’s VMAF outcome.
 #[derive(Debug, Clone)]
@@ -107,43 +118,128 @@ fn format_duration_s(info: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn first_video_stream<'a>(info: &'a Value) -> Option<&'a Value> {
+    info.get("streams")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("codec_type").and_then(|t| t.as_str()) == Some("video"))
+}
+
+fn probe_video_fps(info: &Value) -> Option<f64> {
+    let v = first_video_stream(info)?;
+    let rate = v
+        .get("r_frame_rate")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("avg_frame_rate").and_then(|x| x.as_str()))?;
+    parse_fps(rate)
+}
+
+fn probe_nb_frames(info: &Value) -> Option<u64> {
+    let v = first_video_stream(info)?;
+    v.get("nb_frames")
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+        .filter(|&n| n > 0)
+}
+
 fn n_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 32))
         .unwrap_or(8)
 }
 
+/// Keep recent non-progress stderr lines for failure messages (cap by count).
+fn push_stderr_tail(tail: &mut VecDeque<String>, line: &str) {
+    let t = line.trim();
+    if t.is_empty() {
+        return;
+    }
+    // Drop ffmpeg `-stats` progress spam; keep errors / filter notes.
+    if t.starts_with("frame=") || (t.contains("time=") && t.contains("bitrate=")) {
+        return;
+    }
+    const CAP: usize = 8;
+    if tail.len() >= CAP {
+        tail.pop_front();
+    }
+    tail.push_back(t.to_string());
+}
+
+fn format_ffmpeg_fail(status: &std::process::ExitStatus, tail: &VecDeque<String>) -> String {
+    if tail.is_empty() {
+        return format!("ffmpeg exited with {status}");
+    }
+    let mut snippet = tail.iter().cloned().collect::<Vec<_>>().join(" | ");
+    const MAX: usize = 400;
+    if snippet.len() > MAX {
+        snippet.truncate(MAX);
+        snippet.push('…');
+    }
+    format!("ffmpeg exited with {status}: {snippet}")
+}
+
 /// Run libvmaf: `reference` = original, `distorted` = encode. Returns pooled score.
+/// `ref_trim` seeks/trims the reference only (farm chunk vs matching source range).
 /// `on_update` gets `(optional log line, optional out_time_s)`.
 pub fn run_vmaf_pair(
     reference: &Path,
     distorted: &Path,
     cancel: &AtomicBool,
     mut on_update: impl FnMut(Option<String>, Option<f64>),
+    ref_trim: Option<&VmafRefTrim>,
 ) -> Result<f64, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
     let threads = n_threads().to_string();
-    let filter = format!(
-        "[0:v]setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
-    );
+    // Chunk trim: same pad + frame trim as encode `ChunkTrim` (reference only; distorted already PTS0).
+    let (filter, seek_s, frames_v) = if let Some(tr) = ref_trim {
+        let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
+        let pre_frame = tr.start_frame.saturating_sub(pad_frames);
+        let seek_s = if pre_frame > 0 {
+            Some(pre_frame as f64 / tr.fps)
+        } else {
+            None
+        };
+        let rel_start = tr.start_frame - pre_frame;
+        let rel_end = rel_start + tr.frame_count;
+        let filter = format!(
+            "[0:v]trim=start_frame={rel_start}:end_frame={rel_end},setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
+        );
+        (filter, seek_s, Some(tr.frame_count))
+    } else {
+        let filter = format!(
+            "[0:v]setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
+        );
+        (filter, None, None)
+    };
+
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-stats".into(),
+        "-stats_period".into(),
+        "0.5".into(),
+    ];
+    if let Some(ss) = seek_s {
+        args.extend(["-ss".into(), format!("{ss:.6}")]);
+    }
+    args.extend([
+        "-i".into(),
+        reference.to_string_lossy().into_owned(),
+        "-i".into(),
+        distorted.to_string_lossy().into_owned(),
+        "-filter_complex".into(),
+        filter,
+    ]);
+    if let Some(n) = frames_v {
+        args.extend(["-frames:v".into(), n.to_string()]);
+    }
+    args.extend(["-f".into(), "null".into(), "-".into()]);
+
     let spawned = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-stats",
-            "-stats_period",
-            "0.5",
-            "-i",
-            &reference.to_string_lossy(),
-            "-i",
-            &distorted.to_string_lossy(),
-            "-filter_complex",
-            &filter,
-            "-f",
-            "null",
-            "-",
-        ])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -193,6 +289,7 @@ pub fn run_vmaf_pair(
     });
 
     let mut score = None;
+    let mut stderr_tail: VecDeque<String> = VecDeque::new();
     let poll = Duration::from_millis(50);
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -207,6 +304,7 @@ pub fn run_vmaf_pair(
                         Ok(Ok(raw)) => {
                             let text = String::from_utf8_lossy(&raw);
                             let t = text.trim();
+                            push_stderr_tail(&mut stderr_tail, t);
                             if let Some(s) = parse_vmaf_score(t) {
                                 score = Some(s);
                             }
@@ -231,7 +329,7 @@ pub fn run_vmaf_pair(
                     return Err("cancelled".into());
                 }
                 if !status.success() && score.is_none() {
-                    return Err(format!("ffmpeg exited with {status}"));
+                    return Err(format_ffmpeg_fail(&status, &stderr_tail));
                 }
                 break;
             }
@@ -248,6 +346,7 @@ pub fn run_vmaf_pair(
                 if t.is_empty() {
                     continue;
                 }
+                push_stderr_tail(&mut stderr_tail, t);
                 if let Some(s) = parse_vmaf_score(t) {
                     score = Some(s);
                 }
@@ -270,17 +369,47 @@ pub fn run_vmaf_pair(
         }
     }
 
-    score.ok_or_else(|| "VMAF score not found in ffmpeg output (is libvmaf enabled?)".into())
+    score.ok_or_else(|| {
+        let base = "VMAF score not found in ffmpeg output (is libvmaf enabled?)";
+        if stderr_tail.is_empty() {
+            base.into()
+        } else {
+            // Reuse fail formatter shape without inventing a fake exit status.
+            let mut snippet = stderr_tail.iter().cloned().collect::<Vec<_>>().join(" | ");
+            if snippet.len() > 400 {
+                snippet.truncate(400);
+                snippet.push('…');
+            }
+            format!("{base}: {snippet}")
+        }
+    })
 }
 
-/// (input_name, output_name, input_path, output_path, duration_s)
+/// True when `only` selects this input (or a final/test output for it). Chunk-only basenames are handled separately.
+fn only_matches_input(only: &str, in_name: &str) -> bool {
+    if is_chunk_filename(only) {
+        return false;
+    }
+    let in_stem = Path::new(in_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(in_name);
+    let only_stem = Path::new(only)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(only);
+    let only_pair = crate::targets::pair_stem(only);
+    in_name == only || in_stem == only_stem || in_stem == only_pair.as_str()
+}
+
+/// (input_name, output_name, input_path, output_path, duration_s, optional ref trim for chunks)
 fn resolve_pairs(
     input_dir: &Path,
     output_dir: &Path,
     slots: &[(Option<TestBatch>, OutputTargets)],
     only_basename: Option<&str>,
     only_outputs: Option<&HashSet<String>>,
-) -> Result<Vec<(String, String, PathBuf, PathBuf, f64)>, String> {
+) -> Result<Vec<(String, String, PathBuf, PathBuf, f64, Option<VmafRefTrim>)>, String> {
     let inputs = list_media(input_dir, true);
     let outputs = list_media(output_dir, false);
     let output_set: HashSet<String> = outputs
@@ -288,23 +417,28 @@ fn resolve_pairs(
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
 
-    let mut pairs = Vec::new();
+    // Per-input probe + deliver stems (reuse for finals and leftover farm chunks).
+    struct InMeta {
+        name: String,
+        path: PathBuf,
+        duration_s: f64,
+        total_frames: Option<u64>,
+        fps: Option<f64>,
+        deliver_stems: HashSet<String>,
+        has_alpha: bool,
+    }
+    let only_chunk_stem = only_basename
+        .and_then(parse_chunk_filename)
+        .map(|(stem, _, _, _)| stem);
+
+    let mut metas: Vec<InMeta> = Vec::new();
     for inp in &inputs {
         let Some(in_name) = inp.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
+        // Input/final selection filters before probe; chunk selection filters after deliver stems.
         if let Some(only) = only_basename {
-            let in_stem = Path::new(&in_name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&in_name);
-            let only_stem = Path::new(only)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(only);
-            // Allow selecting either the input or a testN_ output basename.
-            let only_pair = crate::targets::pair_stem(only);
-            if in_name != only && in_stem != only_stem && in_stem != only_pair.as_str() {
+            if only_chunk_stem.is_none() && !only_matches_input(only, &in_name) {
                 continue;
             }
         }
@@ -314,48 +448,149 @@ fn resolve_pairs(
         };
         let has_alpha = video_has_alpha(&info);
         let duration_s = format_duration_s(&info);
-        let mut any_for_input = false;
+        let fps = probe_video_fps(&info);
+        let total_frames =
+            estimate_total_frames(duration_s, fps.unwrap_or(0.0), probe_nb_frames(&info));
+        let mut deliver_stems = HashSet::new();
         for &(batch, slot) in slots {
             let out_name = slot.expected_name_for(&in_name, has_alpha, batch);
-            if !output_set.contains(&out_name) {
+            if let Some(s) = Path::new(&out_name).file_stem().and_then(|s| s.to_str()) {
+                deliver_stems.insert(s.to_string());
+            }
+        }
+        if let Some(s) = Path::new(&in_name).file_stem().and_then(|s| s.to_str()) {
+            deliver_stems.insert(s.to_string());
+        }
+        if let Some(stem) = only_chunk_stem.as_ref() {
+            if !deliver_stems.contains(stem) {
                 continue;
             }
-            // Auto-VMAF / filtered batches: only score listed output basenames.
-            if let Some(allow) = only_outputs {
-                if !allow.contains(&out_name) {
+        }
+        metas.push(InMeta {
+            name: in_name,
+            path: inp.clone(),
+            duration_s,
+            total_frames,
+            fps,
+            deliver_stems,
+            has_alpha,
+        });
+    }
+
+    let mut pairs = Vec::new();
+    // Context-menu on a specific chunk: skip finals; only that chunk is scored below.
+    if !only_basename.map(is_chunk_filename).unwrap_or(false) {
+        for meta in &metas {
+            for &(batch, slot) in slots {
+                let out_name = slot.expected_name_for(&meta.name, meta.has_alpha, batch);
+                if !output_set.contains(&out_name) {
                     continue;
                 }
+                // Auto-VMAF / filtered batches: only score listed output basenames.
+                if let Some(allow) = only_outputs {
+                    if !allow.contains(&out_name) {
+                        continue;
+                    }
+                }
+                pairs.push((
+                    meta.name.clone(),
+                    out_name.clone(),
+                    meta.path.clone(),
+                    output_dir.join(&out_name),
+                    meta.duration_s,
+                    None,
+                ));
             }
-            any_for_input = true;
-            pairs.push((
-                in_name.clone(),
-                out_name.clone(),
-                inp.clone(),
-                output_dir.join(&out_name),
-                duration_s,
-            ));
-        }
-        if only_basename.is_some() && !any_for_input {
-            let expected: Vec<String> = slots
-                .iter()
-                .map(|&(batch, slot)| slot.expected_name_for(&in_name, has_alpha, batch))
-                .collect();
-            return Err(format!(
-                "no output for {in_name} (expected {})",
-                expected.join(" / ")
-            ));
         }
     }
+
+    // Leftover farm chunks: parse basename → matching input → same frame range as submit-time encode.
+    let only_chunk = only_basename.filter(|o| is_chunk_filename(o));
+    let mut chunk_pairs: Vec<(String, u32, (String, String, PathBuf, PathBuf, f64, Option<VmafRefTrim>))> =
+        Vec::new();
+    for out_name in &output_set {
+        let Some((stem, index, count, _)) = parse_chunk_filename(out_name) else {
+            continue;
+        };
+        if let Some(only) = only_chunk {
+            if only != out_name.as_str() {
+                continue;
+            }
+        } else if only_basename.is_some() {
+            // Input/final selection: metas are already filtered; require deliver-stem ownership.
+            if !metas.iter().any(|m| m.deliver_stems.contains(&stem)) {
+                continue;
+            }
+        }
+        if let Some(allow) = only_outputs {
+            if !allow.contains(out_name) {
+                continue;
+            }
+        }
+        let Some(meta) = metas.iter().find(|m| m.deliver_stems.contains(&stem)) else {
+            continue;
+        };
+        let (Some(total_frames), Some(fps)) = (meta.total_frames, meta.fps) else {
+            return Err(format!(
+                "{}: cannot estimate frames/fps for chunk VMAF",
+                meta.name
+            ));
+        };
+        let (start_frame, frame_count) = chunk_frame_range(total_frames, index, count)?;
+        let duration_s = frame_count as f64 / fps;
+        let out_path = output_dir.join(out_name);
+        // Same healthcheck as Check / ensure-chunk — skip incomplete mid-farm leftovers.
+        if let Err(e) = check_chunk_file(&out_path, duration_s) {
+            if only_chunk.is_some() {
+                return Err(format!("{out_name}: {e}"));
+            }
+            continue;
+        }
+        chunk_pairs.push((
+            stem,
+            index,
+            (
+                meta.name.clone(),
+                out_name.clone(),
+                meta.path.clone(),
+                out_path,
+                duration_s,
+                Some(VmafRefTrim {
+                    start_frame,
+                    frame_count,
+                    fps,
+                }),
+            ),
+        ));
+    }
+    // Stable log order: deliver stem, then chunk index (c000, c001, …).
+    chunk_pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    pairs.extend(chunk_pairs.into_iter().map(|(_, _, p)| p));
+
     if pairs.is_empty() {
         // Allowlist filter with nothing left is a soft empty batch (caller logs).
         if only_outputs.is_some() {
             return Ok(pairs);
         }
-        return Err(if only_basename.is_some() {
-            "no matching input/output pair for VMAF".into()
-        } else {
-            "no input/output pairs to score".into()
-        });
+        if let Some(only) = only_basename {
+            if !is_chunk_filename(only) {
+                if let Some(meta) = metas.first() {
+                    let expected: Vec<String> = slots
+                        .iter()
+                        .map(|&(batch, slot)| {
+                            slot.expected_name_for(&meta.name, meta.has_alpha, batch)
+                        })
+                        .collect();
+                    return Err(format!(
+                        "no output for {} (expected {})",
+                        meta.name,
+                        expected.join(" / ")
+                    ));
+                }
+            }
+            return Err("no matching input/output pair for VMAF".into());
+        }
+        return Err("no input/output pairs to score".into());
     }
     Ok(pairs)
 }
@@ -431,7 +666,8 @@ pub fn run_vmaf(
     let mut report = VmafReport::default();
     let mut ok = 0usize;
     let mut failed = 0usize;
-    for (i, (in_name, out_name, in_path, out_path, duration_s)) in pairs.iter().enumerate() {
+    for (i, (in_name, out_name, in_path, out_path, duration_s, ref_trim)) in pairs.iter().enumerate()
+    {
         if cancel.load(Ordering::Relaxed) {
             on_event(VmafEvent::Log("VMAF cancelled".into()));
             break;
@@ -454,7 +690,7 @@ pub fn run_vmaf(
             if let Some(line) = log {
                 on_event(VmafEvent::Log(line));
             }
-        }) {
+        }, ref_trim.as_ref()) {
             Ok(score) => {
                 ok += 1;
                 on_event(VmafEvent::Log(format!("VMAF {in_name}: {score:.4}")));

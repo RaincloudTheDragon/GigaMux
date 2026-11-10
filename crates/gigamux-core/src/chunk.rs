@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use regex::Regex;
+
 /// Rough input `-ss` pad (seconds) before the exact frame cut — speeds demux; trim still exact.
 pub const CHUNK_SEEK_PAD_S: f64 = 1.0;
 
@@ -9,6 +11,24 @@ pub const CHUNK_SEEK_PAD_S: f64 = 1.0;
 pub fn chunk_output_name(stem: &str, index: u32, count: u32, ext: &str) -> String {
     let ext = ext.trim_start_matches('.');
     format!("{stem}.c{index:03}of{count:03}.{ext}")
+}
+
+/// Inverse of [`chunk_output_name`]: `(deliver_stem, index, count, ext)`.
+/// Stem is the final deliver basename without `.cNNNofMMM` — not `Path::file_stem()`, which keeps the chunk tag.
+pub fn parse_chunk_filename(name: &str) -> Option<(String, u32, u32, String)> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)^(.+)\.c(\d{3})of(\d{3})\.(mp4|webm|mkv)$").expect("chunk name regex")
+    });
+    let caps = re.captures(name)?;
+    let stem = caps.get(1)?.as_str().to_string();
+    let index: u32 = caps.get(2)?.as_str().parse().ok()?;
+    let count: u32 = caps.get(3)?.as_str().parse().ok()?;
+    let ext = caps.get(4)?.as_str().to_string();
+    if stem.is_empty() || count == 0 || index >= count {
+        return None;
+    }
+    Some((stem, index, count, ext))
 }
 
 /// Contiguous frame slices; last chunk absorbs remainder. Returns `(start_frame, frame_count)`.
@@ -150,6 +170,19 @@ mod tests {
             chunk_output_name("sample.ts", 0, 4, "mp4"),
             "sample.ts.c000of004.mp4"
         );
+    }
+
+    #[test]
+    fn parse_chunk_filename_round_trip() {
+        let name = chunk_output_name("sample.ts", 2, 4, "mp4");
+        let (stem, index, count, ext) = parse_chunk_filename(&name).expect("parse");
+        assert_eq!(stem, "sample.ts");
+        assert_eq!(index, 2);
+        assert_eq!(count, 4);
+        assert_eq!(ext, "mp4");
+        assert_eq!(chunk_output_name(&stem, index, count, &ext), name);
+        assert!(parse_chunk_filename("sample.ts.mp4").is_none());
+        assert!(parse_chunk_filename("sample.ts.c004of004.mp4").is_none());
     }
 
     #[test]

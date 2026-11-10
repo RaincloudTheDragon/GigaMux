@@ -97,6 +97,7 @@ Upstream Flamenco currently has a bug where the Windows workers are not killed u
 - Local (non-Flamenco) encode has no chunking.
 - QSV+libvpx alpha hybrid is refused for chunked farm jobs; use software alpha or opaque.
 - No seam-scan on the farm (Python-only locally today).
+- Local VMAF (manual or idle auto) scores leftover `*.cNNNofMMM.*` chunks against the source frame range implied by the filename; Check/`check_chunk_file` must pass first (incomplete mid-farm chunks are skipped / blocked like bad finals).
 - Farm VMAF only after workers with `libvmaf` are tagged and confirmed.
 - SSDP Find does not configure Manager; URL is written to prefs when a Manager answers `/api/v3/version`.
 - Whether or not cancellation works depends on Worker build and (for ≤3.9) GigaMux’s legacy circumvention path.

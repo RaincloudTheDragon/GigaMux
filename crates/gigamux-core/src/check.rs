@@ -4,9 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use regex::Regex;
 use serde_json::Value;
 
+use crate::chunk::{
+    chunk_frame_range, estimate_total_frames, parse_chunk_filename, parse_fps,
+};
 use crate::probe::{file_info, video_has_alpha};
 use crate::targets::{pair_stem, OutputTargets, TestBatch};
 
@@ -48,11 +50,7 @@ impl CheckReport {
 
 /// Farm intermediate like `stem.c000of004.webm` — not a final deliver.
 pub fn is_chunk_filename(name: &str) -> bool {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(?i)^.+\.c\d{3}of\d{3}\.(mp4|webm|mkv)$").expect("chunk name regex")
-    });
-    re.is_match(name)
+    crate::chunk::parse_chunk_filename(name).is_some()
 }
 
 /// Absolute duration slack for farm chunk expects (frame-split rounding).
@@ -328,6 +326,35 @@ fn format_duration(info: &Value) -> Option<f64> {
         v.as_f64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     })
+}
+
+fn probe_video_fps(info: &Value) -> Option<f64> {
+    let v = first_video(info)?;
+    let rate = v
+        .get("r_frame_rate")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("avg_frame_rate").and_then(|x| x.as_str()))?;
+    parse_fps(rate)
+}
+
+fn probe_nb_frames(info: &Value) -> Option<u64> {
+    let v = first_video(info)?;
+    v.get("nb_frames")
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+        .filter(|&n| n > 0)
+}
+
+/// Expected chunk duration from source probe + `{index,count}` (same split as farm encode).
+pub fn chunk_expect_dur_s(info: &Value, index: u32, count: u32) -> Result<f64, String> {
+    let fps = probe_video_fps(info).ok_or_else(|| "cannot probe fps for chunk check".to_string())?;
+    let duration_s = format_duration(info).unwrap_or(0.0);
+    let total = estimate_total_frames(duration_s, fps, probe_nb_frames(info))
+        .ok_or_else(|| "cannot estimate frames for chunk check".to_string())?;
+    let (_, frame_count) = chunk_frame_range(total, index, count)?;
+    Ok(frame_count as f64 / fps)
 }
 
 fn implied_bitrate_bps(info: &Value) -> Option<f64> {
@@ -746,6 +773,57 @@ pub fn run_check(
                 input: None,
                 output: Some(outf.clone()),
                 message: "Missing from input".into(),
+            });
+        }
+    }
+
+    // Farm chunk leftovers: same `check_chunk_file` healthcheck as ensure-chunk (High → blocks auto VMAF).
+    for outf in &output_files {
+        let Some((stem, index, count, _)) = parse_chunk_filename(outf) else {
+            continue;
+        };
+        let mut matched: Option<(String, &Value)> = None;
+        for (inf, info) in &input_meta {
+            let has_alpha = video_has_alpha(info);
+            let mut stems = HashSet::new();
+            for &(batch, slot) in slots {
+                let name = slot.expected_name_for(inf, has_alpha, batch);
+                if let Some(s) = Path::new(&name).file_stem().and_then(|s| s.to_str()) {
+                    stems.insert(s.to_string());
+                }
+            }
+            if let Some(s) = Path::new(inf).file_stem().and_then(|s| s.to_str()) {
+                stems.insert(s.to_string());
+            }
+            if stems.contains(&stem) {
+                matched = Some((inf.clone(), info));
+                break;
+            }
+        }
+        let Some((inf, info)) = matched else {
+            report.issues.push(CheckIssue {
+                input: None,
+                output: Some(outf.clone()),
+                message: "Missing from input".into(),
+            });
+            continue;
+        };
+        let expect = match chunk_expect_dur_s(info, index, count) {
+            Ok(d) => d,
+            Err(e) => {
+                report.issues.push(CheckIssue {
+                    input: Some(inf),
+                    output: Some(outf.clone()),
+                    message: e,
+                });
+                continue;
+            }
+        };
+        if let Err(e) = check_chunk_file(&output_dir.join(outf), expect) {
+            report.issues.push(CheckIssue {
+                input: Some(inf),
+                output: Some(outf.clone()),
+                message: e,
             });
         }
     }

@@ -17,8 +17,8 @@ mod ffmpeg_idle_pause;
 
 use gigamux_core::check::{
     check_issue_category, check_issue_severity, delete_issue_outputs, integrity_blocked_outputs,
-    issue_has_deletable_output, list_media, permanent_delete_file, restore_trashed_file, run_check,
-    trash_file, CheckIssue, CheckReport, CheckSeverity,
+    is_chunk_filename, issue_has_deletable_output, list_media, permanent_delete_file,
+    restore_trashed_file, run_check, trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
 use gigamux_core::chunk::chunk_time_range;
 use gigamux_core::encode::{
@@ -1039,13 +1039,16 @@ impl GigaMuxApp {
 
     /// VMAF only while the paired file is still listed.
     /// Test-mode outputs keep their own score (input is not overwritten per-pass).
+    /// Farm chunk outputs keep an output-side score without mirroring onto the input.
     fn live_vmaf_score(&self, side: FileSide, name: &str) -> Option<f64> {
         let score = self.preview_cache.get(&Self::preview_key(side, name))?.vmaf_score?;
-        let other_name = self.counterpart_name(side, name)?;
-        // Prefixed test outputs: show score whenever the input counterpart still exists.
-        if side == FileSide::Output && strip_test_prefix(name).0.is_some() {
+        // Chunk / test-prefixed outputs: score lives on the output key alone.
+        if side == FileSide::Output
+            && (is_chunk_filename(name) || strip_test_prefix(name).0.is_some())
+        {
             return Some(score);
         }
+        let other_name = self.counterpart_name(side, name)?;
         let other = self
             .preview_cache
             .get(&Self::preview_key(Self::other_side(side), &other_name))?;
@@ -1080,10 +1083,15 @@ impl GigaMuxApp {
                 continue;
             };
             let stale = match self.counterpart_name(side, name) {
-                None => true,
+                None => {
+                    // Chunk outputs may not resolve an input counterpart by stem; keep output score.
+                    !(side == FileSide::Output && is_chunk_filename(name))
+                }
                 Some(other_name) => {
-                    // Test-prefixed outputs keep their own score without mirroring onto input.
-                    if side == FileSide::Output && strip_test_prefix(name).0.is_some() {
+                    // Test-prefixed / chunk outputs keep their own score without mirroring onto input.
+                    if side == FileSide::Output
+                        && (is_chunk_filename(name) || strip_test_prefix(name).0.is_some())
+                    {
                         false
                     } else {
                         let other_key = Self::preview_key(Self::other_side(side), &other_name);
@@ -4627,8 +4635,8 @@ impl GigaMuxApp {
                 e.source_path = Some(self.prefs.output_dir.join(output));
             }
         }
-        // Mirror onto input only for non-test pairs so multi testN_ scores do not clobber each other.
-        if strip_test_prefix(output).0.is_none() {
+        // Mirror onto input only for non-test, non-chunk pairs so multi scores do not clobber each other.
+        if strip_test_prefix(output).0.is_none() && !is_chunk_filename(output) {
             let in_key = Self::preview_key(FileSide::Input, input);
             let e = self
                 .preview_cache
