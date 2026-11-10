@@ -11,8 +11,18 @@ GigaMux submits jobs to a stock Flamenco Manager/Worker. `GigaMux.js` authors `m
 | **Worker check helper** | Absolute path workers use for `gigamux-check` (two-way braced). Deploy sets it to `{ManagerInstall}/tools/gigamux-check`, which **assumes the Manager install itself is on shared storage**. If Manager is local-only, browse/enter a shared path that has both Win + Linux helper binaries. |
 | **Ensure tags** | `POST /api/v3/worker-mgt/tags` for missing `nvenc`, `qsv`, `vmaf`. Does not assign workers to tags; do that in Flamenco's worker UI. |
 | **Flamenco** (main UI) | Builds ffmpeg argv locally and `POST /api/v3/jobs` (`type: GigaMux`). Uses the Input selection when that side is active; with no Input selection, sends **every** listed input (one job each). |
+| **Farm** (Flamenco mark button) | Separate OS window for jobs submitted this GigaMux run: status + colored Manager log tail. Opens after a successful submit; closing the window does not cancel jobs. |
 
 Manual Manager URL still works if SSDP is off or blocked.
+
+## Farm panel (session logs)
+
+Tracks job ids returned from submits in **this GigaMux session** only (restart clears the list). While the panel is open it polls Manager every few seconds:
+
+- `GET /api/v3/jobs/{id}` + `…/tasks` for non-terminal jobs
+- Full task logs via `GET /api/v3/tasks/{id}/log` → `/job-files/…` (not the 2 KiB `logtail`); all started tasks are concatenated so later tasks do not wipe earlier stderr
+
+Freshness still waits on worker log batching (~10 KB or ~30 s). GigaMux cannot make logs faster without a worker change. **Open in Manager** opens the Manager web root (SPA has no stable per-job deep link).
 
 ## How Flamenco resolves ffmpeg
 

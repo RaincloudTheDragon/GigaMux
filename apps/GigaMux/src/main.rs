@@ -28,9 +28,11 @@ use gigamux_core::encode::{
 };
 use gigamux_core::flamenco::{
     cancel_exec_mode_for_manager_version, deploy_gigamux_manager, discover_manager,
-    ensure_worker_tags, flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
-    make_gigamux_chunked_job, make_gigamux_encode_job, normalize_check_exe_path, ping_manager,
-    resolve_flamenco_check_exe, submit_job, CancelExecMode, FlamencoTwoway, REQUIRED_WORKER_TAGS,
+    ensure_worker_tags, fetch_job_status, fetch_job_tasks, fetch_task_log, flamenco_job_terminal,
+    flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
+    make_gigamux_chunked_job, make_gigamux_encode_job, manager_web_url, normalize_check_exe_path,
+    pick_log_task, ping_manager, resolve_flamenco_check_exe, submit_job, CancelExecMode,
+    FlamencoTwoway, REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{libvmaf_available, run_vmaf, VmafEvent, VmafReport};
@@ -160,6 +162,13 @@ fn settings_viewport_id() -> egui::ViewportId {
 fn check_results_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("gigamux_check_results")
 }
+
+fn farm_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("gigamux_farm_panel")
+}
+
+/// Bundled Flamenco mark (Manager web `flamenco.png`).
+const FLAMENCO_LOGO_PNG: &[u8] = include_bytes!("../assets/flamenco.png");
 
 /// Color for a Check severity row / header.
 fn check_severity_color(sev: CheckSeverity) -> egui::Color32 {
@@ -337,6 +346,18 @@ struct GigaMuxApp {
     pending_permanent_delete: Option<PermanentDeletePrompt>,
     /// Flamenco sender options (Submit posts jobs; Cancel dismisses).
     pending_flamenco: Option<FlamencoSubmitPrompt>,
+    /// Session-scoped farm jobs (this GigaMux run only) + optional Farm panel.
+    farm_jobs: Vec<FarmSessionJob>,
+    farm_panel_open: bool,
+    farm_selected_id: Option<String>,
+    farm_log_tail: String,
+    farm_log_task_label: String,
+    farm_poll_rx: Option<Receiver<FarmPollResult>>,
+    farm_poll_inflight: bool,
+    farm_last_poll_at: Option<Instant>,
+    farm_force_poll: bool,
+    /// Cached Flamenco logo texture for the Farm toolbar button.
+    farm_logo_tex: Option<egui::TextureHandle>,
     /// Important error modal (session log still gets the line; panel stays collapsed).
     pending_alert: Option<AlertPrompt>,
     /// Alt held at launch — choose which prefs / logs to purge.
@@ -582,6 +603,51 @@ struct PermanentDeletePrompt {
     trash_error: String,
 }
 
+/// One Flamenco job submitted from this GigaMux session (not persisted).
+#[derive(Clone)]
+struct FarmSessionJob {
+    job_id: String,
+    /// Input basename used at submit time.
+    name: String,
+    out_name: String,
+    /// Last Manager status (empty until first poll).
+    status: String,
+    worker: String,
+    task_name: String,
+    /// Last poll/error string for this row.
+    error: Option<String>,
+    /// Task order for merged log sections (`task_id`, `task_name`).
+    log_task_order: Vec<(String, String)>,
+    /// Per-task accumulated stderr (survives task switches / sliding logtail).
+    task_logs: HashMap<String, String>,
+    /// Per-task last raw Manager logtail (for overlap/delta merge).
+    task_last_tail: HashMap<String, String>,
+}
+
+/// One task logtail snapshot from a farm poll (merged on the UI thread).
+struct FarmPollLogChunk {
+    task_id: String,
+    task_name: String,
+    tail: String,
+}
+
+/// Background farm poll payload (status rows + optional log tails for the selection).
+struct FarmPollResult {
+    rows: Vec<FarmPollRow>,
+    /// All tasks' logtails for the selected job (API order); UI merges/appends.
+    log_chunks: Option<Vec<FarmPollLogChunk>>,
+    log_task_label: Option<String>,
+    selected_id: Option<String>,
+}
+
+struct FarmPollRow {
+    job_id: String,
+    status: String,
+    worker: String,
+    task_name: String,
+    error: Option<String>,
+}
+
 /// Flamenco sender dialog (opened by Flamenco button / context menu before POST).
 #[derive(Clone)]
 struct FlamencoSubmitPrompt {
@@ -710,6 +776,16 @@ impl GigaMuxApp {
             pending_recycle_delete: None,
             pending_permanent_delete: None,
             pending_flamenco: None,
+            farm_jobs: Vec::new(),
+            farm_panel_open: false,
+            farm_selected_id: None,
+            farm_log_tail: String::new(),
+            farm_log_task_label: String::new(),
+            farm_poll_rx: None,
+            farm_poll_inflight: false,
+            farm_last_poll_at: None,
+            farm_force_poll: false,
+            farm_logo_tex: None,
             pending_alert: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
             delete_queue: None,
@@ -2392,6 +2468,7 @@ impl GigaMuxApp {
                             "Flamenco submitted: job {id}; {name} → {out_name} ({} chunks, {}k / {})",
                             chunk_n, job_built.bitrate_k, job_built.bitrate_label
                         ));
+                        self.track_farm_job(id, name.clone(), out_name.clone());
                         ok += 1;
                     }
                     Err(e) => {
@@ -2464,6 +2541,7 @@ impl GigaMuxApp {
                         "Flamenco submitted: job {id}; {name} → {out_name} ({}k / {})",
                         cmd.bitrate_k, cmd.bitrate_label
                     ));
+                    self.track_farm_job(id, name.clone(), out_name.clone());
                     ok += 1;
                 }
                 Err(e) => {
@@ -2499,7 +2577,244 @@ impl GigaMuxApp {
         }
         if ok > 0 {
             let _ = prefs::save(&self.prefs);
+            // Surface the farm panel so status/logtail are one click away after submit.
+            self.farm_panel_open = true;
+            self.farm_force_poll = true;
         }
+    }
+
+    /// Remember a job id from this session for the Farm panel (not persisted).
+    fn track_farm_job(&mut self, job_id: String, name: String, out_name: String) {
+        self.farm_selected_id = Some(job_id.clone());
+        self.farm_jobs.push(FarmSessionJob {
+            job_id,
+            name,
+            out_name,
+            status: "submitted".into(),
+            worker: String::new(),
+            task_name: String::new(),
+            error: None,
+            log_task_order: Vec::new(),
+            task_logs: HashMap::new(),
+            task_last_tail: HashMap::new(),
+        });
+        self.farm_log_tail.clear();
+        self.farm_log_task_label.clear();
+        self.farm_force_poll = true;
+    }
+
+    /// Drop completed/canceled/failed rows from the session list.
+    fn clear_finished_farm_jobs(&mut self) {
+        let sel = self.farm_selected_id.clone();
+        self.farm_jobs
+            .retain(|j| !flamenco_job_terminal(&j.status));
+        if let Some(id) = sel {
+            if !self.farm_jobs.iter().any(|j| j.job_id == id) {
+                self.farm_selected_id = self.farm_jobs.first().map(|j| j.job_id.clone());
+                self.sync_farm_log_from_selection();
+            }
+        }
+        self.farm_force_poll = true;
+    }
+
+    /// Show the selected job's merged task logs in the farm pane.
+    fn sync_farm_log_from_selection(&mut self) {
+        let Some(id) = self.farm_selected_id.clone() else {
+            self.farm_log_tail.clear();
+            self.farm_log_task_label.clear();
+            return;
+        };
+        if let Some(job) = self.farm_jobs.iter().find(|j| j.job_id == id) {
+            self.farm_log_tail = rebuild_farm_merged_log(job);
+            let n = job.log_task_order.len();
+            self.farm_log_task_label = if n == 0 {
+                String::new()
+            } else if n == 1 {
+                job.log_task_order[0].1.clone()
+            } else {
+                format!("{n} tasks merged")
+            };
+        } else {
+            self.farm_log_tail.clear();
+            self.farm_log_task_label.clear();
+        }
+    }
+
+    /// Apply a background poll result onto session rows / log pane.
+    fn apply_farm_poll(&mut self, result: FarmPollResult) {
+        for row in result.rows {
+            if let Some(job) = self.farm_jobs.iter_mut().find(|j| j.job_id == row.job_id) {
+                job.status = row.status;
+                job.worker = row.worker;
+                job.task_name = row.task_name;
+                job.error = row.error;
+            }
+        }
+        // Merge every task logtail into the selected job (append; never replace earlier tasks).
+        if result.selected_id.as_ref() == self.farm_selected_id.as_ref() {
+            if let (Some(sel), Some(chunks)) = (result.selected_id.as_ref(), result.log_chunks) {
+                if let Some(job) = self.farm_jobs.iter_mut().find(|j| j.job_id == *sel) {
+                    for chunk in chunks {
+                        merge_farm_task_logtail(job, &chunk.task_id, &chunk.task_name, &chunk.tail);
+                    }
+                }
+            }
+            if let Some(label) = result.log_task_label {
+                // Prefer merged label when we have multiple sections.
+                let multi = self
+                    .farm_selected_id
+                    .as_ref()
+                    .and_then(|id| self.farm_jobs.iter().find(|j| j.job_id == *id))
+                    .map(|j| j.log_task_order.len() > 1)
+                    .unwrap_or(false);
+                if !multi {
+                    self.farm_log_task_label = label;
+                }
+            }
+            self.sync_farm_log_from_selection();
+        }
+    }
+
+    /// Drain farm poll channel; kick a new poll when the panel is open.
+    fn poll_farm_panel(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.farm_poll_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.apply_farm_poll(result);
+                    self.farm_poll_inflight = false;
+                    self.farm_last_poll_at = Some(Instant::now());
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.farm_poll_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.farm_poll_inflight = false;
+                }
+            }
+        }
+
+        if !self.farm_panel_open {
+            return;
+        }
+        if self.farm_jobs.is_empty() {
+            return;
+        }
+        if self.farm_poll_inflight {
+            ctx.request_repaint_after(Duration::from_millis(200));
+            return;
+        }
+        let due = self.farm_force_poll
+            || self
+                .farm_last_poll_at
+                .map(|t| t.elapsed() >= Duration::from_secs(4))
+                .unwrap_or(true);
+        if !due {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            return;
+        }
+        self.farm_force_poll = false;
+        self.spawn_farm_poll();
+        ctx.request_repaint_after(Duration::from_millis(200));
+    }
+
+    /// HTTP off the UI thread: refresh non-terminal jobs + logtail for the selection.
+    fn spawn_farm_poll(&mut self) {
+        let url = self.prefs.flamenco_manager_url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        let selected = self.farm_selected_id.clone();
+        // Snapshot ids that still need status; always include selection for logtail.
+        let mut ids: Vec<String> = self
+            .farm_jobs
+            .iter()
+            .filter(|j| j.status.is_empty() || !flamenco_job_terminal(&j.status))
+            .map(|j| j.job_id.clone())
+            .collect();
+        if let Some(sel) = &selected {
+            if !ids.iter().any(|id| id == sel) {
+                ids.push(sel.clone());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.farm_poll_rx = Some(rx);
+        self.farm_poll_inflight = true;
+        thread::spawn(move || {
+            let mut rows = Vec::new();
+            let mut log_chunks: Option<Vec<FarmPollLogChunk>> = None;
+            let mut log_task_label = None;
+            for job_id in &ids {
+                let (status, worker, task_name, err, tasks_opt) =
+                    match fetch_job_status(&url, job_id) {
+                        Ok(st) => match fetch_job_tasks(&url, job_id) {
+                            Ok(tasks) => {
+                                let picked = pick_log_task(&tasks);
+                                let worker = picked
+                                    .map(|t| t.worker.clone())
+                                    .unwrap_or_default();
+                                let task_name = picked
+                                    .map(|t| t.name.clone())
+                                    .unwrap_or_default();
+                                (st.status, worker, task_name, None, Some(tasks))
+                            }
+                            Err(e) => (st.status, String::new(), String::new(), Some(e), None),
+                        },
+                        Err(e) => ("?".into(), String::new(), String::new(), Some(e), None),
+                    };
+                rows.push(FarmPollRow {
+                    job_id: job_id.clone(),
+                    status,
+                    worker,
+                    task_name: task_name.clone(),
+                    error: err,
+                });
+                // Selected job: full task logs (not 2KiB logtail) for every started task.
+                if selected.as_ref() == Some(job_id) {
+                    if let Some(tasks) = tasks_opt {
+                        let mut chunks = Vec::new();
+                        for t in &tasks {
+                            if t.id.is_empty() || t.status == "queued" {
+                                continue;
+                            }
+                            match fetch_task_log(&url, &t.id) {
+                                Ok(body) if !body.is_empty() => {
+                                    chunks.push(FarmPollLogChunk {
+                                        task_id: t.id.clone(),
+                                        task_name: t.name.clone(),
+                                        tail: body,
+                                    });
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    chunks.push(FarmPollLogChunk {
+                                        task_id: t.id.clone(),
+                                        task_name: t.name.clone(),
+                                        tail: format!("(log fetch error: {e})"),
+                                    });
+                                }
+                            }
+                        }
+                        log_task_label = pick_log_task(&tasks).map(|t| {
+                            format!("{} ({})", t.name, t.id.get(..8).unwrap_or(&t.id))
+                        });
+                        log_chunks = Some(chunks);
+                    } else {
+                        log_chunks = Some(Vec::new());
+                        log_task_label = Some(String::new());
+                    }
+                }
+            }
+            let _ = tx.send(FarmPollResult {
+                rows,
+                log_chunks,
+                log_task_label,
+                selected_id: selected,
+            });
+        });
     }
 
     /// Encode all inputs, or only `only_name` when set (context-menu selection).
@@ -3698,6 +4013,8 @@ impl GigaMuxApp {
                 self.pending_recycle_delete = None;
             } else if self.pending_flamenco.is_some() {
                 self.pending_flamenco = None;
+            } else if self.farm_panel_open {
+                self.farm_panel_open = false;
             } else if self.delete_queue.is_some() {
                 self.finish_delete_queue();
                 self.push_session("delete cancelled");
@@ -5627,17 +5944,24 @@ impl GigaMuxApp {
             egui::Layout::bottom_up(egui::Align::Center),
             |ui| {
                 ui.add_space(GAP_ABOVE_LOG);
-                // First widgets sit nearest the log (bottom_up draws upward).
-                if self.busy && self.encode_progress.is_none() {
-                    let label = match self.job {
-                        Some(JobKind::Encode) => "Encoding…",
-                        Some(JobKind::Check) => "Checking…",
-                        Some(JobKind::Vmaf) => "VMAF…",
-                        None => "Busy…",
-                    };
-                    ui.label(label);
-                    ui.add_space(6.0);
-                }
+                // Fixed-height status slot so busy/idle doesn't shove the button stack.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(140.0, 18.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_height(18.0);
+                        if self.busy && self.encode_progress.is_none() {
+                            let label = match self.job {
+                                Some(JobKind::Encode) => "Encoding…",
+                                Some(JobKind::Check) => "Checking…",
+                                Some(JobKind::Vmaf) => "VMAF…",
+                                None => "Busy…",
+                            };
+                            ui.label(label);
+                        }
+                    },
+                );
+                ui.add_space(6.0);
                 {
                     let vmaf_ok = self.vmaf_available;
                     let disabled_hint = if !vmaf_ok {
@@ -5668,21 +5992,50 @@ impl GigaMuxApp {
                 }
                 ui.add_space(6.0);
                 {
+                    // Fixed-size row so bottom_up centering doesn't overlap Check / Encode.
+                    // Width matches Encode all (140): Flamenco 108 + gap 4 + logo 28.
+                    const ROW: egui::Vec2 = egui::vec2(140.0, 28.0);
                     let farm_ok = !self.prefs.flamenco_manager_url.trim().is_empty();
-                    let farm = ui
-                        .add_enabled(
-                            farm_ok,
-                            egui::Button::new("Flamenco").min_size(egui::vec2(120.0, 28.0)),
-                        )
-                        .on_hover_text(
-                            "Open Flamenco sender for the Input selection, or every input when none are selected. Settings → Files: Find Manager, Deploy JS, Ensure tags.",
-                        )
-                        .on_disabled_hover_text(
-                            "Set Flamenco Manager URL (or Find) in Settings → Files",
-                        );
-                    if farm.clicked() {
-                        self.open_flamenco_submit(None);
-                    }
+                    let n = self.farm_jobs.len();
+                    let tex = self.ensure_farm_logo(ui.ctx());
+                    ui.allocate_ui_with_layout(
+                        ROW,
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_size(ROW);
+                            ui.set_max_size(ROW);
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let farm = ui
+                                .add_enabled(
+                                    farm_ok,
+                                    egui::Button::new("Flamenco")
+                                        .min_size(egui::vec2(108.0, 28.0)),
+                                )
+                                .on_hover_text(
+                                    "Open Flamenco sender for the Input selection, or every input when none are selected. Settings → Files: Find Manager, Deploy JS, Ensure tags.",
+                                )
+                                .on_disabled_hover_text(
+                                    "Set Flamenco Manager URL (or Find) in Settings → Files",
+                                );
+                            if farm.clicked() {
+                                self.open_flamenco_submit(None);
+                            }
+                            let resp = farm_logo_button(ui, farm_ok, tex.as_ref(), n)
+                                .on_hover_text(
+                                    "Farm panel (this session): status + Manager log tail. Closing it does not cancel jobs.",
+                                )
+                                .on_disabled_hover_text(
+                                    "Set Flamenco Manager URL (or Find) in Settings → Files",
+                                );
+                            if resp.clicked() {
+                                self.farm_panel_open = !self.farm_panel_open;
+                                if self.farm_panel_open {
+                                    self.farm_force_poll = true;
+                                }
+                            }
+                        },
+                    );
                 }
                 ui.add_space(6.0);
                 let encode = ui
@@ -6814,6 +7167,201 @@ impl GigaMuxApp {
             });
     }
 
+    /// Load / cache the Flamenco mark texture once.
+    fn ensure_farm_logo(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.farm_logo_tex.is_none() {
+            if let Ok(img) = image::load_from_memory(FLAMENCO_LOGO_PNG) {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                self.farm_logo_tex = Some(ctx.load_texture(
+                    "flamenco_logo",
+                    color,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        self.farm_logo_tex.clone()
+    }
+
+    /// Separate OS window: session farm jobs + colored Manager log tail.
+    /// Closing this viewport only hides the panel; it does not cancel farm jobs.
+    fn ui_farm_panel(&mut self, ctx: &egui::Context) {
+        if !self.farm_panel_open {
+            return;
+        }
+        let vp_id = farm_viewport_id();
+        let mut close = false;
+        let mut do_refresh = false;
+        let mut do_clear = false;
+        let mut do_open = false;
+        let mut select_id: Option<String> = None;
+
+        ctx.show_viewport_immediate(
+            vp_id,
+            egui::ViewportBuilder::default()
+                .with_title("GigaMux Farm")
+                .with_inner_size([760.0, 460.0])
+                .with_min_inner_size([520.0, 320.0]),
+            |ui, _class| {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
+                {
+                    close = true;
+                }
+
+                egui::Panel::top("farm_toolbar")
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Refresh").on_hover_text("Poll Manager now").clicked()
+                            {
+                                do_refresh = true;
+                            }
+                            if ui
+                                .button("Open in Manager")
+                                .on_hover_text(
+                                    "Open Manager web UI (SPA has no per-job deep link)",
+                                )
+                                .clicked()
+                            {
+                                do_open = true;
+                            }
+                            if ui
+                                .button("Clear finished")
+                                .on_hover_text(
+                                    "Drop completed / canceled / failed from this list",
+                                )
+                                .clicked()
+                            {
+                                do_clear = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Close").on_hover_text("Hide panel (jobs keep running)").clicked()
+                                {
+                                    close = true;
+                                }
+                                if !self.farm_log_task_label.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(&self.farm_log_task_label)
+                                            .weak()
+                                            .small(),
+                                    );
+                                }
+                            });
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Log tail follows Manager; worker batching can lag tens of seconds. Closing does not cancel jobs.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    });
+
+                // SidePanel gives the log column a real available_width (horizontal split was wrapping to a tiny width).
+                egui::Panel::left("farm_job_list_panel")
+                    .exact_size(240.0)
+                    .resizable(true)
+                    .show_separator_line(true)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("farm_job_list")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.farm_jobs.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "No jobs this session — submit via Flamenco.",
+                                        )
+                                        .weak(),
+                                    );
+                                }
+                                for job in &self.farm_jobs {
+                                    let selected =
+                                        self.farm_selected_id.as_ref() == Some(&job.job_id);
+                                    let short = job.job_id.get(..8).unwrap_or(&job.job_id);
+                                    let mut line = format!("{short}  {}", job.name);
+                                    if !job.worker.is_empty() {
+                                        line.push_str(&format!("  [{}]", job.worker));
+                                    }
+                                    let status = if job.status.is_empty() {
+                                        "submitted"
+                                    } else {
+                                        job.status.as_str()
+                                    };
+                                    let resp = farm_job_status_button(ui, &line, status, selected);
+                                    let mut tip = format!("{status} — {}", job.out_name);
+                                    if let Some(err) = &job.error {
+                                        tip.push_str("\n");
+                                        tip.push_str(err);
+                                    }
+                                    resp.clone().on_hover_text(tip);
+                                    if resp.clicked() {
+                                        select_id = Some(job.job_id.clone());
+                                    }
+                                }
+                            });
+                    });
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    // Soft-wrap to the pane width (not mid-chaos); long tokens may still break.
+                    let wrap_w = ui.available_width().max(80.0);
+                    let text = normalize_log_newlines(&self.farm_log_tail);
+                    let mut text_ref: &str = text.as_str();
+                    egui::ScrollArea::vertical()
+                        .id_salt("farm_log_tail")
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if text_ref.is_empty() {
+                                ui.label(egui::RichText::new("(no log yet)").weak());
+                            } else {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut text_ref)
+                                        .id_salt("farm_log_text")
+                                        .desired_width(wrap_w)
+                                        .frame(egui::Frame::NONE)
+                                        .margin(egui::Margin::ZERO)
+                                        .layouter(&mut |ui, buf, _asked| {
+                                            // Ignore TextEdit's asked width — use the pane width we measured.
+                                            layout_log_text(ui, buf.as_str(), wrap_w)
+                                        }),
+                                );
+                            }
+                        });
+                });
+            },
+        );
+
+        if do_refresh {
+            self.farm_force_poll = true;
+        }
+        if do_clear {
+            self.clear_finished_farm_jobs();
+        }
+        if do_open {
+            match manager_web_url(self.prefs.flamenco_manager_url.trim()) {
+                Ok(u) => {
+                    if let Err(e) = open_url_in_os(&u) {
+                        self.push_session(format!("Farm: open Manager failed: {e}"));
+                    }
+                }
+                Err(e) => self.push_session(format!("Farm: {e}")),
+            }
+        }
+        if let Some(id) = select_id {
+            if self.farm_selected_id.as_ref() != Some(&id) {
+                self.farm_selected_id = Some(id);
+                self.sync_farm_log_from_selection();
+                self.farm_force_poll = true;
+            }
+        }
+        if close {
+            self.farm_panel_open = false;
+        }
+    }
+
     /// Flamenco sender scaffold: review files + tag/exe, then Submit posts jobs.
     fn ui_flamenco_submit_prompt(&mut self, ctx: &egui::Context) {
         let Some(mut prompt) = self.pending_flamenco.clone() else {
@@ -7432,6 +7980,168 @@ fn select_tag_chip(
     enabled && inner.inner.clicked()
 }
 
+/// Flamenco status accent (`base.css` `--color-status-*`).
+/// `filled` mirrors the status-filter dots: in-progress statuses are outline-only
+/// (`background-color: transparent` for active/queued/under-construction/cancel-requested/archiving).
+fn flamenco_status_style(status: &str) -> (egui::Color32, bool) {
+    let (accent, filled) = match status {
+        "active" => (hsl_rgb(166.0, 1.0, 0.46), false),
+        "completed" => (hsl_rgb(166.0, 1.0, 0.46), true),
+        "queued" | "requeueing" => (hsl_rgb(194.0, 1.0, 0.46), false),
+        "canceled" | "cancelled" => (hsl_rgb(0.0, 0.0, 0.46), true),
+        "paused" => (hsl_rgb(0.0, 0.0, 0.66), true),
+        "failed" | "construction-failed" => (hsl_rgb(356.0, 1.0, 0.59), true),
+        "soft-failed" => (hsl_rgb(356.0, 0.70, 0.40), true),
+        "cancel-requested" | "under-construction" => (hsl_rgb(194.0, 0.30, 0.50), false),
+        "archived" => (hsl_rgb(0.0, 0.0, 0.25), true),
+        "archiving" => (hsl_rgb(0.0, 0.50, 0.50), false),
+        // submitted / unknown — treat like queued (in flight).
+        _ => (hsl_rgb(194.0, 1.0, 0.46), false),
+    };
+    (accent, filled)
+}
+
+/// HSL (h degrees, s/l 0..=1) → sRGB, same model as Flamenco's CSS `hsl()`.
+fn hsl_rgb(h: f32, s: f32, l: f32) -> egui::Color32 {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - ((hp % 2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    egui::Color32::from_rgb(
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Full-width farm job row: Flamenco status color as fill (done) or outline (in progress).
+fn farm_job_status_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    status: &str,
+    selected: bool,
+) -> egui::Response {
+    let (accent, filled) = flamenco_status_style(status);
+    let width = ui.available_width().max(40.0);
+    let (fill, fg, stroke) = if filled {
+        let lum =
+            (accent.r() as f32 * 0.299 + accent.g() as f32 * 0.587 + accent.b() as f32 * 0.114)
+                / 255.0;
+        let fg = if lum > 0.55 {
+            egui::Color32::from_rgb(20, 24, 28)
+        } else {
+            egui::Color32::from_rgb(245, 245, 245)
+        };
+        let stroke = if selected {
+            egui::Stroke::new(2.0, egui::Color32::WHITE)
+        } else {
+            egui::Stroke::new(1.0, accent.gamma_multiply(0.75))
+        };
+        (accent, fg, stroke)
+    } else {
+        // Outline-only: transparent fill, colored ring + text (Flamenco in-progress dots).
+        let fill = ui.visuals().widgets.inactive.bg_fill;
+        let stroke = if selected {
+            egui::Stroke::new(2.5, accent)
+        } else {
+            egui::Stroke::new(2.0, accent)
+        };
+        (fill, accent, stroke)
+    };
+    let text = egui::RichText::new(label).color(fg).strong();
+    ui.add(
+        egui::Button::new(text)
+            .fill(fill)
+            .stroke(stroke)
+            .min_size(egui::vec2(width, 28.0)),
+    )
+}
+
+/// Square Flamenco mark button; optional job-count badge clipped inside the rect.
+fn farm_logo_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    tex: Option<&egui::TextureHandle>,
+    job_count: usize,
+) -> egui::Response {
+    let size = egui::vec2(28.0, 28.0);
+    let (rect, response) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let visuals = ui.style().interact(&response);
+    let painter = ui.painter();
+    let rounding = 4.0;
+    painter.rect_filled(rect, rounding, visuals.weak_bg_fill);
+    painter.rect_stroke(
+        rect,
+        rounding,
+        egui::Stroke::new(1.0, visuals.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+    let pad = 3.0;
+    let img_rect = rect.shrink(pad);
+    if let Some(tex) = tex {
+        let tint = if enabled {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90)
+        };
+        painter.image(
+            tex.id(),
+            img_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            tint,
+        );
+    } else {
+        // Fallback glyph if PNG failed to decode.
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "F",
+            egui::FontId::proportional(14.0),
+            visuals.text_color(),
+        );
+    }
+    // Tiny inset badge — must stay inside `rect` so it never overlaps Check below.
+    if job_count > 0 {
+        let label = if job_count > 9 {
+            "9+".to_string()
+        } else {
+            job_count.to_string()
+        };
+        let galley = painter.layout_no_wrap(
+            label,
+            egui::FontId::proportional(8.0),
+            egui::Color32::WHITE,
+        );
+        let br = egui::Rect::from_min_size(
+            rect.right_top() + egui::vec2(-galley.size().x - 5.0, 2.0),
+            galley.size() + egui::vec2(4.0, 1.0),
+        )
+        .intersect(rect.shrink(1.0));
+        painter.rect_filled(br, 2.0, egui::Color32::from_rgb(200, 80, 60));
+        painter.galley(
+            br.left_top() + egui::vec2(2.0, 0.5),
+            galley,
+            egui::Color32::WHITE,
+        );
+    }
+    response
+}
+
 /// Standard “two overlapping squares” copy control (stroke only — no emoji glyph).
 fn copy_icon_button(ui: &mut egui::Ui) -> egui::Response {
     let size = egui::vec2(18.0, 18.0);
@@ -7582,6 +8292,63 @@ fn heat_chip_colors(heat: f32, dark: bool) -> (egui::Color32, egui::Color32) {
     }
 }
 
+/// Treat `\r` / `\r\n` as line breaks (ffmpeg progress / mixed Manager chunks).
+fn normalize_log_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Cap a single task's stored log (full Manager file can be large on long encodes).
+const FARM_LOG_TASK_CAP: usize = 512 * 1024;
+
+/// Store/replace a task's full Manager log (sections concatenate in task order).
+fn merge_farm_task_logtail(
+    job: &mut FarmSessionJob,
+    task_id: &str,
+    task_name: &str,
+    body: &str,
+) {
+    if !job.log_task_order.iter().any(|(id, _)| id == task_id) {
+        job.log_task_order
+            .push((task_id.to_string(), task_name.to_string()));
+    }
+    let mut text = normalize_log_newlines(body);
+    if text.len() > FARM_LOG_TASK_CAP {
+        let drain = text.len() - FARM_LOG_TASK_CAP;
+        text.drain(..drain);
+        if let Some(i) = text.find('\n') {
+            text.drain(..=i);
+        }
+        text.insert_str(0, "…\n");
+    }
+    // Full file replaces prior snapshot for this task (grows monotonically on Manager).
+    // Keep a longer local copy if a fetch was truncated/failed mid-flight.
+    let entry = job.task_logs.entry(task_id.to_string()).or_default();
+    if text.len() >= entry.len() || entry.is_empty() {
+        *entry = text;
+    }
+    job.task_last_tail
+        .insert(task_id.to_string(), String::new());
+}
+
+/// Concatenate per-task accumulated logs in task order (section headers between tasks).
+fn rebuild_farm_merged_log(job: &FarmSessionJob) -> String {
+    let mut out = String::new();
+    for (tid, tname) in &job.log_task_order {
+        let Some(log) = job.task_logs.get(tid) else {
+            continue;
+        };
+        if log.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            let short = tid.get(..8).unwrap_or(tid);
+            out.push_str(&format!("\n—— {tname} ({short}) ——\n"));
+        }
+        out.push_str(log);
+    }
+    out
+}
+
 /// Colored monospace galley for the log TextEdit layouter.
 fn layout_log_text(
     ui: &egui::Ui,
@@ -7591,8 +8358,16 @@ fn layout_log_text(
     use egui::text::{LayoutJob, TextFormat};
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let mut job = LayoutJob::default();
-    job.wrap.max_width = wrap_width;
-    for (i, line) in text.split('\n').enumerate() {
+    // Soft-wrap at pane width; break long unspaced tokens rather than overflowing.
+    let width = if wrap_width.is_finite() && wrap_width > 0.0 {
+        wrap_width
+    } else {
+        f32::INFINITY
+    };
+    job.wrap.max_width = width;
+    job.wrap.break_anywhere = width.is_finite();
+    let normalized = normalize_log_newlines(text);
+    for (i, line) in normalized.split('\n').enumerate() {
         if i > 0 {
             job.append(
                 "\n",
@@ -7618,11 +8393,26 @@ fn layout_log_text(
 }
 
 fn log_line_color(line: &str) -> egui::Color32 {
-    let lower = line.to_ascii_lowercase();
-    if lower.starts_with("progress:") {
+    // Local encode prefixes `FFmpeg:` / `Progress:`; Flamenco workers use `pid=N > ` + raw stderr.
+    let trimmed = line.trim_start();
+    let (body, flamenco_worker) = if let Some(rest) = trimmed.strip_prefix("pid=") {
+        let body = rest
+            .find('>')
+            .map(|i| rest[i + 1..].trim_start())
+            .unwrap_or(trimmed);
+        (body, true)
+    } else {
+        (trimmed, false)
+    };
+    let lower = body.to_ascii_lowercase();
+    // Progress first (local `Progress:` or raw `frame=` from Flamenco).
+    if lower.starts_with("progress:")
+        || lower.contains("frame=")
+        || lower.contains("fps=")
+        || lower.contains("bitrate=")
+        || lower.contains("out_time=")
+    {
         egui::Color32::from_rgb(180, 120, 220)
-    } else if lower.starts_with("ffmpeg:") {
-        egui::Color32::from_rgb(90, 200, 120)
     } else if lower.starts_with("warn")
         || lower.contains("skip")
         || lower.contains("cancel")
@@ -7634,9 +8424,15 @@ fn log_line_color(line: &str) -> egui::Color32 {
         || lower.contains("fail")
         || lower.contains("incomplete")
         || lower.contains("missing")
+        || lower.contains("moov atom")
     {
         egui::Color32::from_rgb(230, 90, 90)
-    } else if lower.contains("done")
+    } else if lower.starts_with("ffmpeg:")
+        || lower.starts_with("going to run:")
+        || lower.starts_with("command exited")
+        // Same green as local `FFmpeg:` lines (stream dump, GigaMux_* metadata, etc.).
+        || flamenco_worker
+        || lower.contains("done")
         || lower.contains("check ok")
         || lower.starts_with("finished")
         || lower.contains("deleted")
@@ -7735,6 +8531,39 @@ impl GigaMuxApp {
                 vec![clicked_path.to_path_buf()]
             };
         reveal_paths_in_os(&paths)
+    }
+}
+
+/// Open a URL with the OS default browser (`start` / `open` / `xdg-open`).
+fn open_url_in_os(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map_err(|e| format!("start: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("open: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    {
+        let _ = url;
+        Err("open URL: unsupported platform".into())
     }
 }
 
@@ -8055,6 +8884,8 @@ impl eframe::App for GigaMuxApp {
         self.ui_purge_prefs_prompt(&ctx);
         self.ui_check_prompt(&ctx);
         self.ui_flamenco_submit_prompt(&ctx);
+        self.ui_farm_panel(&ctx);
+        self.poll_farm_panel(&ctx);
         self.ui_recycle_delete_prompt(&ctx);
         self.ui_permanent_delete_prompt(&ctx);
     }

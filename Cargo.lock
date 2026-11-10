@@ -10,6 +10,7 @@ dependencies = [
  "eframe",
  "egui",
  "gigamux-core",
+ "image",
  "raw-window-handle",
  "rfd",
  "windows",

@@ -30,13 +30,14 @@ pub use encode::{
 pub use ffmpeg_active::{active_ffmpeg_pid, kill_process_tree, ActiveFfmpegGuard};
 pub use flamenco::{
     cancel_exec_mode_for_manager_version, check_exe_from_deploy_scripts_dir, deploy_gigamux_js,
-    deploy_gigamux_manager, discover_manager, ensure_worker_tags, fetch_worker_tags,
-    flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
-    make_gigamux_chunked_job, make_gigamux_encode_job, normalize_check_exe_path, ping_manager,
+    deploy_gigamux_manager, discover_manager, ensure_worker_tags, fetch_job_status, fetch_job_tasks,
+    fetch_task_log, fetch_task_logtail, fetch_worker_tags, flamenco_job_terminal, flamenco_script_hint,
+    infer_twoway_local_prefix, local_gigamux_js_present, make_gigamux_chunked_job,
+    make_gigamux_encode_job, manager_web_url, normalize_check_exe_path, pick_log_task, ping_manager,
     resolve_flamenco_check_exe, rewrite_flamenco_twoway_path, scripts_dir_from_manager_install,
     submit_job, CancelExecMode, DeployReport, FarmChunkCheck, FarmCleanup, FarmFinalCheck,
-    FlamencoIntegrity, FlamencoTwoway, SubmittedJob, DEFAULT_CHECK_EXE, GIGAMUX_JS,
-    REQUIRED_WORKER_TAGS,
+    FlamencoIntegrity, FlamencoJobStatus, FlamencoTaskSummary, FlamencoTwoway, SubmittedJob,
+    DEFAULT_CHECK_EXE, GIGAMUX_JS, REQUIRED_WORKER_TAGS,
 };
 pub use job_log::{
     encode_event_line, encode_logs_dir, job_logs_dir, vmaf_event_line, EncodeJobLog, JobLog,

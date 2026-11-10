@@ -19,4 +19,4 @@ GigaMux sets job `cancel_exec` from Manager `/api/v3/version`:
 - **≤ 3.9** → `legacy_stub` (warn; helper not shipped yet — still direct exec)
 - **3.10 beta** / ≥3.10 → `direct` (Assumes worker will kill)
 
-Details and log reading: [docs/flamenco.md](../docs/flamenco.md).
+Details (including the in-app **Farm** session log panel): [docs/flamenco.md](../docs/flamenco.md).

@@ -517,6 +517,205 @@ pub fn ping_manager(manager_url: &str) -> Result<String, String> {
     Ok(ver.to_string())
 }
 
+/// Job status snapshot from `GET /api/v3/jobs/{id}` (minimal fields for the farm panel).
+#[derive(Debug, Clone)]
+pub struct FlamencoJobStatus {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+}
+
+/// One task from `GET /api/v3/jobs/{id}/tasks`.
+#[derive(Debug, Clone)]
+pub struct FlamencoTaskSummary {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub worker: String,
+}
+
+/// True when Manager considers the job finished (no more status polling needed).
+pub fn flamenco_job_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "canceled" | "cancelled" | "failed" | "paused"
+    )
+}
+
+/// `GET /api/v3/jobs/{id}` → id / name / status.
+pub fn fetch_job_status(manager_url: &str, job_id: &str) -> Result<FlamencoJobStatus, String> {
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/jobs/{job_id}");
+    let (status, text) = flamenco_http_text(
+        ureq::get(&url)
+            .timeout(Duration::from_secs(5))
+            .call(),
+    )?;
+    if !(200..300).contains(&status) {
+        let snippet: String = text.chars().take(200).collect();
+        return Err(format!("Flamenco job HTTP {status}: {snippet}"));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("Flamenco job JSON: {e}"))?;
+    Ok(FlamencoJobStatus {
+        id: v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or(job_id)
+            .to_string(),
+        name: v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        status: v
+            .get("status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string(),
+    })
+}
+
+/// `GET /api/v3/jobs/{id}/tasks` → task summaries (worker name when present).
+pub fn fetch_job_tasks(
+    manager_url: &str,
+    job_id: &str,
+) -> Result<Vec<FlamencoTaskSummary>, String> {
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/jobs/{job_id}/tasks");
+    let (status, text) = flamenco_http_text(
+        ureq::get(&url)
+            .timeout(Duration::from_secs(5))
+            .call(),
+    )?;
+    if !(200..300).contains(&status) {
+        let snippet: String = text.chars().take(200).collect();
+        return Err(format!("Flamenco tasks HTTP {status}: {snippet}"));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("Flamenco tasks JSON: {e}"))?;
+    let arr = if let Some(a) = v.as_array() {
+        a.clone()
+    } else if let Some(a) = v.get("tasks").and_then(|x| x.as_array()) {
+        a.clone()
+    } else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for t in arr {
+        let worker = t
+            .get("worker")
+            .and_then(|w| {
+                if let Some(s) = w.as_str() {
+                    Some(s.to_string())
+                } else {
+                    w.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                }
+            })
+            .unwrap_or_default();
+        out.push(FlamencoTaskSummary {
+            id: t
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            name: t
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            status: t
+                .get("status")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            worker,
+        });
+    }
+    Ok(out)
+}
+
+/// Prefer an active task for log tail; else last task whose name contains `encode`; else last task.
+pub fn pick_log_task(tasks: &[FlamencoTaskSummary]) -> Option<&FlamencoTaskSummary> {
+    if let Some(t) = tasks.iter().find(|t| t.status == "active") {
+        return Some(t);
+    }
+    if let Some(t) = tasks
+        .iter()
+        .rev()
+        .find(|t| t.name.to_ascii_lowercase().contains("encode"))
+    {
+        return Some(t);
+    }
+    tasks.last()
+}
+
+/// `GET /api/v3/tasks/{task_id}/logtail` → plain-text tail (~2048 bytes on Manager).
+pub fn fetch_task_logtail(manager_url: &str, task_id: &str) -> Result<String, String> {
+    let base = manager_base(manager_url)?;
+    let url = format!("{base}/api/v3/tasks/{task_id}/logtail");
+    let (status, text) = flamenco_http_text(
+        ureq::get(&url)
+            .timeout(Duration::from_secs(5))
+            .call(),
+    )?;
+    if status == 204 || (200..300).contains(&status) && text.is_empty() {
+        return Ok(String::new());
+    }
+    if !(200..300).contains(&status) {
+        let snippet: String = text.chars().take(200).collect();
+        return Err(format!("Flamenco logtail HTTP {status}: {snippet}"));
+    }
+    Ok(text)
+}
+
+/// Full task log via `GET /api/v3/tasks/{id}/log` → download `url` under `/job-files/…`.
+/// Prefer this over [`fetch_task_logtail`] — logtail is only ~2 KiB and drops earlier stderr.
+pub fn fetch_task_log(manager_url: &str, task_id: &str) -> Result<String, String> {
+    let base = manager_base(manager_url)?;
+    let info_url = format!("{base}/api/v3/tasks/{task_id}/log");
+    let (status, text) = flamenco_http_text(
+        ureq::get(&info_url)
+            .timeout(Duration::from_secs(5))
+            .call(),
+    )?;
+    if status == 204 {
+        return Ok(String::new());
+    }
+    if !(200..300).contains(&status) {
+        let snippet: String = text.chars().take(200).collect();
+        return Err(format!("Flamenco log info HTTP {status}: {snippet}"));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("Flamenco log info JSON: {e}"))?;
+    let rel = v
+        .get("url")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "Flamenco log info missing url".to_string())?;
+    let file_url = if rel.starts_with("http://") || rel.starts_with("https://") {
+        rel.to_string()
+    } else if rel.starts_with('/') {
+        format!("{base}{rel}")
+    } else {
+        format!("{base}/{rel}")
+    };
+    let (status, body) = flamenco_http_text(
+        ureq::get(&file_url)
+            .timeout(Duration::from_secs(30))
+            .call(),
+    )?;
+    if !(200..300).contains(&status) {
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("Flamenco log file HTTP {status}: {snippet}"));
+    }
+    Ok(body)
+}
+
+/// Manager web UI root (SPA has no stable deep-link per job).
+pub fn manager_web_url(manager_url: &str) -> Result<String, String> {
+    let base = manager_base(manager_url)?;
+    Ok(format!("{base}/"))
+}
+
 /// UPnP/SSDP M-SEARCH for Flamenco Manager description URLs (same ST as workers).
 pub fn discover_manager_locations(timeout: Duration) -> Result<Vec<String>, String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("SSDP bind: {e}"))?;
@@ -974,5 +1173,46 @@ mod tests {
             cancel_exec_mode_for_manager_version(""),
             CancelExecMode::LegacyStub
         );
+    }
+
+    #[test]
+    fn job_terminal_and_pick_log_task() {
+        assert!(flamenco_job_terminal("completed"));
+        assert!(flamenco_job_terminal("canceled"));
+        assert!(!flamenco_job_terminal("active"));
+        assert!(!flamenco_job_terminal("queued"));
+
+        let tasks = vec![
+            FlamencoTaskSummary {
+                id: "a".into(),
+                name: "encode".into(),
+                status: "completed".into(),
+                worker: "W1".into(),
+            },
+            FlamencoTaskSummary {
+                id: "b".into(),
+                name: "mux".into(),
+                status: "active".into(),
+                worker: "W2".into(),
+            },
+        ];
+        assert_eq!(pick_log_task(&tasks).unwrap().id, "b");
+
+        let done = vec![
+            FlamencoTaskSummary {
+                id: "c0".into(),
+                name: "encode-c0".into(),
+                status: "completed".into(),
+                worker: "W1".into(),
+            },
+            FlamencoTaskSummary {
+                id: "mux".into(),
+                name: "mux".into(),
+                status: "completed".into(),
+                worker: "W2".into(),
+            },
+        ];
+        // Prefer last encode* when nothing is active.
+        assert_eq!(pick_log_task(&done).unwrap().id, "c0");
     }
 }
