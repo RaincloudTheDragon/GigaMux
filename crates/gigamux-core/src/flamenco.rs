@@ -598,23 +598,70 @@ fn manager_base(url: &str) -> Result<String, String> {
     Ok(base.to_string())
 }
 
-/// Read ureq response text; on HTTP error statuses ureq returns `Error::Status` with the body.
-fn flamenco_http_text(result: Result<ureq::Response, ureq::Error>) -> Result<(u16, String), String> {
-    match result {
-        Ok(resp) => {
-            let status = resp.status();
-            let text = resp
-                .into_string()
-                .map_err(|e| format!("Flamenco response read: {e}"))?;
-            Ok((status, text))
-        }
-        // ureq 2: non-2xx becomes Err(Status) — still extract the Manager message.
-        Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            Ok((code, text))
-        }
-        Err(e) => Err(format!("Flamenco submit: {e}")),
-    }
+/// Read status + body from a ureq 3 response (`http_status_as_error(false)` so 4xx/5xx keep a body).
+fn flamenco_http_text(
+    result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<(u16, String), String> {
+    let mut resp = result.map_err(|e| format!("Flamenco request: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("Flamenco response read: {e}"))?;
+    Ok((status, text))
+}
+
+/// GET with timeout; non-2xx still returns status+body for Manager error messages.
+fn flamenco_get(url: &str, timeout: Duration) -> Result<(u16, String), String> {
+    flamenco_http_text(
+        ureq::get(url)
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
+            .build()
+            .call(),
+    )
+}
+
+/// DELETE with timeout; non-2xx still returns status+body.
+fn flamenco_delete(url: &str, timeout: Duration) -> Result<(u16, String), String> {
+    flamenco_http_text(
+        ureq::delete(url)
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
+            .build()
+            .call(),
+    )
+}
+
+/// POST JSON body; non-2xx still returns status+body.
+fn flamenco_post_json(
+    url: &str,
+    body: &impl Serialize,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    flamenco_http_text(
+        ureq::post(url)
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
+            .build()
+            .send_json(body),
+    )
+}
+
+/// POST raw bytes as `application/json`; non-2xx still returns status+body.
+fn flamenco_post_bytes(url: &str, body: &[u8], timeout: Duration) -> Result<(u16, String), String> {
+    flamenco_http_text(
+        ureq::post(url)
+            .header("Content-Type", "application/json")
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
+            .build()
+            .send(body),
+    )
 }
 
 /// Resolve a worker tag **name or UUID** to the Manager tag UUID (required on submit).
@@ -646,11 +693,7 @@ pub fn submit_job(manager_url: &str, job: &SubmittedJob) -> Result<String, Strin
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/jobs");
     let body = serde_json::to_vec(&job).map_err(|e| format!("serialize job: {e}"))?;
-    let (status, text) = flamenco_http_text(
-        ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .send_bytes(&body),
-    )?;
+    let (status, text) = flamenco_post_bytes(&url, &body, Duration::from_secs(30))?;
     if !(200..300).contains(&status) {
         // Truncate huge bodies but keep compileJob errors readable.
         let snippet: String = text.chars().take(500).collect();
@@ -673,14 +716,7 @@ pub fn submit_job(manager_url: &str, job: &SubmittedJob) -> Result<String, Strin
 pub fn ping_manager(manager_url: &str) -> Result<String, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/version");
-    let resp = ureq::get(&url)
-        .timeout(Duration::from_secs(3))
-        .call()
-        .map_err(|e| format!("Flamenco ping: {e}"))?;
-    let status = resp.status();
-    let text = resp
-        .into_string()
-        .map_err(|e| format!("Flamenco ping read: {e}"))?;
+    let (status, text) = flamenco_get(&url, Duration::from_secs(3))?;
     if !(200..300).contains(&status) {
         return Err(format!("Flamenco ping HTTP {status}: {text}"));
     }
@@ -722,11 +758,7 @@ pub fn flamenco_job_terminal(status: &str) -> bool {
 pub fn fetch_job_status(manager_url: &str, job_id: &str) -> Result<FlamencoJobStatus, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/jobs/{job_id}");
-    let (status, text) = flamenco_http_text(
-        ureq::get(&url)
-            .timeout(Duration::from_secs(5))
-            .call(),
-    )?;
+    let (status, text) = flamenco_get(&url, Duration::from_secs(5))?;
     if !(200..300).contains(&status) {
         let snippet: String = text.chars().take(200).collect();
         return Err(format!("Flamenco job HTTP {status}: {snippet}"));
@@ -758,11 +790,7 @@ pub fn fetch_job_tasks(
 ) -> Result<Vec<FlamencoTaskSummary>, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/jobs/{job_id}/tasks");
-    let (status, text) = flamenco_http_text(
-        ureq::get(&url)
-            .timeout(Duration::from_secs(5))
-            .call(),
-    )?;
+    let (status, text) = flamenco_get(&url, Duration::from_secs(5))?;
     if !(200..300).contains(&status) {
         let snippet: String = text.chars().take(200).collect();
         return Err(format!("Flamenco tasks HTTP {status}: {snippet}"));
@@ -830,11 +858,7 @@ pub fn pick_log_task(tasks: &[FlamencoTaskSummary]) -> Option<&FlamencoTaskSumma
 pub fn fetch_task_logtail(manager_url: &str, task_id: &str) -> Result<String, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/tasks/{task_id}/logtail");
-    let (status, text) = flamenco_http_text(
-        ureq::get(&url)
-            .timeout(Duration::from_secs(5))
-            .call(),
-    )?;
+    let (status, text) = flamenco_get(&url, Duration::from_secs(5))?;
     if status == 204 || (200..300).contains(&status) && text.is_empty() {
         return Ok(String::new());
     }
@@ -850,11 +874,7 @@ pub fn fetch_task_logtail(manager_url: &str, task_id: &str) -> Result<String, St
 pub fn fetch_task_log(manager_url: &str, task_id: &str) -> Result<String, String> {
     let base = manager_base(manager_url)?;
     let info_url = format!("{base}/api/v3/tasks/{task_id}/log");
-    let (status, text) = flamenco_http_text(
-        ureq::get(&info_url)
-            .timeout(Duration::from_secs(5))
-            .call(),
-    )?;
+    let (status, text) = flamenco_get(&info_url, Duration::from_secs(5))?;
     if status == 204 {
         return Ok(String::new());
     }
@@ -874,11 +894,7 @@ pub fn fetch_task_log(manager_url: &str, task_id: &str) -> Result<String, String
     } else {
         format!("{base}/{rel}")
     };
-    let (status, body) = flamenco_http_text(
-        ureq::get(&file_url)
-            .timeout(Duration::from_secs(30))
-            .call(),
-    )?;
+    let (status, body) = flamenco_get(&file_url, Duration::from_secs(30))?;
     if !(200..300).contains(&status) {
         let snippet: String = body.chars().take(200).collect();
         return Err(format!("Flamenco log file HTTP {status}: {snippet}"));
@@ -1143,14 +1159,7 @@ pub fn flamenco_script_hint(err_or_body: &str) -> Option<&'static str> {
 pub fn fetch_worker_tags(manager_url: &str) -> Result<Vec<(String, String)>, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/worker-mgt/tags");
-    let resp = ureq::get(&url)
-        .timeout(Duration::from_secs(5))
-        .call()
-        .map_err(|e| format!("fetch tags: {e}"))?;
-    let status = resp.status();
-    let text = resp
-        .into_string()
-        .map_err(|e| format!("fetch tags read: {e}"))?;
+    let (status, text) = flamenco_get(&url, Duration::from_secs(5))?;
     if !(200..300).contains(&status) {
         return Err(format!("fetch tags HTTP {status}: {text}"));
     }
@@ -1215,14 +1224,7 @@ pub fn probe_pin_tag_name(worker_id: &str) -> String {
 pub fn fetch_workers(manager_url: &str) -> Result<Vec<FlamencoWorkerSummary>, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/worker-mgt/workers");
-    let resp = ureq::get(&url)
-        .timeout(Duration::from_secs(5))
-        .call()
-        .map_err(|e| format!("fetch workers: {e}"))?;
-    let status = resp.status();
-    let text = resp
-        .into_string()
-        .map_err(|e| format!("fetch workers read: {e}"))?;
+    let (status, text) = flamenco_get(&url, Duration::from_secs(5))?;
     if !(200..300).contains(&status) {
         return Err(format!("fetch workers HTTP {status}: {text}"));
     }
@@ -1260,14 +1262,7 @@ pub fn fetch_workers(manager_url: &str) -> Result<Vec<FlamencoWorkerSummary>, St
 pub fn fetch_worker_tag_ids(manager_url: &str, worker_id: &str) -> Result<Vec<String>, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/worker-mgt/workers/{worker_id}");
-    let resp = ureq::get(&url)
-        .timeout(Duration::from_secs(5))
-        .call()
-        .map_err(|e| format!("fetch worker: {e}"))?;
-    let status = resp.status();
-    let text = resp
-        .into_string()
-        .map_err(|e| format!("fetch worker read: {e}"))?;
+    let (status, text) = flamenco_get(&url, Duration::from_secs(5))?;
     if !(200..300).contains(&status) {
         return Err(format!("fetch worker HTTP {status}: {text}"));
     }
@@ -1294,11 +1289,7 @@ pub fn set_worker_tags(
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/worker-mgt/workers/{worker_id}/settags");
     let body = json!({ "tag_ids": tag_ids });
-    let (status, text) = flamenco_http_text(
-        ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .send_json(&body),
-    )?;
+    let (status, text) = flamenco_post_json(&url, &body, Duration::from_secs(10))?;
     if !(200..300).contains(&status) {
         return Err(format!("settags HTTP {status}: {text}"));
     }
@@ -1322,11 +1313,7 @@ pub fn ensure_named_worker_tag(
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/worker-mgt/tags");
     let body = json!({ "name": name, "description": description });
-    let (status, text) = flamenco_http_text(
-        ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .send_json(&body),
-    )?;
+    let (status, text) = flamenco_post_json(&url, &body, Duration::from_secs(10))?;
     if !(200..300).contains(&status) {
         return Err(format!("create tag {name} HTTP {status}: {text}"));
     }
@@ -1353,7 +1340,7 @@ pub fn delete_worker_tag(manager_url: &str, tag_id: &str) -> Result<(), String> 
     }
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/worker-mgt/tag/{id}");
-    let (status, text) = flamenco_http_text(ureq::delete(&url).call())?;
+    let (status, text) = flamenco_delete(&url, Duration::from_secs(10))?;
     if !(200..300).contains(&status) {
         return Err(format!("delete tag HTTP {status}: {text}"));
     }
@@ -1442,14 +1429,7 @@ pub fn ensure_worker_tags(
             continue;
         }
         let body = json!({ "name": name, "description": description });
-        let resp = ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .send_json(&body)
-            .map_err(|e| format!("create tag {name}: {e}"))?;
-        let status = resp.status();
-        let text = resp
-            .into_string()
-            .map_err(|e| format!("create tag {name} read: {e}"))?;
+        let (status, text) = flamenco_post_json(&url, &body, Duration::from_secs(10))?;
         if !(200..300).contains(&status) {
             return Err(format!("create tag {name} HTTP {status}: {text}"));
         }
@@ -1725,14 +1705,7 @@ pub fn fetch_worker_tag_membership(
 ) -> Result<Vec<(String, String)>, String> {
     let base = manager_base(manager_url)?;
     let url = format!("{base}/api/v3/worker-mgt/workers/{worker_id}");
-    let resp = ureq::get(&url)
-        .timeout(Duration::from_secs(5))
-        .call()
-        .map_err(|e| format!("fetch worker: {e}"))?;
-    let status = resp.status();
-    let text = resp
-        .into_string()
-        .map_err(|e| format!("fetch worker read: {e}"))?;
+    let (status, text) = flamenco_get(&url, Duration::from_secs(5))?;
     if !(200..300).contains(&status) {
         return Err(format!("fetch worker HTTP {status}: {text}"));
     }
