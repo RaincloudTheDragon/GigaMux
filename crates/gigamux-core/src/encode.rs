@@ -1210,7 +1210,8 @@ pub fn run_batch(
                 slot.opaque_container.label()
             )
         };
-        let slot_gpu = slot.gpu;
+        // Prefer a local device matching the slot's NVENC gen pin when present.
+        let slot_gpu = opts.hw.resolve_gpu_for_slot(slot.nvenc_gen, slot.gpu);
         let device = if use_hybrid {
             match &opts.hw.qsv {
                 Some(q) => format!("qsv+libvpx hybrid ({})", q.name),
@@ -1423,15 +1424,15 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         None => (auto_k, auto_label),
     };
     let cq = req.slot.cq_override.unwrap_or(0);
-    let gpu = if req.slot.gpu != GpuChoice::Any {
-        req.slot.gpu
-    } else {
-        req.gpu
-    };
+    // Farm workers have their own GPU indexes — never forward the submitter's `-gpu N`.
+    let gpu = GpuChoice::Any;
     let use_nvenc = req.slot.use_hardware && req.slot.opaque_video.is_nvenc() && !has_alpha;
     let use_qsv = req.slot.use_hardware && req.slot.opaque_video.is_qsv() && !has_alpha;
     let hw_meta = if use_nvenc {
-        Some(req.hw.nvenc_meta_hw(gpu))
+        Some(match req.slot.nvenc_gen {
+            Some(g) => crate::gpu::HwCatalog::nvenc_meta_hw_for_gen(g),
+            None => req.hw.nvenc_meta_hw(gpu),
+        })
     } else if use_qsv {
         Some(
             req.hw
@@ -1539,14 +1540,11 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
 
     let mut encode_argvs = Vec::with_capacity(chunks as usize);
     let mut chunk_durations_s = Vec::with_capacity(chunks as usize);
+    // Farm workers have their own GPU indexes — never forward the submitter's `-gpu N`.
+    let gpu = GpuChoice::Any;
     for i in 0..chunks {
         let (start_frame, frame_count) = chunk_frame_range(total_frames, i, chunks)?;
         chunk_durations_s.push(frame_count as f64 / fps);
-        let gpu = if req.slot.gpu != GpuChoice::Any {
-            req.slot.gpu
-        } else {
-            req.gpu
-        };
         let mut argv = build_cmd(
             &req.input,
             &chunk_paths[i as usize],
@@ -1580,11 +1578,6 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
 
     // Encoder tags for stage mux + remux (remux alone would leave only Lavf encoder=).
     let gigamux_meta_tags: Vec<(String, String)> = if req.write_encoder_metadata {
-        let gpu = if req.slot.gpu != GpuChoice::Any {
-            req.slot.gpu
-        } else {
-            req.gpu
-        };
         let use_nvenc = req.slot.use_hardware && req.slot.opaque_video.is_nvenc() && !has_alpha;
         let use_qsv = req.slot.use_hardware && req.slot.opaque_video.is_qsv() && !has_alpha;
         let enc_name = if has_alpha {
@@ -1595,7 +1588,10 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
             req.slot.opaque_video.ffmpeg_encoder(false)
         };
         let hw = if use_nvenc {
-            Some(req.hw.nvenc_meta_hw(gpu))
+            Some(match req.slot.nvenc_gen {
+                Some(g) => crate::gpu::HwCatalog::nvenc_meta_hw_for_gen(g),
+                None => req.hw.nvenc_meta_hw(gpu),
+            })
         } else if use_qsv {
             Some(
                 req.hw

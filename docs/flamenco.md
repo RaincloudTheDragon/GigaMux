@@ -46,7 +46,7 @@ Check for the encoders/filters your jobs need before tagging or submitting.
 
 Flamenco: jobs with a `worker_tag` only run on workers in that tag; tagless jobs are available to all workers; tagless workers only take tagless jobs. Flamenco assigns **one worker tag per job** (not per task) — you cannot put QSV color on one pool and software alpha on another inside a single job graph.
 
-GigaMux **Ensure tags** creates coarse pools always; **gen tags only after farm probe**:
+Probe Farm **Ensure**s coarse pools always; **gen tags only after farm probe**:
 
 | Name | Intended use |
 | --- | --- |
@@ -56,7 +56,18 @@ GigaMux **Ensure tags** creates coarse pools always; **gen tags only after farm 
 | `vmaf` | VMAF-only jobs (Separate / batch) |
 | `cpu` | Software / libvpx alpha chunks and remux tooling |
 
-Workers may hold multiple tags (e.g. `nvenc` + `nvenc-ada`). Probe Farm sets GigaMux-managed membership from host JSON (other tags left alone). Send dialog lists coarse tags plus **only probed** `nvenc-{gen}` values. GigaMux submits the tag **UUID** (names are resolved at POST); Manager rejects unknown UUIDs with HTTP 500 on persist.
+Workers may hold multiple tags (e.g. `nvenc` + `nvenc-ada`). Probe Farm sets GigaMux-managed membership from host JSON (other tags left alone).
+
+**Encode routing** comes from **Output → Targets** (NVENC generation under Use hardware):
+
+| Slot HW path | Job tag |
+| --- | --- |
+| Opaque NVENC, generation **Any** | `nvenc` |
+| Opaque NVENC, pinned gen | `nvenc-{gen}` (e.g. `nvenc-turing`) |
+| Opaque VP9 HW | `qsv` |
+| Alpha / software | `cpu` |
+
+Test mode: one Flamenco job per input × active slot (`test1_*`…), each with that slot’s tag — so VMAF can compare gens across the farm. Normal mode: one job per input from slot1. Farm argv does not forward the submitter’s local `-gpu` index. GigaMux submits the tag **UUID** (names resolved at POST). QSV generation picker is deferred.
 
 ### QSV hybrid (future) = job chain
 
@@ -118,6 +129,7 @@ Upstream Flamenco currently has a bug where the Windows workers are not killed u
 - Local (non-Flamenco) encode has no chunking.
 - QSV+libvpx alpha hybrid is refused on the farm until the color/alpha/remux job chain ships; use software alpha or opaque.
 - Farm probe uses one job per worker via temporary `gm-…` pin tags (not the coarse `nvenc` pool); pins are deleted after each job. Batch end merges JSON and assigns capability tags by hostname↔worker name; re-run Probe Farm after new workers appear.
+- Encode worker tags are derived from Targets NVENC generation (not a global Send combo). Test mode submits one farm job per slot.
 - No seam-scan on the farm (Python-only locally today).
 - Local VMAF (manual or idle auto) scores leftover `*.cNNNofMMM.*` chunks against the source frame range implied by the filename; Check/`check_chunk_file` must pass first (incomplete mid-farm chunks are skipped / blocked like bad finals).
 - Attached farm VMAF requires `libvmaf` on encode-tag workers; Separate/batch use the `vmaf` tag.

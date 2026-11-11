@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::gpu::GpuChoice;
+use crate::gpu::{GpuChoice, NvencGeneration};
 use crate::targets::{
     clamp_alpha_container, clamp_opaque_container, AlphaVideo, OpaqueVideo, OutContainer,
     OutputTargets, TestBatch,
@@ -29,6 +29,9 @@ pub struct EncodeSlot {
     /// Per-slot NVENC device (`Any` or `#index`). Ignored for QSV/CPU paths.
     #[serde(default)]
     pub gpu: GpuChoice,
+    /// Farm/local NVENC generation pin (`None` = any → coarse `nvenc` tag). QSV gens deferred.
+    #[serde(default)]
+    pub nvenc_gen: Option<NvencGeneration>,
     /// When set, replaces the automatic video ceiling (maxrate / bufsize) in kbps.
     #[serde(default)]
     pub maxrate_override_k: Option<u32>,
@@ -50,6 +53,7 @@ impl Default for EncodeSlot {
         Self {
             use_hardware: true,
             gpu: GpuChoice::Any,
+            nvenc_gen: None,
             maxrate_override_k: None,
             cq_override: None,
             opaque_video: OpaqueVideo::Av1,
@@ -150,7 +154,7 @@ pub struct Prefs {
     /// Absolute worker-reachable path to `gigamux-check` (no `.exe`). Empty → derive from Deploy scripts dir.
     #[serde(default)]
     pub flamenco_check_exe: String,
-    /// Optional Flamenco worker tag UUID/name for submitted jobs (empty = tagless).
+    /// Legacy global farm worker tag (unused; tags come from `EncodeSlot.nvenc_gen`). Kept for prefs compat.
     #[serde(default)]
     pub flamenco_worker_tag: String,
     /// Absolute path to ffmpeg on workers, or `ffmpeg` for PATH/tools. Empty → `ffmpeg`.
@@ -240,6 +244,12 @@ impl Prefs {
         ] {
             let (g, w) = slot.gpu.sanitize(devices);
             slot.gpu = g;
+            // Prefer a live device matching the pinned generation when present.
+            if let Some(gen) = slot.nvenc_gen {
+                if let Some(d) = devices.iter().find(|d| d.generation == gen) {
+                    slot.gpu = crate::gpu::GpuChoice::Index(d.index);
+                }
+            }
             if warn.is_none() {
                 warn = w;
             }
@@ -254,6 +264,14 @@ impl Prefs {
         }
         let n = self.test_slot_count.clamp(2, 4) as usize;
         &TestBatch::ALL[..n]
+    }
+
+    /// Encode/farm passes: slot1 only when test mode off; else each active test batch.
+    pub fn encode_batches(&self) -> &'static [TestBatch] {
+        if !self.test_mode {
+            return &TestBatch::ALL[..1];
+        }
+        self.active_batches()
     }
 
     /// Mutable slot by test batch.

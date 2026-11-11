@@ -29,20 +29,20 @@ use gigamux_core::encode::{
 use gigamux_core::flamenco::{
     cancel_exec_mode_for_manager_version, deploy_gigamux_manager, discover_manager,
     assign_workers_from_farm_probe, delete_probe_pin_tags, ensure_worker_tags, farm_probe_out_dir,
-    fetch_job_status, fetch_job_tasks, fetch_task_log, fetch_workers, flamenco_job_terminal,
-    flamenco_script_hint, infer_twoway_local_prefix, local_gigamux_js_present,
-    make_gigamux_chunked_job, make_gigamux_encode_job, make_gigamux_probe_job,
-    make_gigamux_vmaf_job, manager_web_url, merge_farm_probe_dir, normalize_check_exe_path,
-    pick_log_task, pin_worker_for_probe, ping_manager, resolve_flamenco_check_exe,
-    restore_worker_tags_after_probe, submit_job, worker_status_probeable, CancelExecMode,
-    FarmProbeInventory, FarmVmafMode, FarmVmafSpec, FlamencoTwoway, ProbeWorkerPin,
-    REQUIRED_WORKER_TAGS,
+    farm_slot_use_hardware, farm_worker_tag_for_slot, fetch_job_status, fetch_job_tasks,
+    fetch_task_log, fetch_workers, flamenco_job_terminal, flamenco_script_hint,
+    infer_twoway_local_prefix, local_gigamux_js_present, make_gigamux_chunked_job,
+    make_gigamux_encode_job, make_gigamux_probe_job, make_gigamux_vmaf_job, manager_web_url,
+    merge_farm_probe_dir, normalize_check_exe_path, pick_log_task, pin_worker_for_probe,
+    ping_manager, resolve_flamenco_check_exe, restore_worker_tags_after_probe, submit_job,
+    worker_status_probeable, CancelExecMode, FarmProbeInventory, FarmVmafMode, FarmVmafSpec,
+    FlamencoTwoway, ProbeWorkerPin, REQUIRED_WORKER_TAGS,
 };
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{
     libvmaf_available, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path, VmafEvent, VmafReport,
 };
-use gigamux_core::gpu::{probe_local_encoders, GpuChoice, HwCatalog};
+use gigamux_core::gpu::{probe_local_encoders, GpuChoice, HwCatalog, NvencGeneration};
 use gigamux_core::job_log;
 use gigamux_core::prefs::{self, EncodeSlot, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
@@ -698,8 +698,6 @@ struct FarmPollRow {
 struct FlamencoSubmitPrompt {
     /// Input basenames to submit (frozen when the dialog opens).
     names: Vec<String>,
-    /// Draft worker tag (seeded from prefs; written back on Submit).
-    worker_tag: String,
     /// Draft ffmpeg exe on workers (seeded from prefs; written back on Submit).
     ffmpeg_exe: String,
     /// Enable frame chunking (N encode + concat/mux).
@@ -2321,7 +2319,6 @@ impl GigaMuxApp {
             .unwrap_or_default();
         self.pending_flamenco = Some(FlamencoSubmitPrompt {
             names,
-            worker_tag: self.prefs.flamenco_worker_tag.clone(),
             ffmpeg_exe: self.prefs.flamenco_ffmpeg_exe.clone(),
             chunking: self.prefs.flamenco_chunking,
             chunks: self.prefs.flamenco_chunks.clamp(2, 32),
@@ -2330,6 +2327,28 @@ impl GigaMuxApp {
             estimate_duration_s,
             estimate_name,
         });
+    }
+
+    /// Per-slot Flamenco tags that Send will use (opaque vs α when they differ).
+    fn farm_tag_summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for &b in self.prefs.encode_batches() {
+            let mut slot = self.prefs.slot(b).clone();
+            slot.use_hardware = farm_slot_use_hardware(&slot);
+            let tag_opaque = farm_worker_tag_for_slot(&slot, false);
+            let tag_alpha = farm_worker_tag_for_slot(&slot, true);
+            let label = if self.prefs.test_mode {
+                format!("test{}", b.index() + 1)
+            } else {
+                "targets".into()
+            };
+            if tag_opaque == tag_alpha {
+                lines.push(format!("{label} → {tag_opaque}"));
+            } else {
+                lines.push(format!("{label} → opaque {tag_opaque} / α {tag_alpha}"));
+            }
+        }
+        lines
     }
 
 
@@ -2355,8 +2374,10 @@ impl GigaMuxApp {
             );
             return;
         }
-        self.commit_maxrate_override_edit(TestBatch::One);
-        self.commit_cq_override_edit(TestBatch::One);
+        for &b in self.prefs.encode_batches() {
+            self.commit_maxrate_override_edit(b);
+            self.commit_cq_override_edit(b);
+        }
         if names.is_empty() {
             self.alert_error("Flamenco", "no input files to send");
             return;
@@ -2375,19 +2396,28 @@ impl GigaMuxApp {
         }
         // Local HW catalog is only for argv metadata / path checks — still re-probe.
         self.refresh_hw_probe("flamenco");
-        // Effective HW for this machine (same as local encode mute); shared across the batch.
-        let mut slot = self.prefs.slot1.clone();
-        slot.use_hardware = self.effective_use_hardware_for(&slot);
+        // One job per input × encode slot (test mode → testN_ delivers + per-slot tags).
+        let test_mode = self.prefs.test_mode;
+        let slot_passes: Vec<(Option<TestBatch>, EncodeSlot)> = self
+            .prefs
+            .encode_batches()
+            .iter()
+            .map(|&b| {
+                let mut slot = self.prefs.slot(b).clone();
+                // Gen-aware farm mute (not sender-local effective_use_hardware).
+                slot.use_hardware = farm_slot_use_hardware(&slot);
+                let tb = if test_mode { Some(b) } else { None };
+                (tb, slot)
+            })
+            .collect();
+        let mut work: Vec<(String, Option<TestBatch>, EncodeSlot)> = Vec::new();
+        for name in &names {
+            for (tb, slot) in &slot_passes {
+                work.push((name.clone(), *tb, slot.clone()));
+            }
+        }
         let exe_owned = {
             let t = self.prefs.flamenco_ffmpeg_exe.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
-        };
-        let tag_owned = {
-            let t = self.prefs.flamenco_worker_tag.trim();
             if t.is_empty() {
                 None
             } else {
@@ -2430,7 +2460,7 @@ impl GigaMuxApp {
         let use_peak_bitrate = self.prefs.use_peak_bitrate;
         let check_exe = self.prefs.flamenco_check_exe.clone();
         let scripts_dir_owned = self.prefs.flamenco_scripts_dir.clone();
-        let total = names.len();
+        let total = work.len();
 
         self.cancel.store(false, Ordering::Relaxed);
         let cancel = Arc::clone(&self.cancel);
@@ -2439,7 +2469,10 @@ impl GigaMuxApp {
         self.job = Some(JobKind::FarmSubmit);
         self.encode_progress = None;
         self.event_rx = Some(rx);
-        self.push_session(format!("Flamenco submit started ({total} job{})…", if total == 1 { "" } else { "s" }));
+        self.push_session(format!(
+            "Flamenco submit started ({total} job{})…",
+            if total == 1 { "" } else { "s" }
+        ));
 
         thread::spawn(move || {
             // ≤3.9: stub cancel helper (warn). 3.10-beta+: direct ffmpeg exec (Worker kill PR).
@@ -2457,7 +2490,7 @@ impl GigaMuxApp {
             let mut failed = 0usize;
             let mut script_hint: Option<String> = None;
 
-            for (i, name) in names.iter().enumerate() {
+            for (i, (name, test_batch, slot)) in work.into_iter().enumerate() {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(
                         "Flamenco submit: cancelled — remaining jobs skipped".into(),
@@ -2465,13 +2498,17 @@ impl GigaMuxApp {
                     break;
                 }
                 let index = i + 1;
+                let item_label = match test_batch {
+                    Some(b) => format!("test{}:{name}", b.index() + 1),
+                    None => name.clone(),
+                };
                 let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Item {
                     index,
                     total,
-                    name: name.clone(),
+                    name: item_label.clone(),
                 }));
 
-                let input = input_dir.join(name);
+                let input = input_dir.join(&name);
                 if !input.is_file() {
                     let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
                         "Flamenco: input not found: {name}"
@@ -2480,19 +2517,26 @@ impl GigaMuxApp {
                     let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                     continue;
                 }
+                let has_alpha = file_info(&input)
+                    .map(|info| video_has_alpha(&info))
+                    .unwrap_or(false);
+                let tag = farm_worker_tag_for_slot(&slot, has_alpha);
+                let job_name = match test_batch {
+                    Some(b) => format!("GigaMux test{} {name}", b.index() + 1),
+                    None => format!("GigaMux {name}"),
+                };
                 let hw_opaque = farm_path_is_hw_opaque(&input, &slot);
                 let use_chunks = want_chunk && !(only_soft && hw_opaque);
                 let req = FarmEncodeRequest {
                     input: input.clone(),
                     output_dir: output_dir.clone(),
-                    gpu: slot.gpu,
+                    gpu: GpuChoice::Any,
                     hw: hw.clone(),
                     preserve_obs_metadata,
                     write_encoder_metadata,
                     use_peak_bitrate,
                     slot: slot.clone(),
-                    // Farm: one full deliver (not testN_ multi-slot).
-                    test_batch: None,
+                    test_batch,
                     chunks: if use_chunks { chunk_n } else { 1 },
                 };
                 let twoway = if twoway_local.is_empty() {
@@ -2504,7 +2548,7 @@ impl GigaMuxApp {
                     })
                 };
                 let exe = exe_owned.as_deref();
-                let tag = tag_owned.as_deref();
+                let tag_ref = Some(tag.as_str());
 
                 if use_chunks {
                     let job_built = match build_farm_chunked_job(&req) {
@@ -2546,13 +2590,13 @@ impl GigaMuxApp {
                         integrity.vmaf = Some(farm_vmaf_spec(&req.input, &job_built.final_output));
                     }
                     let job = match make_gigamux_chunked_job(
-                        format!("GigaMux {name}"),
+                        job_name.clone(),
                         exe,
                         &job_built.encode_argvs,
                         &job_built.mux_argv,
                         &job_built.mux_remux_argv,
                         job_built.out_expect_dur_s,
-                        tag,
+                        tag_ref,
                         twoway,
                         cancel_exec,
                         Some(integrity),
@@ -2570,12 +2614,12 @@ impl GigaMuxApp {
                     match submit_job(&url, &job) {
                         Ok(id) => {
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                                "Flamenco submitted: job {id}; {name} → {out_name} ({} chunks, {}k / {})",
+                                "Flamenco submitted: job {id}; {item_label} → {out_name} (tag {tag}, {} chunks, {}k / {})",
                                 chunk_n, job_built.bitrate_k, job_built.bitrate_label
                             ))));
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
                                 job_id: id,
-                                name: name.clone(),
+                                name: item_label.clone(),
                                 out_name,
                                 want_separate_vmaf: farm_vmaf == FarmVmafMode::Separate,
                             }));
@@ -2583,7 +2627,7 @@ impl GigaMuxApp {
                         }
                         Err(e) => {
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                                "Flamenco submit failed ({name}): {e}"
+                                "Flamenco submit failed ({item_label}): {e}"
                             ))));
                             failed += 1;
                             if let Some(hint) = flamenco_script_hint(&e) {
@@ -2599,7 +2643,7 @@ impl GigaMuxApp {
 
                 if want_chunk && only_soft && hw_opaque {
                     let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                        "Flamenco: {name} HW opaque — single encode (only-chunk-software)"
+                        "Flamenco: {item_label} HW opaque; single encode (only-chunk-software)"
                     ))));
                 }
                 let cmd = match build_farm_ffmpeg_argv(&req) {
@@ -2633,10 +2677,10 @@ impl GigaMuxApp {
                     integrity.vmaf = Some(farm_vmaf_spec(&req.input, &cmd.output));
                 }
                 let job = match make_gigamux_encode_job(
-                    format!("GigaMux {name}"),
+                    job_name,
                     exe,
                     &cmd.argv,
-                    tag,
+                    tag_ref,
                     twoway,
                     cancel_exec,
                     Some(integrity),
@@ -2654,12 +2698,12 @@ impl GigaMuxApp {
                 match submit_job(&url, &job) {
                     Ok(id) => {
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                            "Flamenco submitted: job {id}; {name} → {out_name} ({}k / {})",
+                            "Flamenco submitted: job {id}; {item_label} → {out_name} (tag {tag}, {}k / {})",
                             cmd.bitrate_k, cmd.bitrate_label
                         ))));
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
                             job_id: id,
-                            name: name.clone(),
+                            name: item_label,
                             out_name,
                             want_separate_vmaf: farm_vmaf == FarmVmafMode::Separate,
                         }));
@@ -2667,7 +2711,7 @@ impl GigaMuxApp {
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                            "Flamenco submit failed ({name}): {e}"
+                            "Flamenco submit failed ({item_label}): {e}"
                         ))));
                         failed += 1;
                         if let Some(hint) = flamenco_script_hint(&e) {
@@ -5477,9 +5521,10 @@ impl GigaMuxApp {
         let _ = prefs::save(&self.prefs);
     }
 
-    /// True when this slot's GPU choice can run `av1_nvenc`.
+    /// True when this slot's GPU choice (honoring nvenc_gen) can run `av1_nvenc`.
     fn av1_nvenc_ok_for_slot(&self, slot: &EncodeSlot) -> bool {
-        self.hw.av1_ok_for(slot.gpu)
+        let gpu = self.hw.resolve_gpu_for_slot(slot.nvenc_gen, slot.gpu);
+        self.hw.av1_ok_for(gpu)
     }
 
     fn batch_edit_idx(batch: TestBatch) -> usize {
@@ -5760,7 +5805,21 @@ impl GigaMuxApp {
         }
     }
 
-    /// Device/gen under Use hardware (same place on QSV-only machines as on NVENC).
+    /// Generations offered in Targets: local probe ∪ farm inventory.
+    fn nvenc_gen_choices(&self) -> Vec<NvencGeneration> {
+        let mut gens = self.hw.local_nvenc_gens();
+        for slug in &self.prefs.flamenco_farm_probe.nvenc_gens {
+            if let Some(g) = NvencGeneration::from_farm_tag_slug(slug) {
+                if !gens.contains(&g) {
+                    gens.push(g);
+                }
+            }
+        }
+        gens.sort_by_key(|g| g.farm_tag_slug().unwrap_or(""));
+        gens
+    }
+
+    /// NVENC generation (farm pin + local device preference) under Use hardware.
     fn ui_slot_gpu_picker(&mut self, ui: &mut egui::Ui, batch: TestBatch) {
         let slot = self.prefs.slot(batch).clone();
         if !slot.use_hardware {
@@ -5773,8 +5832,8 @@ impl GigaMuxApp {
                 }
             }
             OpaqueVideo::Hevc | OpaqueVideo::H264 | OpaqueVideo::Av1 => {
-                if self.hw.nvenc.is_empty() {
-                    // QSV-only machine: still show the probe line under Use hardware.
+                let gens = self.nvenc_gen_choices();
+                if gens.is_empty() && self.hw.nvenc.is_empty() {
                     if let Some(q) = &self.hw.qsv {
                         ui.label(
                             egui::RichText::new(format!("{} — Opaque VP9 uses this", q.label))
@@ -5784,50 +5843,63 @@ impl GigaMuxApp {
                     }
                     return;
                 }
-                if self.hw.nvenc.len() == 1 {
-                    ui.label(
-                        egui::RichText::new(self.hw.nvenc[0].ui_label())
-                            .weak()
-                            .small(),
-                    );
-                    return;
-                }
-                // Multi-GPU: combo so each test target can pick a different gen/device.
-                let mut selected = match slot.gpu {
-                    GpuChoice::Any => None,
-                    GpuChoice::Index(i) => Some(i),
+                let id = format!("slot_nvenc_gen_{}", batch.index());
+                let preview = match slot.nvenc_gen {
+                    None => {
+                        if let Some(d) = self.hw.nvenc.first() {
+                            format!("Any ({})", d.generation.label())
+                        } else {
+                            "Any generation".into()
+                        }
+                    }
+                    Some(g) => {
+                        if let Some(d) = self.hw.first_nvenc_of_gen(g) {
+                            d.ui_label()
+                        } else {
+                            format!("{} (farm)", g.label())
+                        }
+                    }
                 };
-                let id = format!("slot_gpu_{}", batch.index());
-                let preview = match slot.gpu {
-                    GpuChoice::Any => self
-                        .hw
-                        .nvenc
-                        .first()
-                        .map(|d| format!("Any ({})", d.ui_label()))
-                        .unwrap_or_else(|| "Any".into()),
-                    GpuChoice::Index(i) => self
-                        .hw
-                        .nvenc
-                        .iter()
-                        .find(|d| d.index == i)
-                        .map(|d| d.ui_label())
-                        .unwrap_or_else(|| format!("#{i}")),
-                };
+                let mut selected = slot.nvenc_gen;
                 egui::ComboBox::from_id_salt(id)
                     .selected_text(preview)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut selected, None, "Any");
-                        for d in &self.hw.nvenc {
-                            ui.selectable_value(&mut selected, Some(d.index), d.ui_label());
+                        ui.selectable_value(&mut selected, None, "Any generation");
+                        for g in &gens {
+                            let label = if self.hw.first_nvenc_of_gen(*g).is_some() {
+                                g.label().to_string()
+                            } else {
+                                format!("{} (farm)", g.label())
+                            };
+                            ui.selectable_value(&mut selected, Some(*g), label);
                         }
-                    });
-                let next = match selected {
-                    None => GpuChoice::Any,
-                    Some(i) => GpuChoice::Index(i),
-                };
-                if next != self.prefs.slot(batch).gpu {
-                    self.prefs.slot_mut(batch).gpu = next;
+                    })
+                    .response
+                    .on_hover_text(
+                        "Pins Flamenco to nvenc / nvenc-{gen}. Local encode prefers a matching GPU when present.",
+                    );
+                if selected != self.prefs.slot(batch).nvenc_gen {
+                    let gpu = match selected {
+                        None => GpuChoice::Any,
+                        Some(g) => self
+                            .hw
+                            .first_nvenc_of_gen(g)
+                            .map(|d| GpuChoice::Index(d.index))
+                            .unwrap_or(GpuChoice::Any),
+                    };
+                    let slot = self.prefs.slot_mut(batch);
+                    slot.nvenc_gen = selected;
+                    slot.gpu = gpu;
                     self.save_targets();
+                } else if gens.is_empty() {
+                    // Single local GPU, no farm gens yet — keep a quiet device label.
+                    if self.hw.nvenc.len() == 1 {
+                        ui.label(
+                            egui::RichText::new(self.hw.nvenc[0].ui_label())
+                                .weak()
+                                .small(),
+                        );
+                    }
                 }
             }
             OpaqueVideo::Vp8 => {}
@@ -7597,40 +7669,13 @@ impl GigaMuxApp {
                 }
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Worker tag");
-            let allowed = self.prefs.flamenco_farm_probe.allowed_submit_tags();
-            let cur = self.prefs.flamenco_worker_tag.trim().to_string();
-            let cur_label = if cur.is_empty() {
-                "(tagless)".to_string()
-            } else {
-                cur.clone()
-            };
-            egui::ComboBox::from_id_salt("settings_flamenco_worker_tag")
-                .selected_text(cur_label)
-                .width(180.0)
-                .show_ui(ui, |ui| {
-                    for tag in &allowed {
-                        let label = if tag.is_empty() {
-                            "(tagless)"
-                        } else {
-                            tag.as_str()
-                        };
-                        if ui
-                            .selectable_label(self.prefs.flamenco_worker_tag.trim() == tag, label)
-                            .clicked()
-                        {
-                            self.prefs.flamenco_worker_tag = tag.clone();
-                            let _ = prefs::save(&self.prefs);
-                        }
-                    }
-                });
-            ui.label(
-                egui::RichText::new("nvenc-{gen} only after Probe Farm")
-                    .small()
-                    .weak(),
-            );
-        });
+        ui.label(
+            egui::RichText::new(
+                "Worker tags come from Output → Targets (NVENC generation under Use hardware).",
+            )
+            .small()
+            .weak(),
+        );
         ui.horizontal(|ui| {
             ui.label("Worker ffmpeg");
             if ui
@@ -8105,9 +8150,12 @@ impl GigaMuxApp {
                 ui.label(egui::RichText::new(&manager).weak().small());
                 ui.add_space(8.0);
 
+                let slots_n = self.prefs.encode_batches().len().max(1);
+                let job_n = n * slots_n;
                 ui.label(egui::RichText::new(format!(
-                    "Jobs ({n} file{})",
-                    if n == 1 { "" } else { "s" }
+                    "Jobs ({job_n} = {n} file{} × {slots_n} slot{})",
+                    if n == 1 { "" } else { "s" },
+                    if slots_n == 1 { "" } else { "s" }
                 )).strong());
                 for name in prompt.names.iter().take(8) {
                     ui.label(egui::RichText::new(name).strong());
@@ -8117,40 +8165,16 @@ impl GigaMuxApp {
                 }
                 ui.add_space(8.0);
 
-                ui.horizontal(|ui| {
-                    ui.label("Worker tag");
-                    let allowed = self.prefs.flamenco_farm_probe.allowed_submit_tags();
-                    // Drop stale gen pins that are no longer in inventory.
-                    if !allowed.iter().any(|t| t == &prompt.worker_tag) {
-                        prompt.worker_tag = if allowed.iter().any(|t| t == "nvenc") {
-                            "nvenc".into()
-                        } else {
-                            String::new()
-                        };
-                    }
-                    let cur_label = if prompt.worker_tag.is_empty() {
-                        "(tagless)".to_string()
-                    } else {
-                        prompt.worker_tag.clone()
-                    };
-                    egui::ComboBox::from_id_salt("flamenco_send_worker_tag")
-                        .selected_text(cur_label)
-                        .width(200.0)
-                        .show_ui(ui, |ui| {
-                            for tag in &allowed {
-                                let label = if tag.is_empty() {
-                                    "(tagless)"
-                                } else {
-                                    tag.as_str()
-                                };
-                                ui.selectable_value(&mut prompt.worker_tag, tag.clone(), label);
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "Coarse pools always listed; nvenc-{gen} only after Probe Farm sees that generation.",
-                        );
-                });
+                ui.label(egui::RichText::new("Worker tags (from Targets)").strong());
+                for line in self.farm_tag_summary_lines() {
+                    ui.label(egui::RichText::new(line).small());
+                }
+                ui.label(
+                    egui::RichText::new("Change NVENC generation under Output → Targets (Use hardware).")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(6.0);
                 ui.label("ffmpeg on worker (optional)");
                 ui.add(
                     egui::TextEdit::singleline(&mut prompt.ffmpeg_exe)
@@ -8226,7 +8250,6 @@ impl GigaMuxApp {
                 );
 
                 if let Some(p) = self.pending_flamenco.as_mut() {
-                    p.worker_tag = prompt.worker_tag.clone();
                     p.ffmpeg_exe = prompt.ffmpeg_exe.clone();
                     p.chunking = prompt.chunking;
                     p.chunks = prompt.chunks.clamp(2, 32);
@@ -8239,16 +8262,15 @@ impl GigaMuxApp {
                     if ui.button("Cancel").clicked() {
                         self.pending_flamenco = None;
                     }
-                    let submit_label = if n == 1 {
+                    let submit_label = if job_n == 1 {
                         "Submit 1 job".into()
                     } else {
-                        format!("Submit {n} jobs")
+                        format!("Submit {job_n} jobs")
                     };
                     if ui
                         .add(egui::Button::new(submit_label).min_size(egui::vec2(120.0, 28.0)))
                         .clicked()
                     {
-                        self.prefs.flamenco_worker_tag = prompt.worker_tag.trim().to_string();
                         self.prefs.flamenco_ffmpeg_exe = prompt.ffmpeg_exe.trim().to_string();
                         self.prefs.flamenco_chunking = prompt.chunking;
                         self.prefs.flamenco_chunks = prompt.chunks.clamp(2, 32);

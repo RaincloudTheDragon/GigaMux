@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::prefs::EncodeSlot;
 use crate::targets::{AlphaVideo, OutContainer, OpaqueVideo, OutputTargets};
 
 /// Bundled job compiler (deploy into Manager `scripts/`).
@@ -33,6 +34,46 @@ pub fn nvenc_gen_tag_description(slug: &str) -> String {
     match NvencGeneration::from_farm_tag_slug(slug) {
         Some(g) => format!("{} — pin opaque NVENC jobs to this generation", g.label()),
         None => format!("NVENC generation pool ({slug})"),
+    }
+}
+
+/// Flamenco worker tag name derived from a slot (not the legacy global prefs tag).
+///
+/// Alpha / software → `cpu`; HW opaque NVENC → `nvenc` or `nvenc-{gen}`; HW opaque VP9 → `qsv`.
+pub fn farm_worker_tag_for_slot(slot: &EncodeSlot, has_alpha: bool) -> String {
+    if has_alpha || !slot.use_hardware {
+        return "cpu".into();
+    }
+    if slot.opaque_video.is_nvenc() {
+        return match slot.nvenc_gen {
+            Some(g) => g
+                .farm_tag_slug()
+                .unwrap_or("nvenc")
+                .to_string(),
+            None => "nvenc".into(),
+        };
+    }
+    if slot.opaque_video.is_qsv() {
+        return "qsv".into();
+    }
+    "cpu".into()
+}
+
+/// Whether farm encode argv should use HW for this slot (gen-aware; ignores sender-local probe).
+pub fn farm_slot_use_hardware(slot: &EncodeSlot) -> bool {
+    if !slot.use_hardware {
+        return false;
+    }
+    match slot.opaque_video {
+        OpaqueVideo::Vp8 => false,
+        OpaqueVideo::Av1 => match slot.nvenc_gen {
+            // Pinned gen without AV1 NVENC → CPU on farm.
+            Some(g) => g.supports_av1_nvenc(),
+            // Coarse `nvenc` pool may include Ada+; keep HW.
+            None => true,
+        },
+        OpaqueVideo::Vp9 => true,
+        OpaqueVideo::Hevc | OpaqueVideo::H264 => true,
     }
 }
 
@@ -2021,6 +2062,29 @@ mod tests {
             has_cpu: true,
         });
         assert_eq!(tags, vec!["cpu", "nvenc", "nvenc-turing"]);
+    }
+
+    #[test]
+    fn farm_tag_from_slot() {
+        use crate::gpu::NvencGeneration;
+        use crate::prefs::EncodeSlot;
+        use crate::targets::OpaqueVideo;
+
+        let mut slot = EncodeSlot::default();
+        slot.opaque_video = OpaqueVideo::Hevc;
+        slot.use_hardware = true;
+        slot.nvenc_gen = None;
+        assert_eq!(farm_worker_tag_for_slot(&slot, false), "nvenc");
+        slot.nvenc_gen = Some(NvencGeneration::Turing);
+        assert_eq!(farm_worker_tag_for_slot(&slot, false), "nvenc-turing");
+        assert_eq!(farm_worker_tag_for_slot(&slot, true), "cpu");
+        slot.opaque_video = OpaqueVideo::Av1;
+        assert!(!farm_slot_use_hardware(&slot)); // Turing has no AV1 NVENC
+        slot.nvenc_gen = Some(NvencGeneration::Ada);
+        assert!(farm_slot_use_hardware(&slot));
+        slot.opaque_video = OpaqueVideo::Vp9;
+        slot.nvenc_gen = None;
+        assert_eq!(farm_worker_tag_for_slot(&slot, false), "qsv");
     }
 
     #[test]

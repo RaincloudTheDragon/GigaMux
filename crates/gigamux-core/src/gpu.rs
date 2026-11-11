@@ -49,7 +49,8 @@ impl GpuChoice {
 }
 
 /// NVENC hardware generation (Wikipedia NVENC#Versions numbering).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NvencGeneration {
     /// Unmapped SM / name — still usable for encode when listed.
     Unknown,
@@ -138,6 +139,11 @@ impl NvencGeneration {
             "blackwell" => Some(Self::Blackwell),
             _ => None,
         }
+    }
+
+    /// Consumer NVENC AV1 encode (Ada+). Used for farm HW mute when gen is pinned without a local smoke.
+    pub fn supports_av1_nvenc(self) -> bool {
+        matches!(self, Self::Ada | Self::Blackwell)
     }
 }
 
@@ -374,6 +380,36 @@ impl HwCatalog {
         }
     }
 
+    /// First local device matching `gen`, if any.
+    pub fn first_nvenc_of_gen(&self, gen: NvencGeneration) -> Option<&NvencDevice> {
+        self.nvenc.iter().find(|d| d.generation == gen)
+    }
+
+    /// Prefer a local device of `nvenc_gen` when set; otherwise keep `gpu`.
+    pub fn resolve_gpu_for_slot(
+        &self,
+        nvenc_gen: Option<NvencGeneration>,
+        gpu: GpuChoice,
+    ) -> GpuChoice {
+        if let Some(gen) = nvenc_gen {
+            if let Some(d) = self.first_nvenc_of_gen(gen) {
+                return GpuChoice::Index(d.index);
+            }
+        }
+        gpu
+    }
+
+    /// Unique NVENC generations present on this machine (stable order by device index).
+    pub fn local_nvenc_gens(&self) -> Vec<NvencGeneration> {
+        let mut out = Vec::new();
+        for d in &self.nvenc {
+            if d.generation != NvencGeneration::Unknown && !out.contains(&d.generation) {
+                out.push(d.generation);
+            }
+        }
+        out
+    }
+
     /// True when `choice` can open `av1_nvenc`.
     pub fn av1_ok_for(&self, choice: GpuChoice) -> bool {
         match choice {
@@ -388,6 +424,11 @@ impl HwCatalog {
             Some(d) => d.meta_hw_tag(),
             None => "NVENC_Any".into(),
         }
+    }
+
+    /// Farm metadata when a generation is pinned (no local device required).
+    pub fn nvenc_meta_hw_for_gen(gen: NvencGeneration) -> String {
+        format!("{}_Farm", gen.meta_token())
     }
 }
 
