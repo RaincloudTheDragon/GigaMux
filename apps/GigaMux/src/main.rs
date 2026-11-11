@@ -3865,10 +3865,11 @@ impl GigaMuxApp {
             }
         }
         // Two-phase so A→B and B→C can't clobber mid-batch.
+        // No leading-dot temps: Samba treats `.*` as hidden and often stamps DOS Hidden onto the final name.
         let mut temps: Vec<(String, PathBuf, String)> = Vec::new();
         for (i, (old_name, new_name)) in pairs.iter().enumerate() {
             let from = dir.join(old_name);
-            let temp = dir.join(format!(".gigamux_renaming_{i}_{}", std::process::id()));
+            let temp = dir.join(format!("gigamux_renaming_{i}_{}.tmp", std::process::id()));
             std::fs::rename(&from, &temp).map_err(|e| format!("{old_name}: {e}"))?;
             temps.push((old_name.clone(), temp, new_name.clone()));
         }
@@ -3876,6 +3877,7 @@ impl GigaMuxApp {
         for (old_name, temp, new_name) in temps {
             let to = dir.join(&new_name);
             std::fs::rename(&temp, &to).map_err(|e| format!("{old_name} → {new_name}: {e}"))?;
+            clear_windows_hidden_attr(&to);
             self.remap_after_rename(side, &old_name, &new_name, &to);
             done.push((old_name, new_name));
         }
@@ -9277,6 +9279,35 @@ fn trim_log(lines: &mut Vec<String>) {
         lines.drain(0..drain);
     }
 }
+
+/// Clear FILE_ATTRIBUTE_HIDDEN after a rename (SMB/dot temps can leave the DOS Hidden bit set).
+#[cfg(windows)]
+fn clear_windows_hidden_attr(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES,
+        INVALID_FILE_ATTRIBUTES,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let attrs = GetFileAttributesW(PCWSTR(wide.as_ptr()));
+        if attrs == INVALID_FILE_ATTRIBUTES {
+            return;
+        }
+        if attrs & FILE_ATTRIBUTE_HIDDEN.0 != 0 {
+            let cleared = FILE_FLAGS_AND_ATTRIBUTES(attrs & !FILE_ATTRIBUTE_HIDDEN.0);
+            let _ = SetFileAttributesW(PCWSTR(wide.as_ptr()), cleared);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn clear_windows_hidden_attr(_path: &Path) {}
 
 /// Short system sound when a batch job finishes (encode / VMAF / check).
 fn play_job_done_chime() {
