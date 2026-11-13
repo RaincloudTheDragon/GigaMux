@@ -20,27 +20,28 @@ const SSDP_ST: &str = "urn:flamenco:manager:0";
 const SSDP_UUID: &str = "aa80bc5f-d0af-46b8-8630-23bd7e80ec4d";
 const SSDP_ADDR: &str = "239.255.255.250:1900";
 
-/// Coarse Flamenco pools (always Ensure'd). Gen tags (`nvenc-ada`, …) are created only after farm probe.
-pub const REQUIRED_WORKER_TAGS: &[(&str, &str)] = &[
+/// Capability task types for worker `flamenco-worker.yaml` (not Manager tags).
+pub const CAPABILITY_TASK_TYPES: &[(&str, &str)] = &[
+    ("misc", "Probe Farm pin jobs (always include until Manager can push task_types)"),
     ("nvenc", "NVENC-capable ffmpeg (opaque hardware encode; any generation)"),
     ("qsv", "QSV-capable ffmpeg (VP9 QSV opaque / hybrid color)"),
     ("vmaf", "ffmpeg build with libvmaf"),
-    ("cpu", "Software / libvpx alpha chunks and remux tooling"),
+    ("cpu", "Software / libvpx alpha chunks, mux/remux, final-check"),
 ];
 
-/// Description for a probe-gated `nvenc-{gen}` tag.
+/// Description for a probe-gated `nvenc-{gen}` task type.
 pub fn nvenc_gen_tag_description(slug: &str) -> String {
     use crate::gpu::NvencGeneration;
     match NvencGeneration::from_farm_tag_slug(slug) {
-        Some(g) => format!("{} — pin opaque NVENC jobs to this generation", g.label()),
+        Some(g) => format!("{} — pin opaque NVENC encodes to this generation", g.label()),
         None => format!("NVENC generation pool ({slug})"),
     }
 }
 
-/// Flamenco worker tag name derived from a slot (not the legacy global prefs tag).
+/// Flamenco encode task type from a Targets slot (jobs are tagless except Probe Farm pins).
 ///
 /// Alpha / software → `cpu`; HW opaque NVENC → `nvenc` or `nvenc-{gen}`; HW opaque VP9 → `qsv`.
-pub fn farm_worker_tag_for_slot(slot: &EncodeSlot, has_alpha: bool) -> String {
+pub fn farm_task_type_for_slot(slot: &EncodeSlot, has_alpha: bool) -> String {
     if has_alpha || !slot.use_hardware {
         return "cpu".into();
     }
@@ -90,19 +91,18 @@ pub struct SubmittedJob {
     pub worker_tag: Option<String>,
 }
 
-fn flamenco_exe_and_tag(
-    ffmpeg_exe: Option<&str>,
-    worker_tag: Option<&str>,
-) -> (String, Option<String>) {
-    let exe = ffmpeg_exe
+fn flamenco_exe(ffmpeg_exe: Option<&str>) -> String {
+    ffmpeg_exe
         .filter(|s| !s.is_empty())
         .unwrap_or("ffmpeg")
-        .to_string();
-    let tag = worker_tag
+        .to_string()
+}
+
+fn optional_worker_tag(worker_tag: Option<&str>) -> Option<String> {
+    worker_tag
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-    (exe, tag)
+        .map(|s| s.to_string())
 }
 
 /// How `GigaMux.js` should author `exec` for Cancel (Windows orphan workaround).
@@ -414,10 +414,13 @@ fn rewrite_argv_twoway(argv: &[String], tw: Option<FlamencoTwoway<'_>>) -> Vec<S
 }
 
 /// One-file encode job for Flamenco (`GigaMux.js` → worker `exec` ffmpeg).
+///
+/// `encode_task_type` sets encode task Flamenco type; `worker_tag` is only for Probe Farm `gm-…` pins.
 pub fn make_gigamux_encode_job(
     name: impl Into<String>,
     ffmpeg_exe: Option<&str>,
     ffmpeg_argv: &[String],
+    encode_task_type: &str,
     worker_tag: Option<&str>,
     twoway: Option<FlamencoTwoway<'_>>,
     cancel_exec: CancelExecMode,
@@ -427,7 +430,9 @@ pub fn make_gigamux_encode_job(
         return Err("ffmpeg argv is empty".into());
     }
     // argv[0] is the logical program name; worker uses settings.ffmpeg_exe (or "ffmpeg").
-    let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
+    let exe = flamenco_exe(ffmpeg_exe);
+    let enc_type = encode_task_type.trim();
+    let enc_type = if enc_type.is_empty() { "cpu" } else { enc_type };
     let argv = rewrite_argv_twoway(ffmpeg_argv, twoway);
     let argv_json =
         serde_json::to_string(&argv).map_err(|e| format!("serialize ffmpeg argv: {e}"))?;
@@ -450,6 +455,7 @@ pub fn make_gigamux_encode_job(
         "cleanup_json": cleanup_json,
         "vmaf_json": vmaf_json,
         "vmaf_pairs_json": "",
+        "encode_task_type": enc_type,
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -457,7 +463,7 @@ pub fn make_gigamux_encode_job(
         submitter_platform: "windows".into(),
         priority: 50,
         settings,
-        worker_tag: tag,
+        worker_tag: optional_worker_tag(worker_tag),
     })
 }
 
@@ -469,7 +475,7 @@ pub fn make_gigamux_chunked_job(
     mux_argv: &[String],
     mux_remux_argv: &[String],
     out_expect_dur_s: f64,
-    worker_tag: Option<&str>,
+    encode_task_type: &str,
     twoway: Option<FlamencoTwoway<'_>>,
     cancel_exec: CancelExecMode,
     integrity: Option<FlamencoIntegrity>,
@@ -483,7 +489,9 @@ pub fn make_gigamux_chunked_job(
     if out_expect_dur_s <= 0.0 {
         return Err(format!("out_expect_dur_s must be > 0 (got {out_expect_dur_s})"));
     }
-    let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
+    let exe = flamenco_exe(ffmpeg_exe);
+    let enc_type = encode_task_type.trim();
+    let enc_type = if enc_type.is_empty() { "cpu" } else { enc_type };
     let encode_rewritten: Vec<Vec<String>> = encode_argvs
         .iter()
         .map(|a| rewrite_argv_twoway(a, twoway))
@@ -522,6 +530,7 @@ pub fn make_gigamux_chunked_job(
         "cleanup_json": cleanup_json,
         "vmaf_json": vmaf_json,
         "vmaf_pairs_json": "",
+        "encode_task_type": enc_type,
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -529,23 +538,23 @@ pub fn make_gigamux_chunked_job(
         submitter_platform: "windows".into(),
         priority: 50,
         settings,
-        worker_tag: tag,
+        // Encode jobs are tagless; routing is via task_type.
+        worker_tag: None,
     })
 }
 
-/// VMAF-only Flamenco job (`vmaf` tag): one `ensure-vmaf` task per pair.
+/// VMAF-only Flamenco job (task_type `vmaf`, tagless): one `ensure-vmaf` task per pair.
 pub fn make_gigamux_vmaf_job(
     name: impl Into<String>,
     ffmpeg_exe: Option<&str>,
     pairs: &[FarmVmafSpec],
-    worker_tag: Option<&str>,
     twoway: Option<FlamencoTwoway<'_>>,
     check_exe: &str,
 ) -> Result<SubmittedJob, String> {
     if pairs.is_empty() {
         return Err("vmaf pairs is empty".into());
     }
-    let (exe, tag) = flamenco_exe_and_tag(ffmpeg_exe, worker_tag);
+    let exe = flamenco_exe(ffmpeg_exe);
     let mut rewritten = Vec::with_capacity(pairs.len());
     for p in pairs {
         rewritten.push(FarmVmafSpec {
@@ -579,6 +588,7 @@ pub fn make_gigamux_vmaf_job(
         "cleanup_json": "",
         "vmaf_json": "",
         "vmaf_pairs_json": pairs_json,
+        "encode_task_type": "cpu",
     });
     Ok(SubmittedJob {
         name: name.into(),
@@ -586,7 +596,7 @@ pub fn make_gigamux_vmaf_job(
         submitter_platform: "windows".into(),
         priority: 50,
         settings,
-        worker_tag: tag,
+        worker_tag: None,
     })
 }
 
@@ -1396,49 +1406,6 @@ pub fn restore_worker_tags_after_probe(
     delete_worker_tag(manager_url, &pin.tag_id)
 }
 
-/// Create missing coarse tags plus any `nvenc-{gen}` slugs in `inventory`. Returns names created.
-pub fn ensure_worker_tags(
-    manager_url: &str,
-    inventory: Option<&FarmProbeInventory>,
-) -> Result<Vec<String>, String> {
-    let existing = fetch_worker_tags(manager_url)?;
-    let mut have: HashSet<String> = existing.into_iter().map(|(_, n)| n).collect();
-    let base = manager_base(manager_url)?;
-    let url = format!("{base}/api/v3/worker-mgt/tags");
-    let mut created = Vec::new();
-    let mut wanted: Vec<(String, String)> = REQUIRED_WORKER_TAGS
-        .iter()
-        .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
-        .collect();
-    if let Some(inv) = inventory {
-        for slug in &inv.nvenc_gens {
-            if crate::gpu::NvencGeneration::from_farm_tag_slug(slug).is_none() {
-                continue;
-            }
-            let name = if slug.starts_with("nvenc-") {
-                slug.clone()
-            } else {
-                format!("nvenc-{slug}")
-            };
-            let desc = nvenc_gen_tag_description(&name);
-            wanted.push((name, desc));
-        }
-    }
-    for (name, description) in wanted {
-        if have.contains(&name) {
-            continue;
-        }
-        let body = json!({ "name": name, "description": description });
-        let (status, text) = flamenco_post_json(&url, &body, Duration::from_secs(10))?;
-        if !(200..300).contains(&status) {
-            return Err(format!("create tag {name} HTTP {status}: {text}"));
-        }
-        have.insert(name.clone());
-        created.push(name);
-    }
-    Ok(created)
-}
-
 /// Persisted union of farm probe host reports (prefs).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FarmProbeInventory {
@@ -1649,29 +1616,22 @@ pub fn merge_farm_probe_dir(out_dir: &Path) -> Result<FarmProbeInventory, String
     Ok(inv)
 }
 
-/// Coarse pools + `nvenc-{gen}` (+ leftover `gm-` pins) that GigaMux owns for auto-assign.
+/// True for temporary Probe Farm pin tags (`gm-…`).
 pub fn is_gigamux_managed_tag(name: &str) -> bool {
-    let n = name.trim().to_ascii_lowercase();
-    if n.starts_with("gm-") {
-        return true;
-    }
-    if n == "nvenc" || n == "qsv" || n == "vmaf" || n == "cpu" {
-        return true;
-    }
-    crate::gpu::NvencGeneration::from_farm_tag_slug(&n).is_some()
+    name.trim().to_ascii_lowercase().starts_with("gm-")
 }
 
-/// Capability tags implied by one host probe (names, not UUIDs).
-pub fn desired_capability_tags(report: &FarmProbeHostReport) -> Vec<String> {
-    let mut tags = Vec::new();
+/// Recommended `task_types` for one host probe (`misc` always first for Probe Farm pins).
+pub fn recommended_task_types(report: &FarmProbeHostReport) -> Vec<String> {
+    let mut caps = Vec::new();
     if report.has_cpu {
-        tags.push("cpu".into());
+        caps.push("cpu".into());
     }
     if report.has_qsv {
-        tags.push("qsv".into());
+        caps.push("qsv".into());
     }
     if report.has_vmaf {
-        tags.push("vmaf".into());
+        caps.push("vmaf".into());
     }
     let mut gens = Vec::new();
     for g in &report.nvenc_gens {
@@ -1681,129 +1641,118 @@ pub fn desired_capability_tags(report: &FarmProbeHostReport) -> Vec<String> {
         }
     }
     if !gens.is_empty() {
-        tags.push("nvenc".into());
-        tags.extend(gens);
+        caps.push("nvenc".into());
+        caps.extend(gens);
     }
-    tags.sort();
-    tags.dedup();
-    tags
+    caps.sort();
+    caps.dedup();
+    let mut out = vec!["misc".into()];
+    out.extend(caps);
+    out
 }
 
-/// Result of matching probe JSON hosts to Manager workers and applying capability tags.
+/// One worker's recommended Flamenco `task_types` after farm probe.
+#[derive(Debug, Clone)]
+pub struct WorkerTaskTypeRecommendation {
+    pub worker_name: String,
+    pub task_types: Vec<String>,
+}
+
+/// Match probe hosts → Manager workers and recommend task types (no Manager write).
 #[derive(Debug, Clone, Default)]
-pub struct FarmProbeAssignReport {
-    /// `worker: tag,tag,…`
-    pub assigned: Vec<String>,
+pub struct FarmProbeTaskTypeReport {
+    pub recommendations: Vec<WorkerTaskTypeRecommendation>,
     /// Probe hosts with no matching Manager worker name.
     pub unmatched: Vec<String>,
 }
 
-/// Tag ids currently on a worker, with names (`GET …/workers/{id}`).
-pub fn fetch_worker_tag_membership(
-    manager_url: &str,
-    worker_id: &str,
-) -> Result<Vec<(String, String)>, String> {
-    let base = manager_base(manager_url)?;
-    let url = format!("{base}/api/v3/worker-mgt/workers/{worker_id}");
-    let (status, text) = flamenco_get(&url, Duration::from_secs(5))?;
-    if !(200..300).contains(&status) {
-        return Err(format!("fetch worker HTTP {status}: {text}"));
-    }
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("worker JSON: {e}"))?;
-    let mut out = Vec::new();
-    if let Some(arr) = v.get("tags").and_then(|t| t.as_array()) {
-        for t in arr {
-            let id = t.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let name = t
-                .get("name")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !id.is_empty() {
-                out.push((id, name));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Match each probe host report to a Manager worker (case-insensitive name) and set capability tags.
-///
-/// Replaces GigaMux-managed tags (`nvenc`, `nvenc-*`, `qsv`, `vmaf`, `cpu`, `gm-*`) with the probe set; leaves any other tags alone.
-pub fn assign_workers_from_farm_probe(
+/// Match each probe host report to a Manager worker (case-insensitive name) and build YAML recommendations.
+pub fn recommend_task_types_from_farm_probe(
     manager_url: &str,
     out_dir: &Path,
-) -> Result<FarmProbeAssignReport, String> {
+) -> Result<FarmProbeTaskTypeReport, String> {
     let reports = load_farm_probe_reports(out_dir)?;
     let workers = fetch_workers(manager_url)?;
-    let all_tags = fetch_worker_tags(manager_url)?;
-    let resolve = |name: &str| -> Result<String, String> {
-        all_tags
-            .iter()
-            .find(|(_, n)| n.eq_ignore_ascii_case(name))
-            .map(|(id, _)| id.clone())
-            .ok_or_else(|| format!("tag {name:?} missing — Ensure tags first"))
-    };
-
-    let mut report = FarmProbeAssignReport::default();
+    let mut out = FarmProbeTaskTypeReport::default();
     for host_report in &reports {
         let host = host_report.host.trim();
         if host.is_empty() || host.eq_ignore_ascii_case("unknown-host") {
-            report.unmatched.push(host_report.host.clone());
+            out.unmatched.push(host_report.host.clone());
             continue;
         }
         let Some(worker) = workers
             .iter()
             .find(|w| w.name.eq_ignore_ascii_case(host))
         else {
-            report.unmatched.push(host.to_string());
+            out.unmatched.push(host.to_string());
             continue;
         };
-        let desired_names = desired_capability_tags(host_report);
-        let mut desired_ids = Vec::new();
-        for name in &desired_names {
-            desired_ids.push(resolve(name)?);
-        }
-        let current = fetch_worker_tag_membership(manager_url, &worker.id)?;
-        let mut next: Vec<String> = current
-            .iter()
-            .filter(|(_, name)| !is_gigamux_managed_tag(name))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in &desired_ids {
-            if !next.iter().any(|x| x.eq_ignore_ascii_case(id)) {
-                next.push(id.clone());
-            }
-        }
-        // Skip no-op settags when membership already matches.
-        let mut cur_ids: Vec<String> = current.iter().map(|(id, _)| id.clone()).collect();
-        cur_ids.sort();
-        let mut next_sorted = next.clone();
-        next_sorted.sort();
-        if cur_ids == next_sorted {
-            report.assigned.push(format!(
-                "{}: {} (unchanged)",
-                worker.name,
-                if desired_names.is_empty() {
-                    "(none)".into()
-                } else {
-                    desired_names.join(",")
-                }
-            ));
-            continue;
-        }
-        set_worker_tags(manager_url, &worker.id, &next)?;
-        report.assigned.push(format!(
-            "{}: {}",
-            worker.name,
-            if desired_names.is_empty() {
-                "(none)".into()
-            } else {
-                desired_names.join(",")
-            }
-        ));
+        out.recommendations.push(WorkerTaskTypeRecommendation {
+            worker_name: worker.name.clone(),
+            task_types: recommended_task_types(host_report),
+        });
     }
-    Ok(report)
+    out.recommendations
+        .sort_by(|a, b| a.worker_name.to_ascii_lowercase().cmp(&b.worker_name.to_ascii_lowercase()));
+    Ok(out)
+}
+
+/// Basename `{worker}_flamenco-worker.yaml` (filesystem-safe).
+pub fn safe_worker_yaml_filename(worker_name: &str) -> String {
+    let safe: String = worker_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "worker".to_string()
+    } else {
+        safe
+    };
+    format!("{safe}_flamenco-worker.yaml")
+}
+
+/// Body of a per-worker `flamenco-worker.yaml` for manual fleet delivery.
+pub fn flamenco_worker_yaml(manager_url: &str, task_types: &[String]) -> String {
+    let mut s = String::from(
+        "# GigaMux-generated Flamenco Worker config.\n\
+         # Copy/rename to flamenco-worker.yaml in this worker's working directory, then restart Flamenco Worker.\n\
+         # Do not share one cwd/yaml across multiple workers (shared binary on the share is fine).\n\n",
+    );
+    let url = manager_url.trim().trim_end_matches('/');
+    s.push_str("manager_url: ");
+    s.push_str(url);
+    s.push('\n');
+    s.push_str("task_types:\n");
+    for t in task_types {
+        s.push_str("  - ");
+        s.push_str(t);
+        s.push('\n');
+    }
+    s.push_str("restart_exit_code: 47\n");
+    s
+}
+
+/// Write one `{worker}_flamenco-worker.yaml` per recommendation into `dir`.
+pub fn export_worker_yamls(
+    dir: &Path,
+    manager_url: &str,
+    recs: &[WorkerTaskTypeRecommendation],
+) -> Result<Vec<PathBuf>, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("create export dir: {e}"))?;
+    let mut written = Vec::new();
+    for rec in recs {
+        let path = dir.join(safe_worker_yaml_filename(&rec.worker_name));
+        let body = flamenco_worker_yaml(manager_url, &rec.task_types);
+        fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+        written.push(path);
+    }
+    Ok(written)
 }
 
 /// Default shared folder for probe JSON (under output dir).
@@ -1842,10 +1791,12 @@ pub fn make_gigamux_probe_job(
         out.clone(),
     ];
     // Prefer dedicated probe_out_dir when Manager has the redeployed script; encode_argvs always present so compile/persist never hits the empty-argv 400 (and works on older JS too).
+    // encode_task_type unused (JS short-circuits on probe_out_dir); pin tag isolates the worker.
     make_gigamux_encode_job(
         name,
         Some(check_rewritten.as_str()),
         &argv,
+        "misc",
         worker_tag,
         None, // paths already braced above; avoid double-rewrite of check/out
         CancelExecMode::Direct,
@@ -1886,6 +1837,7 @@ mod tests {
             "t",
             None,
             &argv,
+            "nvenc",
             None,
             Some(FlamencoTwoway {
                 local_prefix: r"Z:\",
@@ -1902,6 +1854,8 @@ mod tests {
             job.settings["check_exe"],
             "{shared_storage_path}/Flamenco/tools/gigamux-check"
         );
+        assert_eq!(job.settings["encode_task_type"], "nvenc");
+        assert!(job.worker_tag.is_none());
     }
 
     #[test]
@@ -1970,6 +1924,7 @@ mod tests {
             "t",
             None,
             &argv,
+            "cpu",
             None,
             Some(FlamencoTwoway {
                 local_prefix: r"Z:\",
@@ -1984,6 +1939,7 @@ mod tests {
         assert!(enc.contains("{shared_storage_path}/GigaMux/out.mp4"));
         assert!(!enc.contains(r"Z:\\GigaMux"));
         assert_eq!(job.settings["cancel_exec"], "direct");
+        assert_eq!(job.settings["encode_task_type"], "cpu");
     }
 
     #[test]
@@ -2024,21 +1980,29 @@ mod tests {
         assert!(worker_status_probeable("asleep"));
         assert!(!worker_status_probeable("offline"));
         assert!(!worker_status_probeable("error"));
-        assert!(is_gigamux_managed_tag("nvenc-turing"));
+        assert!(!is_gigamux_managed_tag("nvenc-turing"));
         assert!(is_gigamux_managed_tag("gm-abc"));
         assert!(!is_gigamux_managed_tag("GPU-EEVEE"));
-        let tags = desired_capability_tags(&FarmProbeHostReport {
-            host: "godzilla".into(),
+        let types = recommended_task_types(&FarmProbeHostReport {
+            host: "worker-a".into(),
             nvenc_gens: vec!["nvenc-turing".into()],
             has_qsv: false,
             has_vmaf: false,
             has_cpu: true,
         });
-        assert_eq!(tags, vec!["cpu", "nvenc", "nvenc-turing"]);
+        assert_eq!(types, vec!["misc", "cpu", "nvenc", "nvenc-turing"]);
+        let yaml = flamenco_worker_yaml("http://manager.example:8080/", &types);
+        assert!(yaml.contains("manager_url: http://manager.example:8080\n"));
+        assert!(yaml.contains("  - misc\n"));
+        assert!(yaml.contains("  - nvenc-turing\n"));
+        assert_eq!(
+            safe_worker_yaml_filename("host / gpu0"),
+            "host___gpu0_flamenco-worker.yaml"
+        );
     }
 
     #[test]
-    fn farm_tag_from_slot() {
+    fn farm_task_type_from_slot() {
         use crate::gpu::NvencGeneration;
         use crate::prefs::EncodeSlot;
         use crate::targets::OpaqueVideo;
@@ -2047,17 +2011,17 @@ mod tests {
         slot.opaque_video = OpaqueVideo::Hevc;
         slot.use_hardware = true;
         slot.nvenc_gen = None;
-        assert_eq!(farm_worker_tag_for_slot(&slot, false), "nvenc");
+        assert_eq!(farm_task_type_for_slot(&slot, false), "nvenc");
         slot.nvenc_gen = Some(NvencGeneration::Turing);
-        assert_eq!(farm_worker_tag_for_slot(&slot, false), "nvenc-turing");
-        assert_eq!(farm_worker_tag_for_slot(&slot, true), "cpu");
+        assert_eq!(farm_task_type_for_slot(&slot, false), "nvenc-turing");
+        assert_eq!(farm_task_type_for_slot(&slot, true), "cpu");
         slot.opaque_video = OpaqueVideo::Av1;
         assert!(!farm_slot_use_hardware(&slot)); // Turing has no AV1 NVENC
         slot.nvenc_gen = Some(NvencGeneration::Ada);
         assert!(farm_slot_use_hardware(&slot));
         slot.opaque_video = OpaqueVideo::Vp9;
         slot.nvenc_gen = None;
-        assert_eq!(farm_worker_tag_for_slot(&slot, false), "qsv");
+        assert_eq!(farm_task_type_for_slot(&slot, false), "qsv");
     }
 
     #[test]

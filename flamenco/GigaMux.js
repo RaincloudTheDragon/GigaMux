@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Unlicense
 // Job type GigaMux: ffmpeg argv(s) from the GigaMux submitter.
-// Single file: one misc/exec (+ optional final-check + optional trailing vmaf).
-// Chunked: N ensure-chunk encodes → mux (ensure-out vmux from ffconcat+audio) → remux (ensure-out final) → final-check/cleanup → optional vmaf.
-// VMAF-only: vmaf_pairs_json → N ensure-vmaf tasks (no encode); submit with worker tag `vmaf`.
-// mux and remux are separate Flamenco tasks so remux soft-fail never re-runs the stage join (same reason we used to split concat from mux).
+// Single file: encode task_type from settings → optional final-check (cpu) → optional trailing vmaf.
+// Chunked: N encode-c* → mux/remux/final-check (cpu) → optional vmaf.
+// VMAF-only: vmaf_pairs_json → ensure-vmaf tasks (task_type vmaf); jobs are tagless.
+// Farm-probe stays misc + gm-… pin tag (Probe Farm isolation only).
+// mux and remux are separate Flamenco tasks so remux soft-fail never re-runs the stage join.
 // Deploy via Settings → Files → Deploy GigaMux… (Manager install → scripts/ + tools/ helpers).
 
 const JOB_TYPE = {
@@ -99,7 +100,7 @@ const JOB_TYPE = {
             type: "string",
             required: false,
             default: "",
-            description: "JSON {input,output,sidecar} — trailing ensure-vmaf after final-check (same job tag)",
+            description: "JSON {input,output,sidecar}: trailing ensure-vmaf after final-check (task_type vmaf)",
         },
         {
             key: "vmaf_pairs_json",
@@ -107,6 +108,13 @@ const JOB_TYPE = {
             required: false,
             default: "",
             description: "JSON array of {input,output,sidecar} — VMAF-only job (no encode)",
+        },
+        {
+            key: "encode_task_type",
+            type: "string",
+            required: false,
+            default: "cpu",
+            description: "Flamenco task type for encode / encode-c* (nvenc, nvenc-{gen}, qsv, cpu)",
         },
         {
             key: "probe_out_dir",
@@ -117,6 +125,13 @@ const JOB_TYPE = {
         },
     ],
 };
+
+// Encode pool task type from submitter (fallback cpu).
+function encodeTaskType(settings) {
+    const raw =
+        typeof settings.encode_task_type === "string" ? settings.encode_task_type.trim() : "";
+    return raw.length > 0 ? raw : "cpu";
+}
 
 function parseArgvJson(raw, label) {
     if (typeof raw !== "string" || raw.trim().length === 0) {
@@ -293,17 +308,19 @@ function compileJob(job) {
         return;
     }
 
-    // VMAF-only job: no encode graph.
+    // VMAF-only job: no encode graph (task_type vmaf; job is tagless).
     if (vmafPairs !== null) {
         print("GigaMux compileJob: vmaf-only pairs=", vmafPairs.length, " check_exe=", checkExe);
         for (let i = 0; i < vmafPairs.length; i++) {
             const name = vmafPairs.length === 1 ? "vmaf" : "vmaf-" + i;
-            const task = author.Task(name, "misc");
+            const task = author.Task(name, "vmaf");
             addEnsureVmaf(task, checkExe, exe, vmafPairs[i]);
             job.addTask(task);
         }
         return;
     }
+
+    const encType = encodeTaskType(settings);
 
     let encodeArgvs = null;
     const encRaw = settings.encode_argvs_json;
@@ -359,7 +376,9 @@ function compileJob(job) {
         " cleanup=",
         cleanupRaw.length > 0,
         " vmaf_attached=",
-        vmafAttached !== null
+        vmafAttached !== null,
+        " encode_task_type=",
+        encType
     );
     if (cancelMode === "legacy_stub") {
         print("GigaMux: cancel_exec=legacy_stub — Windows cancel helper not shipped; using direct ffmpeg exec");
@@ -372,7 +391,7 @@ function compileJob(job) {
             throw "GigaMux: encode argv " + i + " is empty";
         }
         const name = encodeArgvs.length === 1 ? "encode" : "encode-c" + i;
-        const task = author.Task(name, "misc");
+        const task = author.Task(name, encType);
         // Chunked: ensure-chunk reuses a good existing file; only forces `-y` encode when missing/bad.
         // Soft-fail requeues this single command (hybrid auto-retry).
         if (chunkChecks !== null) {
@@ -404,14 +423,14 @@ function compileJob(job) {
         }
 
         // Separate mux vs remux so remux soft-fail does not re-run the stage join (ffconcat+audio → vmux).
-        const muxTask = author.Task("mux", "misc");
+        const muxTask = author.Task("mux", "cpu");
         addEnsureOut(muxTask, checkExe, exe, vmuxPath, expectDur, muxArgv);
         for (const t of encodeTasks) {
             muxTask.addDependency(t);
         }
         job.addTask(muxTask);
 
-        const remuxTask = author.Task("remux", "misc");
+        const remuxTask = author.Task("remux", "cpu");
         addEnsureOut(remuxTask, checkExe, exe, finalPath, expectDur, muxRemuxArgv);
         remuxTask.addDependency(muxTask);
         job.addTask(remuxTask);
@@ -432,7 +451,7 @@ function compileJob(job) {
         } catch (e) {
             throw "GigaMux: final_check_json: " + e;
         }
-        const finalTask = author.Task("final-check", "misc");
+        const finalTask = author.Task("final-check", "cpu");
         addCheckExec(finalTask, checkExe, [
             "final",
             finalSpec.input,
@@ -464,12 +483,12 @@ function compileJob(job) {
         throw "GigaMux: cleanup_json requires final_check_json (cleanup runs after successful final check)";
     }
 
-    // Trailing VMAF after final-check (or encode/remux when no final-check). Same job worker tag.
+    // Trailing VMAF after final-check (or encode/remux when no final-check); task_type vmaf.
     if (vmafAttached !== null) {
         if (!gateTask) {
             throw "GigaMux: vmaf_json requires encode/mux/final-check tasks";
         }
-        const vmafTask = author.Task("vmaf", "misc");
+        const vmafTask = author.Task("vmaf", "vmaf");
         addEnsureVmaf(vmafTask, checkExe, exe, vmafAttached);
         vmafTask.addDependency(gateTask);
         job.addTask(vmafTask);

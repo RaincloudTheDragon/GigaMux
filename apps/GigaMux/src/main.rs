@@ -27,16 +27,17 @@ use gigamux_core::encode::{
     EncodeOptions, FarmEncodeRequest,
 };
 use gigamux_core::flamenco::{
-    cancel_exec_mode_for_manager_version, deploy_gigamux_manager, discover_manager,
-    assign_workers_from_farm_probe, delete_probe_pin_tags, ensure_worker_tags, farm_probe_out_dir,
-    farm_slot_use_hardware, farm_worker_tag_for_slot, fetch_job_status, fetch_job_tasks,
-    fetch_task_log, fetch_workers, flamenco_job_terminal, flamenco_script_hint,
-    infer_twoway_local_prefix, local_gigamux_js_present, make_gigamux_chunked_job,
-    make_gigamux_encode_job, make_gigamux_probe_job, make_gigamux_vmaf_job, manager_web_url,
-    merge_farm_probe_dir, normalize_check_exe_path, pick_log_task, pin_worker_for_probe,
-    ping_manager, resolve_flamenco_check_exe, restore_worker_tags_after_probe, submit_job,
-    worker_status_probeable, CancelExecMode, FarmProbeInventory, FarmVmafMode, FarmVmafSpec,
-    FlamencoTwoway, ProbeWorkerPin, REQUIRED_WORKER_TAGS,
+    cancel_exec_mode_for_manager_version, delete_probe_pin_tags, deploy_gigamux_manager,
+    discover_manager, export_worker_yamls, farm_probe_out_dir, farm_slot_use_hardware,
+    farm_task_type_for_slot, fetch_job_status, fetch_job_tasks, fetch_task_log, fetch_workers,
+    flamenco_job_terminal, flamenco_script_hint, infer_twoway_local_prefix,
+    local_gigamux_js_present, make_gigamux_chunked_job, make_gigamux_encode_job,
+    make_gigamux_probe_job, make_gigamux_vmaf_job, manager_web_url, merge_farm_probe_dir,
+    normalize_check_exe_path, pick_log_task, pin_worker_for_probe, ping_manager,
+    recommend_task_types_from_farm_probe, resolve_flamenco_check_exe,
+    restore_worker_tags_after_probe, submit_job, worker_status_probeable, CancelExecMode,
+    FarmProbeInventory, FarmProbeTaskTypeReport, FarmVmafMode, FarmVmafSpec, FlamencoTwoway,
+    ProbeWorkerPin, WorkerTaskTypeRecommendation, CAPABILITY_TASK_TYPES,
 };
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{
@@ -393,8 +394,10 @@ struct GigaMuxApp {
     farm_poll_inflight: bool,
     farm_last_poll_at: Option<Instant>,
     farm_force_poll: bool,
-    /// After Probe Farm submits, merge+ensure+assign once all gm-… pins are cleared.
+    /// After Probe Farm submits, merge + recommend task types once all gm-… pins are cleared.
     farm_probe_await_apply: bool,
+    /// Post-probe (or Settings) dialog: recommended task_types + YAML export.
+    pending_worker_yaml: Option<WorkerYamlPrompt>,
     /// Cached Flamenco logo texture for the Farm toolbar button.
     farm_logo_tex: Option<egui::TextureHandle>,
     /// Important error modal (session log still gets the line; panel stays collapsed).
@@ -731,6 +734,13 @@ struct AlertPrompt {
     after_ok: AlertAfterOk,
 }
 
+/// Post-probe / Settings: recommended worker `task_types` + YAML export.
+#[derive(Clone)]
+struct WorkerYamlPrompt {
+    recommendations: Vec<WorkerTaskTypeRecommendation>,
+    unmatched: Vec<String>,
+}
+
 /// Alt-at-launch purge chooser (which prefs slices + optional logs).
 #[derive(Clone)]
 struct PurgePrompt {
@@ -831,6 +841,7 @@ impl GigaMuxApp {
             farm_last_poll_at: None,
             farm_force_poll: false,
             farm_probe_await_apply: false,
+            pending_worker_yaml: None,
             farm_logo_tex: None,
             pending_alert: None,
             pending_purge: ask_purge_prefs.then(PurgePrompt::default),
@@ -2329,23 +2340,23 @@ impl GigaMuxApp {
         });
     }
 
-    /// Per-slot Flamenco tags that Send will use (opaque vs α when they differ).
-    fn farm_tag_summary_lines(&self) -> Vec<String> {
+    /// Per-slot Flamenco encode task types that Send will use (opaque vs α when they differ).
+    fn farm_task_type_summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for &b in self.prefs.encode_batches() {
             let mut slot = self.prefs.slot(b).clone();
             slot.use_hardware = farm_slot_use_hardware(&slot);
-            let tag_opaque = farm_worker_tag_for_slot(&slot, false);
-            let tag_alpha = farm_worker_tag_for_slot(&slot, true);
+            let ty_opaque = farm_task_type_for_slot(&slot, false);
+            let ty_alpha = farm_task_type_for_slot(&slot, true);
             let label = if self.prefs.test_mode {
                 format!("test{}", b.index() + 1)
             } else {
                 "targets".into()
             };
-            if tag_opaque == tag_alpha {
-                lines.push(format!("{label} → {tag_opaque}"));
+            if ty_opaque == ty_alpha {
+                lines.push(format!("{label} → {ty_opaque}"));
             } else {
-                lines.push(format!("{label} → opaque {tag_opaque} / α {tag_alpha}"));
+                lines.push(format!("{label} → opaque {ty_opaque} / α {ty_alpha}"));
             }
         }
         lines
@@ -2520,7 +2531,7 @@ impl GigaMuxApp {
                 let has_alpha = file_info(&input)
                     .map(|info| video_has_alpha(&info))
                     .unwrap_or(false);
-                let tag = farm_worker_tag_for_slot(&slot, has_alpha);
+                let task_type = farm_task_type_for_slot(&slot, has_alpha);
                 let job_name = match test_batch {
                     Some(b) => format!("GigaMux test{} {name}", b.index() + 1),
                     None => format!("GigaMux {name}"),
@@ -2548,7 +2559,6 @@ impl GigaMuxApp {
                     })
                 };
                 let exe = exe_owned.as_deref();
-                let tag_ref = Some(tag.as_str());
 
                 if use_chunks {
                     let job_built = match build_farm_chunked_job(&req) {
@@ -2596,7 +2606,7 @@ impl GigaMuxApp {
                         &job_built.mux_argv,
                         &job_built.mux_remux_argv,
                         job_built.out_expect_dur_s,
-                        tag_ref,
+                        &task_type,
                         twoway,
                         cancel_exec,
                         Some(integrity),
@@ -2614,7 +2624,7 @@ impl GigaMuxApp {
                     match submit_job(&url, &job) {
                         Ok(id) => {
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                                "Flamenco submitted: job {id}; {item_label} → {out_name} (tag {tag}, {} chunks, {}k / {})",
+                                "Flamenco submitted: job {id}; {item_label} → {out_name} (type {task_type}, {} chunks, {}k / {})",
                                 chunk_n, job_built.bitrate_k, job_built.bitrate_label
                             ))));
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
@@ -2680,7 +2690,8 @@ impl GigaMuxApp {
                     job_name,
                     exe,
                     &cmd.argv,
-                    tag_ref,
+                    &task_type,
+                    None,
                     twoway,
                     cancel_exec,
                     Some(integrity),
@@ -2698,7 +2709,7 @@ impl GigaMuxApp {
                 match submit_job(&url, &job) {
                     Ok(id) => {
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                            "Flamenco submitted: job {id}; {item_label} → {out_name} (tag {tag}, {}k / {})",
+                            "Flamenco submitted: job {id}; {item_label} → {out_name} (type {task_type}, {}k / {})",
                             cmd.bitrate_k, cmd.bitrate_label
                         ))));
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
@@ -2764,25 +2775,7 @@ impl GigaMuxApp {
         self.farm_force_poll = true;
     }
 
-    /// Create coarse + inventory gen tags on the Manager.
-    fn ensure_flamenco_tags(&mut self) {
-        let url = self.prefs.flamenco_manager_url.clone();
-        if url.trim().is_empty() {
-            self.alert_error("Flamenco", "set Flamenco Manager URL first");
-            return;
-        }
-        match ensure_worker_tags(&url, Some(&self.prefs.flamenco_farm_probe)) {
-            Ok(created) if created.is_empty() => {
-                self.push_session("Flamenco tags: already present");
-            }
-            Ok(created) => {
-                self.push_session(format!("Flamenco tags created: {}", created.join(", ")));
-            }
-            Err(e) => self.alert_error("Flamenco", format!("Flamenco tags: {e}")),
-        }
-    }
-
-    /// Merge probe JSON from the output share into prefs (no Ensure / assign).
+    /// Merge probe JSON from the output share into prefs.
     fn merge_flamenco_farm_probe(&mut self) {
         if !prefs::dir_ok(&self.prefs.output_dir) {
             self.alert_error("Flamenco", "set output folder before merging farm probe");
@@ -2807,7 +2800,30 @@ impl GigaMuxApp {
         }
     }
 
-    /// Merge share JSON → prefs, Ensure tags, assign capability tags on matching workers.
+    /// Open the worker YAML recommendations dialog from a probe report.
+    fn open_worker_yaml_prompt(&mut self, rep: FarmProbeTaskTypeReport) {
+        for line in &rep.recommendations {
+            self.push_session(format!(
+                "Flamenco task_types: {}: {}",
+                line.worker_name,
+                line.task_types.join(",")
+            ));
+        }
+        for host in &rep.unmatched {
+            self.push_session(format!(
+                "Flamenco task_types: no worker named {host:?}"
+            ));
+        }
+        if rep.recommendations.is_empty() && rep.unmatched.is_empty() {
+            self.push_session("Flamenco task_types: no host JSON yet");
+        }
+        self.pending_worker_yaml = Some(WorkerYamlPrompt {
+            recommendations: rep.recommendations,
+            unmatched: rep.unmatched,
+        });
+    }
+
+    /// Merge share JSON → prefs, then recommend task_types (YAML export dialog).
     fn apply_flamenco_farm_probe(&mut self) {
         if !prefs::dir_ok(&self.prefs.output_dir) {
             self.alert_error("Flamenco", "set output folder before applying farm probe");
@@ -2819,27 +2835,33 @@ impl GigaMuxApp {
             return;
         }
         self.merge_flamenco_farm_probe();
-        self.ensure_flamenco_tags();
         let dir = farm_probe_out_dir(&self.prefs.output_dir);
-        match assign_workers_from_farm_probe(&url, &dir) {
-            Ok(rep) => {
-                for line in &rep.assigned {
-                    self.push_session(format!("Flamenco farm-probe assign: {line}"));
-                }
-                for host in &rep.unmatched {
-                    self.push_session(format!(
-                        "Flamenco farm-probe assign: no worker named {host:?}"
-                    ));
-                }
-                if rep.assigned.is_empty() && rep.unmatched.is_empty() {
-                    self.push_session("Flamenco farm-probe assign: no host JSON yet");
-                }
-            }
-            Err(e) => self.alert_error("Flamenco", format!("farm probe assign: {e}")),
+        match recommend_task_types_from_farm_probe(&url, &dir) {
+            Ok(rep) => self.open_worker_yaml_prompt(rep),
+            Err(e) => self.alert_error("Flamenco", format!("farm probe recommend: {e}")),
         }
     }
 
-    /// Merge existing probe JSON, Ensure tags, then one farm-probe job per non-offline worker (temp pin tag).
+    /// Re-open YAML recommendations from current share probe JSON (no new probe jobs).
+    fn show_worker_yaml_from_probe(&mut self) {
+        let url = self.prefs.flamenco_manager_url.trim().to_string();
+        if url.is_empty() {
+            self.alert_error("Flamenco", "set Flamenco Manager URL first");
+            return;
+        }
+        if !prefs::dir_ok(&self.prefs.output_dir) {
+            self.alert_error("Flamenco", "set output folder first");
+            return;
+        }
+        self.merge_flamenco_farm_probe();
+        let dir = farm_probe_out_dir(&self.prefs.output_dir);
+        match recommend_task_types_from_farm_probe(&url, &dir) {
+            Ok(rep) => self.open_worker_yaml_prompt(rep),
+            Err(e) => self.alert_error("Flamenco", format!("worker YAML recommend: {e}")),
+        }
+    }
+
+    /// Merge existing probe JSON, then one farm-probe job per non-offline worker (temp gm-… pin tag).
     fn probe_flamenco_farm(&mut self) {
         let url = self.prefs.flamenco_manager_url.trim().to_string();
         if url.is_empty() {
@@ -2851,7 +2873,6 @@ impl GigaMuxApp {
             return;
         }
         self.merge_flamenco_farm_probe();
-        self.ensure_flamenco_tags();
         // Drop leftover gm-… pins from prior runs (definitions linger after worker restore).
         match delete_probe_pin_tags(&url) {
             Ok(gone) if !gone.is_empty() => {
@@ -3129,14 +3150,7 @@ impl GigaMuxApp {
                 })
             }
         };
-        let job = match make_gigamux_vmaf_job(
-            job_name,
-            exe,
-            pairs,
-            Some("vmaf"),
-            twoway,
-            &check_exe,
-        ) {
+        let job = match make_gigamux_vmaf_job(job_name, exe, pairs, twoway, &check_exe) {
             Ok(j) => j,
             Err(e) => {
                 self.push_session(format!("Farm VMAF job: {e}"));
@@ -4641,6 +4655,8 @@ impl GigaMuxApp {
                 self.pending_recycle_delete = None;
             } else if self.pending_flamenco.is_some() {
                 self.pending_flamenco = None;
+            } else if self.pending_worker_yaml.is_some() {
+                self.pending_worker_yaml = None;
             } else if self.busy && matches!(self.job, Some(JobKind::FarmSubmit)) {
                 // Prefer cancel over closing the Farm panel opened mid-submit.
                 self.cancel_encode();
@@ -7594,14 +7610,9 @@ impl GigaMuxApp {
             let can_probe = !self.prefs.flamenco_manager_url.trim().is_empty();
             let probe_btn = ui
                 .add_enabled(can_probe, egui::Button::new("Probe Farm"))
-                .on_hover_text(format!(
-                    "Probe every non-offline worker; when done: merge JSON, Ensure tags ({}), and assign capabilities. Right-click to clear prefs inventory (share JSON kept).",
-                    REQUIRED_WORKER_TAGS
-                        .iter()
-                        .map(|(n, _)| *n)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
+                .on_hover_text(
+                    "Probe every non-offline worker (gm-… pin tags); when done: merge JSON and open task_types YAML recommendations. Right-click to clear prefs inventory (share JSON kept).",
+                )
                 .on_disabled_hover_text("Set Manager URL (or Find) first");
             if probe_btn.clicked() {
                 self.probe_flamenco_farm();
@@ -7618,6 +7629,16 @@ impl GigaMuxApp {
                     ui.close();
                 }
             });
+            if ui
+                .add_enabled(can_probe, egui::Button::new("Worker YAMLs…"))
+                .on_hover_text(
+                    "Re-open task_types recommendations from existing probe JSON (export {worker}_flamenco-worker.yaml).",
+                )
+                .on_disabled_hover_text("Set Manager URL first")
+                .clicked()
+            {
+                self.show_worker_yaml_from_probe();
+            }
         });
         {
             let inv = &self.prefs.flamenco_farm_probe;
@@ -7671,12 +7692,24 @@ impl GigaMuxApp {
                 }
             }
         });
-        ui.label(
-            egui::RichText::new(
-                "Worker tags come from Output → Targets (NVENC generation under Use hardware).",
-            )
-            .small()
-            .weak(),
+        // Wrap to the visible pane edge (clip_rect), not content min-width from wide TextEdits above.
+        let wrap_w = ui.clip_rect().width().max(80.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(wrap_w, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(wrap_w);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Encode task types come from Output → Targets. After Probe Farm, export worker YAMLs; workers must not share one cwd/flamenco-worker.yaml.",
+                        )
+                        .small()
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+            },
         );
         ui.horizontal(|ui| {
             ui.label("Worker ffmpeg");
@@ -7722,6 +7755,105 @@ impl GigaMuxApp {
                 let _ = prefs::save(&self.prefs);
             }
         });
+    }
+
+    /// Post-probe / Settings: recommended task_types + export `{worker}_flamenco-worker.yaml`.
+    fn ui_worker_yaml_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.pending_worker_yaml.clone() else {
+            return;
+        };
+        let mut dismiss = false;
+        let mut do_export = false;
+        egui::Window::new("Worker task_types")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    "Manager cannot push task_types yet. Copy each YAML into that worker's working directory as flamenco-worker.yaml, then restart the Worker. Do not share one cwd/yaml across machines.",
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        CAPABILITY_TASK_TYPES
+                            .iter()
+                            .map(|(n, d)| format!("{n}: {d}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        if prompt.recommendations.is_empty() {
+                            ui.label(egui::RichText::new("No matched workers yet.").weak());
+                        }
+                        for rec in &prompt.recommendations {
+                            ui.label(egui::RichText::new(&rec.worker_name).strong());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "task_types: [{}]",
+                                    rec.task_types.join(", ")
+                                ))
+                                .small(),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        for host in &prompt.unmatched {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "unmatched host {host:?} (Manager worker name must match hostname)"
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !prompt.recommendations.is_empty(),
+                            egui::Button::new("Export YAMLs…"),
+                        )
+                        .on_hover_text(
+                            "Pick a folder; writes {worker}_flamenco-worker.yaml for each recommendation.",
+                        )
+                        .clicked()
+                    {
+                        do_export = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        if do_export {
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_title("Export flamenco-worker YAML files")
+                .pick_folder()
+            {
+                let url = self.prefs.flamenco_manager_url.clone();
+                match export_worker_yamls(&dir, &url, &prompt.recommendations) {
+                    Ok(paths) => {
+                        self.push_session(format!(
+                            "Exported {} worker YAML(s) to {}",
+                            paths.len(),
+                            dir.display()
+                        ));
+                        dismiss = true;
+                    }
+                    Err(e) => self.alert_error("Flamenco", format!("export worker YAMLs: {e}")),
+                }
+            }
+        }
+        if dismiss || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.pending_worker_yaml = None;
+        }
     }
 
     /// Important-error modal (OK / Esc). Does not expand the log panel.
@@ -8167,14 +8299,16 @@ impl GigaMuxApp {
                 }
                 ui.add_space(8.0);
 
-                ui.label(egui::RichText::new("Worker tags (from Targets)").strong());
-                for line in self.farm_tag_summary_lines() {
+                ui.label(egui::RichText::new("Encode task types (from Targets)").strong());
+                for line in self.farm_task_type_summary_lines() {
                     ui.label(egui::RichText::new(line).small());
                 }
                 ui.label(
-                    egui::RichText::new("Change NVENC generation under Output → Targets (Use hardware).")
-                        .weak()
-                        .small(),
+                    egui::RichText::new(
+                        "Jobs are tagless. Workers need matching task_types in flamenco-worker.yaml (Probe Farm → Worker YAMLs…).",
+                    )
+                    .weak()
+                    .small(),
                 );
                 ui.add_space(6.0);
                 ui.label("ffmpeg on worker (optional)");
@@ -8234,7 +8368,7 @@ impl GigaMuxApp {
                                 "Attached",
                             )
                             .on_hover_text(
-                                "Trailing ensure-vmaf on this encode job (same worker tag — those workers need libvmaf).",
+                                "Trailing ensure-vmaf on this encode job (task_type vmaf — those workers need libvmaf).",
                             );
                             ui.selectable_value(
                                 &mut prompt.farm_vmaf,
@@ -8242,7 +8376,7 @@ impl GigaMuxApp {
                                 "Separate",
                             )
                             .on_hover_text(
-                                "After encode completes, submit a VMAF-only job tagged `vmaf`.",
+                                "After encode completes, submit a VMAF-only job (task_type vmaf).",
                             );
                         });
                 })
@@ -9734,6 +9868,7 @@ impl eframe::App for GigaMuxApp {
         self.handle_folder_dnd(&ctx);
 
         self.ui_settings(&ctx);
+        self.ui_worker_yaml_prompt(&ctx);
         self.ui_alert_prompt(&ctx);
         self.ui_purge_prefs_prompt(&ctx);
         self.ui_check_prompt(&ctx);
