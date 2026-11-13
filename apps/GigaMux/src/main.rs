@@ -7363,10 +7363,15 @@ impl GigaMuxApp {
             // Never paint raw multi‑k‑line ffmpeg dumps into egui (freezes the window).
             let shown = truncate_cli_err(e, 400);
             let truncated = shown.contains("… (stderr truncated)") || e.len() > 400;
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 100, 80),
-                    format!("thumb: {shown}"),
+            // Wrap inside the center column, do not grow the layout to the error string.
+            ui.set_max_width(ui.available_width());
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("thumb: {shown}"))
+                            .color(egui::Color32::from_rgb(200, 100, 80)),
+                    )
+                    .wrap(),
                 );
                 if truncated
                     && ui
@@ -7414,7 +7419,15 @@ impl GigaMuxApp {
                 Self::ui_meta_table(ui, s, bitrates_ready, size_vs_input, vmaf_score);
             }
             Some(Err(e)) => {
-                ui.colored_label(egui::Color32::from_rgb(200, 100, 80), e);
+                // Wrap to the center column width (min/thumb allotment), never widen the column.
+                ui.set_max_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(truncate_cli_err(e, 400))
+                            .color(egui::Color32::from_rgb(200, 100, 80)),
+                    )
+                    .wrap(),
+                );
             }
             None => {}
         }
@@ -10298,7 +10311,12 @@ impl eframe::App for GigaMuxApp {
                 ui.allocate_ui_with_layout(
                     egui::vec2(center_w, total.y),
                     egui::Layout::top_down(egui::Align::Center),
-                    |ui| self.ui_center(ui),
+                    |ui| {
+                        // Hard-cap so long ffprobe/thumb errors wrap instead of stretching the column.
+                        ui.set_width(center_w);
+                        ui.set_max_width(center_w);
+                        self.ui_center(ui);
+                    },
                 );
                 ui.separator();
                 let out_size = egui::vec2(out_w, total.y);
