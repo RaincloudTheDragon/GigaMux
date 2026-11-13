@@ -2633,7 +2633,15 @@ impl GigaMuxApp {
                     integrity.check_exe =
                         resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
                     if farm_vmaf == FarmVmafMode::Attached {
-                        integrity.vmaf = Some(farm_vmaf_spec(&req.input, &job_built.final_output));
+                        if read_vmaf_sidecar(&vmaf_sidecar_path(&job_built.final_output)).is_some()
+                        {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco VMAF skip (already scored): {out_name}"
+                            ))));
+                        } else {
+                            integrity.vmaf =
+                                Some(farm_vmaf_spec(&req.input, &job_built.final_output));
+                        }
                     }
                     let job = match make_gigamux_hybrid_job(
                         job_name.clone(),
@@ -2722,7 +2730,15 @@ impl GigaMuxApp {
                     integrity.check_exe =
                         resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
                     if farm_vmaf == FarmVmafMode::Attached {
-                        integrity.vmaf = Some(farm_vmaf_spec(&req.input, &job_built.final_output));
+                        if read_vmaf_sidecar(&vmaf_sidecar_path(&job_built.final_output)).is_some()
+                        {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco VMAF skip (already scored): {out_name}"
+                            ))));
+                        } else {
+                            integrity.vmaf =
+                                Some(farm_vmaf_spec(&req.input, &job_built.final_output));
+                        }
                     }
                     let job = match make_gigamux_chunked_job(
                         job_name.clone(),
@@ -2809,7 +2825,13 @@ impl GigaMuxApp {
                 let mut integrity = farm_integrity_for_single(&req, &cmd);
                 integrity.check_exe = resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
                 if farm_vmaf == FarmVmafMode::Attached {
-                    integrity.vmaf = Some(farm_vmaf_spec(&req.input, &cmd.output));
+                    if read_vmaf_sidecar(&vmaf_sidecar_path(&cmd.output)).is_some() {
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco VMAF skip (already scored): {out_name}"
+                        ))));
+                    } else {
+                        integrity.vmaf = Some(farm_vmaf_spec(&req.input, &cmd.output));
+                    }
                 }
                 let job = match make_gigamux_encode_job(
                     job_name,
@@ -4942,6 +4964,27 @@ impl GigaMuxApp {
             );
             return;
         }
+        self.import_vmaf_sidecars_from_output();
+        // All-pairs: only unscored (cache + sidecar). Output-row single-file: skip if scored.
+        let only_outputs = if let Some(ref n) = only_name {
+            let is_output = self.names_for(FileSide::Output).iter().any(|o| o == n);
+            if is_output
+                && (self.live_vmaf_score(FileSide::Output, n).is_some()
+                    || read_vmaf_sidecar(&vmaf_sidecar_path(&self.prefs.output_dir.join(n)))
+                        .is_some())
+            {
+                self.push_session(format!("VMAF skip (already scored): {n}"));
+                return;
+            }
+            None
+        } else {
+            let unscored = self.unscored_output_names();
+            if unscored.is_empty() {
+                self.push_session("VMAF skip; all listed outputs already scored");
+                return;
+            }
+            Some(unscored)
+        };
         let input = self.prefs.input_dir.clone();
         let output = self.prefs.output_dir.clone();
         let slots = self.prefs.check_vmaf_slots();
@@ -4953,8 +4996,8 @@ impl GigaMuxApp {
         self.event_rx = Some(rx);
         let label = only_name
             .as_deref()
-            .map(|n| format!("VMAF started — {n}"))
-            .unwrap_or_else(|| "VMAF started — all pairs".into());
+            .map(|n| format!("VMAF started {n}"))
+            .unwrap_or_else(|| "VMAF started; unscored pairs".into());
         self.push_session(label);
         self.encode_progress = None;
         thread::spawn(move || {
@@ -4964,7 +5007,7 @@ impl GigaMuxApp {
                 &output,
                 &slots,
                 only_name,
-                None,
+                only_outputs,
                 &cancel,
                 |ev| {
                     let _ = tx_ev.send(AppEvent::Vmaf(ev));
@@ -6883,7 +6926,7 @@ impl GigaMuxApp {
                             egui::Button::new("VMAF").min_size(egui::vec2(120.0, 28.0)),
                         )
                         .on_hover_text(
-                            "libvmaf all input→output pairs. Right-click a file for one pair; right-click this button to farm-VMAF unscored finals (tag `vmaf`). Esc cancels.",
+                            "libvmaf unscored pairs only (skips existing .vmaf.json / cached scores). Right-click a file for one pair; right-click this button to farm-VMAF unscored finals. Esc cancels.",
                         )
                         .on_disabled_hover_text(disabled_hint);
                     if vmaf.clicked() {

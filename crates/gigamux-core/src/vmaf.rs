@@ -1009,6 +1009,29 @@ pub fn run_vmaf(
             total: total_files,
             duration_s: *duration_s,
         });
+        // Durable skip: same `{out}.vmaf.json` as farm `ensure-vmaf` (no re-libvmaf).
+        let sidecar = vmaf_sidecar_path(out_path);
+        if let Some(sc) = read_vmaf_sidecar(&sidecar) {
+            ok += 1;
+            on_event(VmafEvent::Log(format!(
+                "VMAF {}/{}: {in_name} → {out_name} — skip (sidecar {:.4})",
+                i + 1,
+                total_files,
+                sc.score
+            )));
+            on_event(VmafEvent::FileDone {
+                name: in_name.clone(),
+                output: out_name.clone(),
+                score: sc.score,
+            });
+            report.results.push(VmafResult {
+                input: in_name.clone(),
+                output: out_name.clone(),
+                score: Some(sc.score),
+                error: None,
+            });
+            continue;
+        }
         on_event(VmafEvent::Log(format!(
             "VMAF {}/{}: {in_name} → {out_name}…",
             i + 1,
@@ -1024,6 +1047,20 @@ pub fn run_vmaf(
         }, ref_trim.as_ref()) {
             Ok(score) => {
                 ok += 1;
+                // Persist so local + farm agree on "already scored".
+                if let Err(e) = write_vmaf_sidecar(
+                    &sidecar,
+                    &VmafSidecar {
+                        version: 1,
+                        score,
+                        input: in_name.clone(),
+                        output: out_name.clone(),
+                    },
+                ) {
+                    on_event(VmafEvent::Log(format!(
+                        "VMAF {in_name}: scored {score:.4} but sidecar write failed: {e}"
+                    )));
+                }
                 on_event(VmafEvent::Log(format!("VMAF {in_name}: {score:.4}")));
                 on_event(VmafEvent::FileDone {
                     name: in_name.clone(),
