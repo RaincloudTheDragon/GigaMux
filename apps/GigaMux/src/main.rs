@@ -6607,11 +6607,16 @@ impl GigaMuxApp {
                         } else {
                             name.clone()
                         };
-                        // Codec (+ α) + chroma + CBR/VBR from preview cache; muted … while probing.
+                        // Codec (+ α) + chroma + CBR/VBR from preview cache; spinner in the rate slot until peeks finish.
                         let cache_key = Self::preview_key(side, &name);
+                        // Pending entry, or not yet inserted while a preview worker is still running.
+                        let cache_pending = match self.preview_cache.get(&cache_key) {
+                            Some(e) => e.pending,
+                            None => self.cache_rx.is_some() || self.lists_inflight,
+                        };
                         let tags = self.preview_cache.get(&cache_key).and_then(|e| {
                             if e.pending {
-                                return Some((None, false, None, None));
+                                return None;
                             }
                             e.summary.as_ref().and_then(|r| r.as_ref().ok()).map(|s| {
                                 let rate = if e.bitrates_ready {
@@ -6625,10 +6630,11 @@ impl GigaMuxApp {
                                     None
                                 };
                                 (
-                                    Some(codec_tag(s)),
+                                    codec_tag(s),
                                     s.has_alpha,
                                     pix_fmt_chip_tag(&s.pix_fmt),
                                     rate,
+                                    !e.bitrates_ready, // spinner where VBR/CBR will land
                                 )
                             })
                         });
@@ -6670,9 +6676,12 @@ impl GigaMuxApp {
                                 ui.selectable_label(selected, &row_label)
                                     .on_hover_text(&name)
                             };
+                            if cache_pending {
+                                ui.add(egui::Spinner::new().size(12.0))
+                                    .on_hover_text("Indexing…");
+                            }
                             match &tags {
-                                Some((None, _, _, _)) => codec_chip(ui, "…"),
-                                Some((Some(tag), has_alpha, chroma, rate)) => {
+                                Some((tag, has_alpha, chroma, rate, rate_pending)) => {
                                     codec_chip(ui, tag);
                                     if *has_alpha {
                                         alpha_chip(ui);
@@ -6682,6 +6691,9 @@ impl GigaMuxApp {
                                     }
                                     if let Some(r) = rate {
                                         rate_mode_chip(ui, r);
+                                    } else if *rate_pending {
+                                        ui.add(egui::Spinner::new().size(12.0))
+                                            .on_hover_text("Sampling bitrates…");
                                     }
                                 }
                                 None => {}
