@@ -7,6 +7,7 @@
 //! - `gigamux-check chunk <path> <expect_dur_secs>`
 //! - `gigamux-check final <input> <output> <opaque_video> <opaque_container> <alpha_video> <alpha_container>`
 //! - `gigamux-check cleanup <dir> <stem> <ext> <chunks>`
+//! - `gigamux-check mux-alpha-webm <color.ivf> <alpha.ivf> <out.webm> [range] [space] [primaries] [transfer]`
 //! - `gigamux-check farm-probe <out_dir>` (write `{host}.json` GPU/QSV/VMAF inventory)
 
 use std::env;
@@ -18,8 +19,10 @@ use gigamux_core::check::{
     ensure_out_file,
 };
 use gigamux_core::flamenco::{write_farm_probe_report, FarmFinalCheck};
+use gigamux_core::probe::VideoColorMeta;
 use gigamux_core::targets::{AlphaVideo, OutContainer, OpaqueVideo};
 use gigamux_core::vmaf::ensure_vmaf;
+use gigamux_core::webm_alpha::mux_vp9_alpha_webm;
 
 fn parse_opaque_video(s: &str) -> Result<OpaqueVideo, String> {
     match s.to_ascii_lowercase().as_str() {
@@ -53,7 +56,7 @@ fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let Some(cmd) = args.next() else {
         eprintln!(
-            "usage: gigamux-check ensure-chunk|ensure-out|ensure-vmaf|chunk|final|cleanup|farm-probe …"
+            "usage: gigamux-check ensure-chunk|ensure-out|ensure-vmaf|chunk|final|cleanup|mux-alpha-webm|farm-probe …"
         );
         return ExitCode::from(2);
     };
@@ -196,6 +199,45 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             cleanup_farm_intermediates(PathBuf::from(dir).as_path(), &stem, &ext, chunks)
+        }
+        "mux-alpha-webm" => {
+            let color = PathBuf::from(args.next().unwrap_or_default());
+            let alpha = PathBuf::from(args.next().unwrap_or_default());
+            let out = PathBuf::from(args.next().unwrap_or_default());
+            if color.as_os_str().is_empty()
+                || alpha.as_os_str().is_empty()
+                || out.as_os_str().is_empty()
+            {
+                eprintln!(
+                    "mux-alpha-webm: need <color.ivf> <alpha.ivf> <out.webm> [range] [space] [primaries] [transfer]"
+                );
+                return ExitCode::from(2);
+            }
+            // Optional colour tags (empty / "-" = omit); written into Matroska Colour.
+            fn opt_tag(s: Option<String>) -> Option<String> {
+                let t = s.unwrap_or_default().trim().to_string();
+                if t.is_empty() || t == "-" {
+                    None
+                } else {
+                    Some(t.to_ascii_lowercase())
+                }
+            }
+            let meta = VideoColorMeta {
+                range: opt_tag(args.next()),
+                space: opt_tag(args.next()),
+                primaries: opt_tag(args.next()),
+                transfer: opt_tag(args.next()),
+            };
+            match mux_vp9_alpha_webm(&color, &alpha, &out, &meta) {
+                Ok(()) => {
+                    println!("gigamux-check mux-alpha-webm: ok {}", out.display());
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("gigamux-check mux-alpha-webm: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         "farm-probe" => {
             let dir = args.next().unwrap_or_default();

@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 
 use crate::chunk::{
-    chunk_frame_range, estimate_total_frames, parse_chunk_filename, parse_fps,
+    chunk_deliver_stem, chunk_frame_range, estimate_total_frames, parse_chunk_filename, parse_fps,
 };
 use crate::probe::{file_info, video_has_alpha};
 use crate::targets::{pair_stem, OutputTargets, TestBatch};
@@ -17,7 +17,8 @@ const INPUT_EXTS: &[&str] = &[
     "mp4", "mkv", "mov", "webm", "m4v", "avi", "mpg", "mpeg", "m2v", "m2ts", "mts", "ts", "mxf",
     "ogv", "ogg", "wmv", "flv", "3gp", "3g2",
 ];
-const OUTPUT_EXTS: &[&str] = &["mp4", "webm", "mkv"];
+/// Deliver containers + farm hybrid IVF plane chunks (listed for chunk VMAF / Check).
+const OUTPUT_EXTS: &[&str] = &["mp4", "webm", "mkv", "ivf"];
 const STREAM_END_SLACK_S: f64 = 1.0;
 const STREAM_END_SLACK_FRAC: f64 = 0.002;
 /// Soft-WARN threshold for |video start − audio start| (Check Low; farm final does not hard-fail).
@@ -53,9 +54,22 @@ pub fn is_chunk_filename(name: &str) -> bool {
     crate::chunk::parse_chunk_filename(name).is_some()
 }
 
+/// Flat hybrid plane temps next to delivers (`{stem}.color.ivf`, `{stem}.alpha.ivf`, `{stem}.vmux.webm`).
+/// Not chunk-tagged; excluded from orphan Check / output pairing.
+pub fn is_hybrid_plane_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".color.ivf")
+        || lower.ends_with(".alpha.ivf")
+        || lower.ends_with(".vmux.webm")
+}
+
 /// Absolute duration slack for farm chunk expects (frame-split rounding).
-const CHUNK_DUR_SLACK_S: f64 = 0.25;
+/// Keep small: ±0.25s let stale IVF chunks (off by one frame) pass reuse and break concat/remux.
+const CHUNK_DUR_SLACK_S: f64 = 0.05;
 const CHUNK_DUR_SLACK_FRAC: f64 = 0.02;
+/// Allowed |got − expect| frame count when both sides are known (stale chunk reuse guard).
+/// Zero: a single extra frame per chunk survived ±50ms duration slack and broke IVF concat.
+const CHUNK_FRAME_SLACK: u64 = 0;
 
 /// Force ffmpeg overwrite (`-y`); replaces a leading `-n` if present.
 fn argv_force_overwrite(argv: &[String]) -> Vec<String> {
@@ -182,7 +196,10 @@ pub fn ensure_out_file(
     check_chunk_file(path, expect_dur_s)
 }
 
-/// Healthcheck one farm chunk file against its expected duration (video-only).
+/// Healthcheck one farm chunk / ensure-out file against expected **video** duration.
+///
+/// Uses video-stream duration (not container/format) so A/V delivers with longer audio do not fail.
+/// When `nb_frames` is present, also rejects stale chunks whose frame count disagrees with expect×fps.
 pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("chunk missing: {}", path.display()));
@@ -194,37 +211,52 @@ pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
     let Some(video) = first_video(&info) else {
         return Err(format!("chunk missing video stream: {}", path.display()));
     };
-    let declared = format_duration(&info).ok_or_else(|| {
-        format!("chunk missing duration: {}", path.display())
-    })?;
+    // Prefer bitstream length over container duration (audio can pad format tags).
+    let measured = video_stream_duration(&info)
+        .or_else(|| format_duration(&info))
+        .ok_or_else(|| format!("chunk missing duration: {}", path.display()))?;
     let slack = CHUNK_DUR_SLACK_S.max(expect_dur_s * CHUNK_DUR_SLACK_FRAC);
-    if (declared - expect_dur_s).abs() > slack {
+    if (measured - expect_dur_s).abs() > slack {
         return Err(format!(
-            "chunk duration mismatch: expect {expect_dur_s:.3}s, got {declared:.3}s ({})",
+            "chunk duration mismatch: expect {expect_dur_s:.3}s, got {measured:.3}s ({})",
             path.display()
         ));
     }
-    // Truncated containers: declared tags can lie while packets stop early.
-    if declared > 5.0 {
+    // Frame-accurate guard: one-frame stale IVFs pass a 50ms duration slack but break concat/remux.
+    if let (Some(fps), Some(got_frames)) = (probe_video_fps(&info), stream_nb_frames(video)) {
+        if fps > 0.0 {
+            let expect_frames = (expect_dur_s * fps).round().max(1.0) as u64;
+            let delta = expect_frames.abs_diff(got_frames);
+            if delta > CHUNK_FRAME_SLACK {
+                return Err(format!(
+                    "chunk frame count mismatch: expect ~{expect_frames} frames ({expect_dur_s:.3}s×{fps:.3}fps), got {got_frames} ({})",
+                    path.display()
+                ));
+            }
+        }
+    }
+    // Truncated containers: tags can lie while packets stop early — compare against video length / expect.
+    let end_ref = measured.min(expect_dur_s);
+    if end_ref > 5.0 {
         let codec = video
             .get("codec_name")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let (written, premature) = written_media_seconds(path, Some(declared), codec);
-        let end_slack = STREAM_END_SLACK_S.max(declared * STREAM_END_SLACK_FRAC);
+        let (written, premature) = written_media_seconds(path, Some(end_ref), codec);
+        let end_slack = STREAM_END_SLACK_S.max(end_ref * STREAM_END_SLACK_FRAC);
         match written {
             None if premature && codec.eq_ignore_ascii_case("av1") => {
                 // Same soft AV1 probe caveat as final check — do not fail the chunk.
             }
             None => {
                 return Err(format!(
-                    "Incomplete chunk: declared {declared:.2}s but no video packets readable ({})",
+                    "Incomplete chunk: declared {end_ref:.2}s but no video packets readable ({})",
                     path.display()
                 ));
             }
-            Some(w) if premature || w + end_slack < declared => {
+            Some(w) if premature || w + end_slack < end_ref => {
                 return Err(format!(
-                    "Incomplete chunk: declared {declared:.2}s but video ends at ~{w:.2}s ({})",
+                    "Incomplete chunk: declared {end_ref:.2}s but video ends at ~{w:.2}s ({})",
                     path.display()
                 ));
             }
@@ -254,7 +286,7 @@ pub fn check_output_pair(
     }
 }
 
-/// Delete farm intermediates for a stem (`*.cNNNofMMM.*`, `.ffconcat`, `.vcat.*`, `.vmux.mkv`). Permanent remove (shared storage).
+/// Delete farm intermediates for a stem (`*.cNNNofMMM.*`, `.ffconcat`, `.vcat.*`, `.vmux.*`, flat hybrid planes, legacy `{stem}.hybrid/`). Permanent remove (shared storage).
 pub fn cleanup_farm_intermediates(
     output_dir: &Path,
     stem: &str,
@@ -273,12 +305,35 @@ pub fn cleanup_farm_intermediates(
     if chunks > 0 {
         for i in 0..chunks {
             remove(output_dir.join(crate::chunk::chunk_output_name(stem, i, chunks, ext)));
+            // Hybrid alpha plane chunks sit next to the deliver (same stem, `.ivf`).
+            if !ext.eq_ignore_ascii_case("ivf") {
+                remove(output_dir.join(crate::chunk::chunk_output_name(stem, i, chunks, "ivf")));
+            }
+            // Optional multi-QSV color plane chunks: `{stem}.color.cNNNofMMM.ivf`.
+            remove(output_dir.join(crate::chunk::chunk_output_name(
+                &format!("{stem}.color"),
+                i,
+                chunks,
+                "ivf",
+            )));
         }
     }
     remove(output_dir.join(format!("{stem}.ffconcat")));
+    remove(output_dir.join(format!("{stem}.color.ffconcat")));
     remove(output_dir.join(format!("{stem}.vcat.{ext}")));
-    // Multi-audio MP4 staging (see farm mux MKV→final remux).
+    // Opaque multi-audio staging + hybrid video-only remux before audio mux.
     remove(output_dir.join(format!("{stem}.vmux.mkv")));
+    remove(output_dir.join(format!("{stem}.vmux.webm")));
+    // Flat hybrid color/alpha planes (concat targets or single-encode outputs).
+    remove(output_dir.join(format!("{stem}.color.ivf")));
+    remove(output_dir.join(format!("{stem}.alpha.ivf")));
+    // Legacy nested hybrid temp dir (pre-flat layout).
+    let hybrid_dir = output_dir.join(format!("{stem}.hybrid"));
+    if hybrid_dir.is_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&hybrid_dir) {
+            errors.push(format!("{}: {e}", hybrid_dir.display()));
+        }
+    }
     if errors.is_empty() {
         Ok(())
     } else {
@@ -322,10 +377,52 @@ fn first_video(info: &Value) -> Option<&Value> {
 }
 
 fn format_duration(info: &Value) -> Option<f64> {
-    info.pointer("/format/duration").and_then(|v| {
-        v.as_f64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    })
+    info.pointer("/format/duration").and_then(parse_ffprobe_duration)
+}
+
+/// Bare seconds or Matroska-style `HH:MM:SS.nnn` duration tags.
+fn parse_ffprobe_duration(v: &Value) -> Option<f64> {
+    if let Some(f) = v.as_f64() {
+        return Some(f).filter(|x| *x > 0.0);
+    }
+    let s = v.as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Some(f).filter(|x| *x > 0.0);
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: f64 = parts[0].parse().ok()?;
+    let m: f64 = parts[1].parse().ok()?;
+    let sec: f64 = parts[2].parse().ok()?;
+    let total = h * 3600.0 + m * 60.0 + sec;
+    Some(total).filter(|x| *x > 0.0)
+}
+
+/// Video bitstream length for farm chunk expects (ignore longer audio on the container).
+/// Prefer `nb_frames`/fps when present — WebM format duration follows the longest stream.
+fn video_stream_duration(info: &Value) -> Option<f64> {
+    let v = first_video(info)?;
+    if let (Some(fps), Some(n)) = (probe_video_fps(info), stream_nb_frames(v)) {
+        if fps > 0.0 {
+            return Some(n as f64 / fps);
+        }
+    }
+    if let Some(d) = v.get("duration").and_then(parse_ffprobe_duration) {
+        return Some(d);
+    }
+    if let Some(d) = v
+        .pointer("/tags/DURATION")
+        .or_else(|| v.pointer("/tags/duration"))
+        .and_then(parse_ffprobe_duration)
+    {
+        return Some(d);
+    }
+    format_duration(info)
 }
 
 fn probe_video_fps(info: &Value) -> Option<f64> {
@@ -350,7 +447,7 @@ fn probe_nb_frames(info: &Value) -> Option<u64> {
 /// Expected chunk duration from source probe + `{index,count}` (same split as farm encode).
 pub fn chunk_expect_dur_s(info: &Value, index: u32, count: u32) -> Result<f64, String> {
     let fps = probe_video_fps(info).ok_or_else(|| "cannot probe fps for chunk check".to_string())?;
-    let duration_s = format_duration(info).unwrap_or(0.0);
+    let duration_s = video_stream_duration(info).unwrap_or(0.0);
     let total = estimate_total_frames(duration_s, fps, probe_nb_frames(info))
         .ok_or_else(|| "cannot estimate frames for chunk check".to_string())?;
     let (_, frame_count) = chunk_frame_range(total, index, count)?;
@@ -494,13 +591,22 @@ fn check_pair_inner(
     output_info: &Value,
     targets: OutputTargets,
 ) -> Option<String> {
-    let input_duration = match format_duration(input_info) {
-        Some(d) => d,
-        None => return Some("Input missing duration".into()),
+    let input_format = format_duration(input_info);
+    let output_format = format_duration(output_info);
+    // Video bitstream length — container/format often tracks longer audio (hybrid `-shortest` trims to video).
+    let input_duration = video_stream_duration(input_info)
+        .or(input_format)
+        .ok_or_else(|| "Input missing duration".to_string());
+    let input_duration = match input_duration {
+        Ok(d) => d,
+        Err(e) => return Some(e),
     };
-    let output_duration = match format_duration(output_info) {
-        Some(d) => d,
-        None => return Some("Output missing duration".into()),
+    let output_duration = video_stream_duration(output_info)
+        .or(output_format)
+        .ok_or_else(|| "Output missing duration".to_string());
+    let output_duration = match output_duration {
+        Ok(d) => d,
+        Err(e) => return Some(e),
     };
 
     // WebM often copies full source duration into tags while clusters stop early.
@@ -669,6 +775,19 @@ fn check_pair_soft_warnings(input_info: &Value, output_info: &Value) -> Vec<Stri
             ));
         }
     }
+    // Container/format duration can track longer audio while video planes match (hybrid `-shortest`).
+    if let (Some(in_fmt), Some(out_fmt)) = (format_duration(input_info), format_duration(output_info)) {
+        let fmt_diff = (in_fmt - out_fmt).abs();
+        if fmt_diff > 0.1 {
+            let in_vid = video_stream_duration(input_info).unwrap_or(in_fmt);
+            let out_vid = video_stream_duration(output_info).unwrap_or(out_fmt);
+            if (in_vid - out_vid).abs() <= 0.1 {
+                out.push(format!(
+                    "A/V container skew: format In={in_fmt:.3}s Out={out_fmt:.3}s (video In={in_vid:.3}s Out={out_vid:.3}s)"
+                ));
+            }
+        }
+    }
     // A/V start skew (farm mux can leave ~44ms on Linux Matroska); WARN only so cleanup still runs.
     if let (Some(out_v), Some(out_a0)) = (
         streams_of_type(output_info, "video").into_iter().next(),
@@ -768,7 +887,10 @@ pub fn run_check(
     for outf in &output_files {
         // Strip testN_ so multi-slot outputs still pair to input stems.
         let stem = pair_stem(outf);
-        if !input_stems.contains(&stem) && !is_chunk_filename(outf) {
+        if !input_stems.contains(&stem)
+            && !is_chunk_filename(outf)
+            && !is_hybrid_plane_filename(outf)
+        {
             report.issues.push(CheckIssue {
                 input: None,
                 output: Some(outf.clone()),
@@ -782,6 +904,8 @@ pub fn run_check(
         let Some((stem, index, count, _)) = parse_chunk_filename(outf) else {
             continue;
         };
+        // Hybrid color plane chunks are `{stem}.color.cNNNofMMM.ivf` — pair to deliver stem.
+        let deliver = chunk_deliver_stem(&stem);
         let mut matched: Option<(String, &Value)> = None;
         for (inf, info) in &input_meta {
             let has_alpha = video_has_alpha(info);
@@ -795,7 +919,7 @@ pub fn run_check(
             if let Some(s) = Path::new(inf).file_stem().and_then(|s| s.to_str()) {
                 stems.insert(s.to_string());
             }
-            if stems.contains(&stem) {
+            if stems.contains(deliver) {
                 matched = Some((inf.clone(), info));
                 break;
             }
@@ -898,6 +1022,7 @@ pub fn check_issue_severity(issue: &CheckIssue) -> CheckSeverity {
         || issue.message.starts_with("AV1 output unreadable")
         || issue.message.starts_with("Bitrate floor:")
         || issue.message.starts_with("A/V start skew:")
+        || issue.message.starts_with("A/V container skew:")
     {
         CheckSeverity::Low
     } else if issue.message.starts_with("Missing from output") {
@@ -930,6 +1055,8 @@ pub fn check_issue_category(issue: &CheckIssue) -> &'static str {
         "Bitrate floor"
     } else if m.starts_with("A/V start skew") {
         "A/V start skew"
+    } else if m.starts_with("A/V container skew") {
+        "A/V container skew"
     } else if m.starts_with("Input probe") {
         "Input probe failed"
     } else if m.starts_with("Output file error") {
@@ -1109,11 +1236,13 @@ pub fn delete_issue_outputs(
 }
 
 /// List video filenames in a folder (non-recursive).
+/// Output side skips flat hybrid plane temps (chunks still listed for VMAF).
 pub fn list_media(dir: &Path, input_side: bool) -> Vec<PathBuf> {
     let exts = if input_side { INPUT_EXTS } else { OUTPUT_EXTS };
     list_named(dir, exts)
         .unwrap_or_default()
         .into_iter()
+        .filter(|n| input_side || !is_hybrid_plane_filename(n))
         .map(|n| dir.join(n))
         .collect()
 }
@@ -1145,11 +1274,27 @@ mod tests {
         fs::write(dir.join("clip.vcat.mp4"), b"x").unwrap();
         fs::write(dir.join("clip.vmux.mkv"), b"x").unwrap();
         fs::write(dir.join("clip.mp4"), b"keep").unwrap();
+        fs::write(dir.join("clip.c000of002.ivf"), b"x").unwrap();
+        fs::write(dir.join("clip.color.c001of002.ivf"), b"x").unwrap();
+        fs::write(dir.join("clip.color.ivf"), b"x").unwrap();
+        fs::write(dir.join("clip.alpha.ivf"), b"x").unwrap();
+        fs::write(dir.join("clip.vmux.webm"), b"x").unwrap();
+        fs::write(dir.join("clip.color.ffconcat"), b"x").unwrap();
+        let hybrid = dir.join("clip.hybrid");
+        fs::create_dir_all(&hybrid).unwrap();
+        fs::write(hybrid.join("color.ivf"), b"x").unwrap();
         cleanup_farm_intermediates(&dir, stem, ext, 2).unwrap();
         assert!(!dir.join("clip.c000of002.mp4").exists());
+        assert!(!dir.join("clip.c000of002.ivf").exists());
+        assert!(!dir.join("clip.color.c001of002.ivf").exists());
         assert!(!dir.join("clip.ffconcat").exists());
+        assert!(!dir.join("clip.color.ffconcat").exists());
         assert!(!dir.join("clip.vcat.mp4").exists());
         assert!(!dir.join("clip.vmux.mkv").exists());
+        assert!(!dir.join("clip.vmux.webm").exists());
+        assert!(!dir.join("clip.color.ivf").exists());
+        assert!(!dir.join("clip.alpha.ivf").exists());
+        assert!(!hybrid.exists());
         assert!(dir.join("clip.mp4").exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1158,7 +1303,12 @@ mod tests {
     fn chunk_filename_accepts_mkv() {
         assert!(is_chunk_filename("a.c000of003.mkv"));
         assert!(is_chunk_filename("a.c000of003.webm"));
+        assert!(is_chunk_filename("a.c000of003.ivf"));
         assert!(!is_chunk_filename("a.mp4"));
+        assert!(is_hybrid_plane_filename("clip.color.ivf"));
+        assert!(is_hybrid_plane_filename("clip.alpha.ivf"));
+        assert!(is_hybrid_plane_filename("clip.vmux.webm"));
+        assert!(!is_hybrid_plane_filename("clip.c000of002.ivf"));
     }
 
     #[test]

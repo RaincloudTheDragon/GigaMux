@@ -13,12 +13,18 @@ pub fn chunk_output_name(stem: &str, index: u32, count: u32, ext: &str) -> Strin
     format!("{stem}.c{index:03}of{count:03}.{ext}")
 }
 
+/// Map a parsed chunk stem to the deliver stem (`{stem}.color` hybrid QSV plane → `{stem}`).
+pub fn chunk_deliver_stem(stem: &str) -> &str {
+    stem.strip_suffix(".color").unwrap_or(stem)
+}
+
 /// Inverse of [`chunk_output_name`]: `(deliver_stem, index, count, ext)`.
 /// Stem is the final deliver basename without `.cNNNofMMM` — not `Path::file_stem()`, which keeps the chunk tag.
 pub fn parse_chunk_filename(name: &str) -> Option<(String, u32, u32, String)> {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"(?i)^(.+)\.c(\d{3})of(\d{3})\.(mp4|webm|mkv)$").expect("chunk name regex")
+        // IVF = farm hybrid alpha/color plane chunks (same stem.cNNNofMMM layout as opaque).
+        Regex::new(r"(?i)^(.+)\.c(\d{3})of(\d{3})\.(mp4|webm|mkv|ivf)$").expect("chunk name regex")
     });
     let caps = re.captures(name)?;
     let stem = caps.get(1)?.as_str().to_string();
@@ -183,6 +189,9 @@ mod tests {
         assert_eq!(chunk_output_name(&stem, index, count, &ext), name);
         assert!(parse_chunk_filename("sample.ts.mp4").is_none());
         assert!(parse_chunk_filename("sample.ts.c004of004.mp4").is_none());
+        let ivf = chunk_output_name("clip", 0, 2, "ivf");
+        let (s, i, c, e) = parse_chunk_filename(&ivf).expect("ivf chunk");
+        assert_eq!((s.as_str(), i, c, e.as_str()), ("clip", 0, 2, "ivf"));
     }
 
     #[test]

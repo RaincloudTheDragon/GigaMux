@@ -550,6 +550,128 @@ pub fn make_gigamux_chunked_job(
     })
 }
 
+/// QSV+libvpx alpha hybrid: per-task-type encodes → optional IVF concat → remux-alpha → audio → final.
+pub fn make_gigamux_hybrid_job(
+    name: impl Into<String>,
+    ffmpeg_exe: Option<&str>,
+    job: &crate::encode::FarmHybridJob,
+    twoway: Option<FlamencoTwoway<'_>>,
+    cancel_exec: CancelExecMode,
+    integrity: Option<FlamencoIntegrity>,
+) -> Result<SubmittedJob, String> {
+    if job.color_tasks.is_empty() || job.alpha_tasks.is_empty() {
+        return Err("hybrid job needs color and alpha encode tasks".into());
+    }
+    if job.video_expect_dur_s <= 0.0 {
+        return Err(format!(
+            "video_expect_dur_s must be > 0 (got {})",
+            job.video_expect_dur_s
+        ));
+    }
+    if job.out_expect_dur_s <= 0.0 {
+        return Err(format!(
+            "out_expect_dur_s must be > 0 (got {})",
+            job.out_expect_dur_s
+        ));
+    }
+    let exe = flamenco_exe(ffmpeg_exe);
+
+    fn rewrite_task(
+        t: &crate::encode::FarmHybridEncodeTask,
+        tw: Option<FlamencoTwoway<'_>>,
+    ) -> serde_json::Value {
+        let argv = rewrite_argv_twoway(&t.argv, tw);
+        let ensure = t.ensure.as_ref().map(|c| {
+            json!({
+                "path": rewrite_path_arg(&c.path, tw),
+                "expect_dur": c.expect_dur,
+            })
+        });
+        json!({
+            "name": t.name,
+            "task_type": t.task_type,
+            "argv": argv,
+            "ensure": ensure,
+        })
+    }
+
+    let color_tasks: Vec<_> = job
+        .color_tasks
+        .iter()
+        .map(|t| rewrite_task(t, twoway))
+        .collect();
+    let alpha_tasks: Vec<_> = job
+        .alpha_tasks
+        .iter()
+        .map(|t| rewrite_task(t, twoway))
+        .collect();
+    let color_concat = job
+        .color_concat_argv
+        .as_ref()
+        .map(|a| rewrite_argv_twoway(a, twoway));
+    let alpha_concat = job
+        .alpha_concat_argv
+        .as_ref()
+        .map(|a| rewrite_argv_twoway(a, twoway));
+    let remux_args: Vec<String> = job
+        .remux_check_args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            // Rewrite path args (color/alpha/out); leave command + colour tags alone.
+            if i >= 1 && i <= 3 {
+                rewrite_path_arg(a, twoway)
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    let audio_argv = rewrite_argv_twoway(&job.audio_argv, twoway);
+
+    let hybrid = json!({
+        "color_tasks": color_tasks,
+        "alpha_tasks": alpha_tasks,
+        "color_concat_argv": color_concat,
+        "alpha_concat_argv": alpha_concat,
+        "remux_check_args": remux_args,
+        "audio_argv": audio_argv,
+        "video_expect_dur": job.video_expect_dur_s,
+        "out_expect_dur": job.out_expect_dur_s,
+    });
+    let hybrid_json =
+        serde_json::to_string(&hybrid).map_err(|e| format!("serialize hybrid_json: {e}"))?;
+
+    let integ = rewrite_integrity_paths(integrity.unwrap_or_default(), twoway);
+    let (check_exe, chunk_checks_json, final_check_json, cleanup_json, vmaf_json) =
+        integrity_settings_json(&integ)?;
+
+    let settings = json!({
+        "ffmpeg_exe": exe,
+        "hybrid_json": hybrid_json,
+        "encode_argvs_json": "",
+        "ffmpeg_argv_json": "",
+        "concat_argv_json": "",
+        "mux_argv_json": "",
+        "mux_remux_argv_json": "",
+        "cancel_exec": cancel_exec.as_setting(),
+        "check_exe": check_exe,
+        "chunk_checks_json": chunk_checks_json,
+        "final_check_json": final_check_json,
+        "cleanup_json": cleanup_json,
+        "vmaf_json": vmaf_json,
+        "vmaf_pairs_json": "",
+        "encode_task_type": "qsv",
+    });
+    Ok(SubmittedJob {
+        name: name.into(),
+        job_type: "GigaMux".into(),
+        submitter_platform: "windows".into(),
+        priority: 50,
+        settings,
+        worker_tag: None,
+    })
+}
+
 /// VMAF-only Flamenco job (task_type `vmaf`, tagless): one `ensure-vmaf` task per pair.
 pub fn make_gigamux_vmaf_job(
     name: impl Into<String>,

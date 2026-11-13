@@ -2,6 +2,7 @@
 // Job type GigaMux: ffmpeg argv(s) from the GigaMux submitter.
 // Single file: encode task_type from settings → optional final-check (cpu) → optional trailing vmaf.
 // Chunked: N encode-c* → mux/remux/final-check (cpu) → optional vmaf.
+// Hybrid: hybrid_json → encode-color (qsv) + encode-alpha (cpu) → remux-alpha → audio → final.
 // VMAF-only: vmaf_pairs_json → ensure-vmaf tasks (task_type vmaf); jobs are tagless.
 // Farm-probe stays misc + gm-… pin tag (Probe Farm isolation only).
 // mux and remux are separate Flamenco tasks so remux soft-fail never re-runs the stage join.
@@ -122,6 +123,14 @@ const JOB_TYPE = {
             required: false,
             default: "",
             description: "When set: farm-probe only; gigamux-check farm-probe <dir> (no encode)",
+        },
+        {
+            key: "hybrid_json",
+            type: "string",
+            required: false,
+            default: "",
+            description:
+                "QSV+libvpx alpha hybrid graph JSON: color_tasks, alpha_tasks, optional concat argvs, remux_check_args, audio_argv, video_expect_dur, out_expect_dur",
         },
     ],
 };
@@ -286,6 +295,173 @@ function addEnsureVmaf(task, checkExe, exe, spec) {
     ]);
 }
 
+function addHybridEncodeTask(job, spec, exe, checkExe) {
+    if (!spec || typeof spec.name !== "string" || typeof spec.task_type !== "string") {
+        throw "GigaMux: hybrid encode task needs name + task_type";
+    }
+    if (!Array.isArray(spec.argv) || spec.argv.length === 0) {
+        throw "GigaMux: hybrid encode task " + spec.name + " needs argv";
+    }
+    const taskType = spec.task_type.trim().length > 0 ? spec.task_type.trim() : "cpu";
+    const task = author.Task(spec.name, taskType);
+    if (spec.ensure && typeof spec.ensure.path === "string" && typeof spec.ensure.expect_dur === "number") {
+        addCheckExec(task, checkExe, [
+            "ensure-chunk",
+            spec.ensure.path,
+            String(spec.ensure.expect_dur),
+            exe,
+            "--",
+        ].concat(spec.argv));
+    } else {
+        addFfmpegExec(task, exe, spec.argv);
+    }
+    job.addTask(task);
+    return task;
+}
+
+function compileHybridJob(job, settings, exe, checkExe, cancelMode, vmafAttached, hybridRaw) {
+    let hybrid;
+    try {
+        hybrid = JSON.parse(hybridRaw);
+    } catch (e) {
+        throw "GigaMux: hybrid_json: " + e;
+    }
+    if (!hybrid || !Array.isArray(hybrid.color_tasks) || !Array.isArray(hybrid.alpha_tasks)) {
+        throw "GigaMux: hybrid_json needs color_tasks + alpha_tasks arrays";
+    }
+    if (hybrid.color_tasks.length === 0 || hybrid.alpha_tasks.length === 0) {
+        throw "GigaMux: hybrid_json color/alpha tasks must be non-empty";
+    }
+    if (!Array.isArray(hybrid.remux_check_args) || hybrid.remux_check_args.length < 4) {
+        throw "GigaMux: hybrid_json remux_check_args needs mux-alpha-webm + 3 paths";
+    }
+    if (!Array.isArray(hybrid.audio_argv) || hybrid.audio_argv.length === 0) {
+        throw "GigaMux: hybrid_json audio_argv required";
+    }
+    // IVF concat is video-only; final audio mux may track longer source audio (container duration).
+    const videoExpectDur =
+        typeof hybrid.video_expect_dur === "number" && hybrid.video_expect_dur > 0
+            ? hybrid.video_expect_dur
+            : typeof hybrid.out_expect_dur === "number" && hybrid.out_expect_dur > 0
+              ? hybrid.out_expect_dur
+              : outExpectDur(settings, null);
+    print(
+        "GigaMux compileJob: hybrid color=",
+        hybrid.color_tasks.length,
+        " alpha=",
+        hybrid.alpha_tasks.length,
+        " cancel_exec=",
+        cancelMode,
+        " check_exe=",
+        checkExe
+    );
+    if (cancelMode === "legacy_stub") {
+        print("GigaMux: cancel_exec=legacy_stub — Windows cancel helper not shipped; using direct ffmpeg exec");
+    }
+
+    const colorTasks = [];
+    for (let i = 0; i < hybrid.color_tasks.length; i++) {
+        colorTasks.push(addHybridEncodeTask(job, hybrid.color_tasks[i], exe, checkExe));
+    }
+    const alphaTasks = [];
+    for (let i = 0; i < hybrid.alpha_tasks.length; i++) {
+        alphaTasks.push(addHybridEncodeTask(job, hybrid.alpha_tasks[i], exe, checkExe));
+    }
+
+    let colorReady = colorTasks;
+    if (Array.isArray(hybrid.color_concat_argv) && hybrid.color_concat_argv.length > 0) {
+        const concatTask = author.Task("concat-color", "cpu");
+        const outPath = argvOutputPath(hybrid.color_concat_argv);
+        addEnsureOut(concatTask, checkExe, exe, outPath, videoExpectDur, hybrid.color_concat_argv);
+        for (let i = 0; i < colorTasks.length; i++) {
+            concatTask.addDependency(colorTasks[i]);
+        }
+        job.addTask(concatTask);
+        colorReady = [concatTask];
+    }
+
+    let alphaReady = alphaTasks;
+    if (Array.isArray(hybrid.alpha_concat_argv) && hybrid.alpha_concat_argv.length > 0) {
+        const concatTask = author.Task("concat-alpha", "cpu");
+        const outPath = argvOutputPath(hybrid.alpha_concat_argv);
+        addEnsureOut(concatTask, checkExe, exe, outPath, videoExpectDur, hybrid.alpha_concat_argv);
+        for (let i = 0; i < alphaTasks.length; i++) {
+            concatTask.addDependency(alphaTasks[i]);
+        }
+        job.addTask(concatTask);
+        alphaReady = [concatTask];
+    }
+
+    const remuxTask = author.Task("remux-alpha", "cpu");
+    addCheckExec(remuxTask, checkExe, hybrid.remux_check_args);
+    for (let i = 0; i < colorReady.length; i++) {
+        remuxTask.addDependency(colorReady[i]);
+    }
+    for (let i = 0; i < alphaReady.length; i++) {
+        remuxTask.addDependency(alphaReady[i]);
+    }
+    job.addTask(remuxTask);
+
+    const audioOut = argvOutputPath(hybrid.audio_argv);
+    const audioTask = author.Task("audio", "cpu");
+    // Ensure against video length — container may still track longer source audio; final-check owns A/V skew.
+    addEnsureOut(audioTask, checkExe, exe, audioOut, videoExpectDur, hybrid.audio_argv);
+    audioTask.addDependency(remuxTask);
+    job.addTask(audioTask);
+
+    let gateTask = audioTask;
+    const finalCheckRaw =
+        typeof settings.final_check_json === "string" ? settings.final_check_json.trim() : "";
+    const cleanupRaw =
+        typeof settings.cleanup_json === "string" ? settings.cleanup_json.trim() : "";
+
+    if (finalCheckRaw.length > 0) {
+        let finalSpec;
+        try {
+            finalSpec = JSON.parse(finalCheckRaw);
+        } catch (e) {
+            throw "GigaMux: final_check_json: " + e;
+        }
+        const finalTask = author.Task("final-check", "cpu");
+        addCheckExec(finalTask, checkExe, [
+            "final",
+            finalSpec.input,
+            finalSpec.output,
+            finalSpec.opaque_video,
+            finalSpec.opaque_container,
+            finalSpec.alpha_video,
+            finalSpec.alpha_container,
+        ]);
+        if (cleanupRaw.length > 0) {
+            let cleanSpec;
+            try {
+                cleanSpec = JSON.parse(cleanupRaw);
+            } catch (e) {
+                throw "GigaMux: cleanup_json: " + e;
+            }
+            addCheckExec(finalTask, checkExe, [
+                "cleanup",
+                cleanSpec.dir,
+                cleanSpec.stem,
+                cleanSpec.ext,
+                String(cleanSpec.chunks),
+            ]);
+        }
+        finalTask.addDependency(gateTask);
+        job.addTask(finalTask);
+        gateTask = finalTask;
+    } else if (cleanupRaw.length > 0) {
+        throw "GigaMux: cleanup_json requires final_check_json (cleanup runs after successful final check)";
+    }
+
+    if (vmafAttached !== null) {
+        const vmafTask = author.Task("vmaf", "vmaf");
+        addEnsureVmaf(vmafTask, checkExe, exe, vmafAttached);
+        vmafTask.addDependency(gateTask);
+        job.addTask(vmafTask);
+    }
+}
+
 function compileJob(job) {
     const settings = job.settings;
     const exe = settings.ffmpeg_exe || "ffmpeg";
@@ -317,6 +493,14 @@ function compileJob(job) {
             addEnsureVmaf(task, checkExe, exe, vmafPairs[i]);
             job.addTask(task);
         }
+        return;
+    }
+
+    // QSV color + libvpx alpha hybrid (per-task types; Rust remux via gigamux-check).
+    const hybridRaw =
+        typeof settings.hybrid_json === "string" ? settings.hybrid_json.trim() : "";
+    if (hybridRaw.length > 0) {
+        compileHybridJob(job, settings, exe, checkExe, cancelMode, vmafAttached, hybridRaw);
         return;
     }
 

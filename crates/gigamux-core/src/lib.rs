@@ -23,9 +23,10 @@ pub use check::{
 };
 pub use chunk::{chunk_time_range, estimate_total_frames, parse_fps};
 pub use encode::{
-    build_farm_chunked_job, build_farm_ffmpeg_argv, farm_integrity_for_chunked,
-    farm_integrity_for_single, farm_vmaf_spec, run_batch, write_farm_ffconcat, EncodeEvent,
-    EncodeOptions, FarmChunkedJob, FarmEncodeRequest, FarmFfmpegCommand,
+    build_farm_chunked_job, build_farm_ffmpeg_argv, build_farm_hybrid_job, farm_integrity_for_chunked,
+    farm_integrity_for_hybrid, farm_integrity_for_single, farm_vmaf_spec, run_batch,
+    write_farm_ffconcat, write_farm_hybrid_ffconcats, EncodeEvent, EncodeOptions, FarmChunkedJob,
+    FarmEncodeRequest, FarmFfmpegCommand, FarmHybridEncodeTask, FarmHybridJob,
 };
 pub use ffmpeg_active::{active_ffmpeg_pid, kill_process_tree, ActiveFfmpegGuard};
 pub use flamenco::{
@@ -36,7 +37,8 @@ pub use flamenco::{
     fetch_worker_tag_ids, fetch_worker_tags, fetch_workers, flamenco_job_terminal,
     flamenco_script_hint, flamenco_worker_yaml, infer_twoway_local_prefix, is_gigamux_managed_tag,
     load_farm_probe_reports, local_gigamux_js_present, make_gigamux_chunked_job,
-    make_gigamux_encode_job, make_gigamux_probe_job, make_gigamux_vmaf_job, manager_web_url,
+    make_gigamux_encode_job, make_gigamux_hybrid_job, make_gigamux_probe_job, make_gigamux_vmaf_job,
+    manager_web_url,
     merge_farm_probe_dir, normalize_check_exe_path, nvenc_gen_tag_description, pick_log_task,
     pin_worker_for_probe, ping_manager, probe_pin_tag_name, recommend_task_types_from_farm_probe,
     recommended_task_types, resolve_flamenco_check_exe, resolve_worker_tag_uuid,
@@ -76,3 +78,4 @@ pub use vmaf::{
     ensure_vmaf, libvmaf_available, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path,
     write_vmaf_sidecar, VmafEvent, VmafReport, VmafResult, VmafSidecar,
 };
+pub use webm_alpha::wants_qsv_alpha_hybrid;

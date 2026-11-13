@@ -181,6 +181,9 @@ pub struct Prefs {
     /// When true, farm encode task types use `nvenc-{gen}` pins from Targets. When false, all NVENC maps to coarse `nvenc`. Default on.
     #[serde(default = "default_true")]
     pub flamenco_nvenc_gen_isolation: bool,
+    /// Hybrid only: when Chunk encode is on, also split QSV color IVF across workers. Default off (one QSV worker assumed).
+    #[serde(default)]
+    pub flamenco_chunk_qsv_color: bool,
 }
 
 fn default_flamenco_twoway_var() -> String {
@@ -223,6 +226,7 @@ impl Default for Prefs {
             flamenco_twoway_var: "shared_storage_path".into(),
             flamenco_farm_probe: crate::flamenco::FarmProbeInventory::default(),
             flamenco_nvenc_gen_isolation: true,
+            flamenco_chunk_qsv_color: false,
         }
     }
 }

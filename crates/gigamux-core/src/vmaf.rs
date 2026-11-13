@@ -15,10 +15,11 @@ use serde_json::Value;
 
 use crate::check::{check_chunk_file, is_chunk_filename, list_media};
 use crate::chunk::{
-    chunk_frame_range, estimate_total_frames, parse_chunk_filename, parse_fps, CHUNK_SEEK_PAD_S,
+    chunk_deliver_stem, chunk_frame_range, estimate_total_frames, parse_chunk_filename, parse_fps,
+    CHUNK_SEEK_PAD_S,
 };
 use crate::job_log::{JobLog, JobLogKind};
-use crate::probe::{file_info, video_has_alpha};
+use crate::probe::{file_info, video_codec_name, video_has_alpha};
 use crate::targets::{OutputTargets, TestBatch};
 
 /// Optional reference trim for chunk VMAF (distorted is already the chunk, PTS0).
@@ -181,26 +182,185 @@ pub fn ensure_vmaf(
     Ok(score)
 }
 
+/// How RGB relates to alpha when flattening onto black for VMAF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlphaAssociation {
+    /// RGB is independent of A — must `premultiply` before dropping alpha.
+    Straight,
+    /// RGB is already ×A (or zero under transparent) — dropping A is the black composite.
+    Premultiplied,
+}
+
+/// VP8/VP9 with alpha need libvpx; native decode drops the A plane and poisons VMAF.
+fn vmaf_alpha_decoder_prefix(info: &Value) -> Vec<String> {
+    if !video_has_alpha(info) {
+        return Vec::new();
+    }
+    match video_codec_name(info).as_str() {
+        "vp9" => vec!["-c:v".into(), "libvpx-vp9".into()],
+        "vp8" => vec!["-c:v".into(), "libvpx".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// Mean `signalstats` YAVG over a short head of the file (association probe).
+fn mean_yavg_sample(ffmpeg_exe: &str, path: &Path, info: &Value, vf: &str) -> Result<f64, String> {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-nostats".into(),
+        "-t".into(),
+        "0.5".into(),
+    ];
+    args.extend(vmaf_alpha_decoder_prefix(info));
+    args.extend([
+        "-i".into(),
+        path.to_string_lossy().into_owned(),
+        "-vf".into(),
+        format!("{vf},signalstats,metadata=print:key=lavfi.signalstats.YAVG"),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ]);
+    let out = Command::new(ffmpeg_exe)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("alpha assoc probe spawn: {e}"))?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    let mut vals = Vec::new();
+    for line in err.lines() {
+        if let Some(i) = line.find("YAVG=") {
+            let rest = &line[i + 5..];
+            let num: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e' || *c == 'E' || *c == '+')
+                .collect();
+            if let Ok(v) = num.parse::<f64>() {
+                vals.push(v);
+            }
+        }
+    }
+    if vals.is_empty() {
+        return Err(format!(
+            "alpha assoc probe: no YAVG from {} ({})",
+            path.display(),
+            if out.status.success() {
+                "empty"
+            } else {
+                "ffmpeg failed"
+            }
+        ));
+    }
+    Ok(vals.iter().sum::<f64>() / vals.len() as f64)
+}
+
+/// Detect straight vs premultiplied by whether `premultiply` removes substantial luminance.
+/// OBS α WebMs are often straight (bright RGB under low A); hybrid delivers are often already premul-like.
+fn probe_alpha_association(
+    ffmpeg_exe: &str,
+    path: &Path,
+    info: &Value,
+) -> Result<AlphaAssociation, String> {
+    if !video_has_alpha(info) {
+        return Ok(AlphaAssociation::Premultiplied);
+    }
+    let raw = mean_yavg_sample(ffmpeg_exe, path, info, "format=yuv420p")?;
+    let premul = mean_yavg_sample(
+        ffmpeg_exe,
+        path,
+        info,
+        "format=yuva420p,premultiply=inplace=1,format=yuv420p",
+    )?;
+    // Premultiply killing ≥15% of mean Y ⇒ RGB lived under low alpha ⇒ straight.
+    if raw > 1.0 && premul < raw * 0.85 {
+        Ok(AlphaAssociation::Straight)
+    } else {
+        Ok(AlphaAssociation::Premultiplied)
+    }
+}
+
+/// Flatten one α plane onto black for libvmaf — premul only when that side is straight.
+fn vmaf_plane_prep(stream: &str, trim: Option<&VmafRefTrim>, assoc: AlphaAssociation) -> String {
+    let body = match assoc {
+        AlphaAssociation::Straight => {
+            "format=yuva420p,premultiply=inplace=1,format=yuv420p,setpts=PTS-STARTPTS"
+        }
+        // Already ×A (or opaque): drop A; do not premul again (would double-darken soft edges).
+        AlphaAssociation::Premultiplied => "format=yuva420p,format=yuv420p,setpts=PTS-STARTPTS",
+    };
+    if let Some(tr) = trim {
+        let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
+        let pre_frame = tr.start_frame.saturating_sub(pad_frames);
+        let rel_start = tr.start_frame - pre_frame;
+        let rel_end = rel_start + tr.frame_count;
+        format!("{stream}trim=start_frame={rel_start}:end_frame={rel_end},{body}")
+    } else {
+        format!("{stream}{body}")
+    }
+}
+
+/// Opaque path: PTS align only. Alpha path: per-side association flatten onto black before libvmaf.
+fn vmaf_filter_complex(
+    threads: &str,
+    alpha: bool,
+    ref_trim: Option<&VmafRefTrim>,
+    ref_assoc: AlphaAssociation,
+    dist_assoc: AlphaAssociation,
+) -> String {
+    if alpha {
+        let ref_prep = vmaf_plane_prep("[0:v]", ref_trim, ref_assoc);
+        let dist_prep = vmaf_plane_prep("[1:v]", None, dist_assoc);
+        format!("{ref_prep}[ref];{dist_prep}[dist];[ref][dist]libvmaf=n_threads={threads}")
+    } else if let Some(tr) = ref_trim {
+        let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
+        let pre_frame = tr.start_frame.saturating_sub(pad_frames);
+        let rel_start = tr.start_frame - pre_frame;
+        let rel_end = rel_start + tr.frame_count;
+        format!(
+            "[0:v]trim=start_frame={rel_start}:end_frame={rel_end},setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
+        )
+    } else {
+        format!(
+            "[0:v]setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
+        )
+    }
+}
+
 /// Blocking libvmaf with a specific ffmpeg binary (no cancel / UI progress).
 fn run_vmaf_pair_exe(ffmpeg_exe: &str, reference: &Path, distorted: &Path) -> Result<f64, String> {
+    let ref_info = file_info(reference)?;
+    let dist_info = file_info(distorted)?;
+    let alpha = video_has_alpha(&ref_info) || video_has_alpha(&dist_info);
     let threads = n_threads().to_string();
-    let filter = format!(
-        "[0:v]setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
-    );
+    let (ref_assoc, dist_assoc) = if alpha {
+        (
+            probe_alpha_association(ffmpeg_exe, reference, &ref_info)?,
+            probe_alpha_association(ffmpeg_exe, distorted, &dist_info)?,
+        )
+    } else {
+        (
+            AlphaAssociation::Premultiplied,
+            AlphaAssociation::Premultiplied,
+        )
+    };
+    let filter = vmaf_filter_complex(&threads, alpha, None, ref_assoc, dist_assoc);
+    let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
+    args.extend(vmaf_alpha_decoder_prefix(&ref_info));
+    args.extend(["-i".into(), reference.to_string_lossy().into_owned()]);
+    args.extend(vmaf_alpha_decoder_prefix(&dist_info));
+    args.extend([
+        "-i".into(),
+        distorted.to_string_lossy().into_owned(),
+        "-filter_complex".into(),
+        filter,
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ]);
     let out = Command::new(ffmpeg_exe)
-        .args([
-            "-hide_banner",
-            "-nostats",
-            "-i",
-            &reference.to_string_lossy(),
-            "-i",
-            &distorted.to_string_lossy(),
-            "-filter_complex",
-            &filter,
-            "-f",
-            "null",
-            "-",
-        ])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -341,9 +501,12 @@ pub fn run_vmaf_pair(
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
+    let ref_info = file_info(reference)?;
+    let dist_info = file_info(distorted)?;
+    let alpha = video_has_alpha(&ref_info) || video_has_alpha(&dist_info);
     let threads = n_threads().to_string();
     // Chunk trim: same pad + frame trim as encode `ChunkTrim` (reference only; distorted already PTS0).
-    let (filter, seek_s, frames_v) = if let Some(tr) = ref_trim {
+    let (seek_s, frames_v) = if let Some(tr) = ref_trim {
         let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
         let pre_frame = tr.start_frame.saturating_sub(pad_frames);
         let seek_s = if pre_frame > 0 {
@@ -351,18 +514,35 @@ pub fn run_vmaf_pair(
         } else {
             None
         };
-        let rel_start = tr.start_frame - pre_frame;
-        let rel_end = rel_start + tr.frame_count;
-        let filter = format!(
-            "[0:v]trim=start_frame={rel_start}:end_frame={rel_end},setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
-        );
-        (filter, seek_s, Some(tr.frame_count))
+        (seek_s, Some(tr.frame_count))
     } else {
-        let filter = format!(
-            "[0:v]setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
-        );
-        (filter, None, None)
+        (None, None)
     };
+    // Probe each α side so OBS straight vs hybrid premul both flatten to the same black composite.
+    let (ref_assoc, dist_assoc) = if alpha {
+        on_update(
+            Some("VMAF: probing alpha association (straight vs premultiplied)…".into()),
+            None,
+        );
+        (
+            probe_alpha_association("ffmpeg", reference, &ref_info)?,
+            probe_alpha_association("ffmpeg", distorted, &dist_info)?,
+        )
+    } else {
+        (
+            AlphaAssociation::Premultiplied,
+            AlphaAssociation::Premultiplied,
+        )
+    };
+    if alpha {
+        on_update(
+            Some(format!(
+                "VMAF: alpha assoc ref={ref_assoc:?} dist={dist_assoc:?}"
+            )),
+            None,
+        );
+    }
+    let filter = vmaf_filter_complex(&threads, alpha, ref_trim, ref_assoc, dist_assoc);
 
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
@@ -373,9 +553,10 @@ pub fn run_vmaf_pair(
     if let Some(ss) = seek_s {
         args.extend(["-ss".into(), format!("{ss:.6}")]);
     }
+    args.extend(vmaf_alpha_decoder_prefix(&ref_info));
+    args.extend(["-i".into(), reference.to_string_lossy().into_owned()]);
+    args.extend(vmaf_alpha_decoder_prefix(&dist_info));
     args.extend([
-        "-i".into(),
-        reference.to_string_lossy().into_owned(),
         "-i".into(),
         distorted.to_string_lossy().into_owned(),
         "-filter_complex".into(),
@@ -660,13 +841,15 @@ fn resolve_pairs(
         let Some((stem, index, count, _)) = parse_chunk_filename(out_name) else {
             continue;
         };
+        // Hybrid `{stem}.color.cNNN…` pairs to the deliver stem for ref trim / ownership.
+        let deliver = chunk_deliver_stem(&stem).to_string();
         if let Some(only) = only_chunk {
             if only != out_name.as_str() {
                 continue;
             }
         } else if only_basename.is_some() {
             // Input/final selection: metas are already filtered; require deliver-stem ownership.
-            if !metas.iter().any(|m| m.deliver_stems.contains(&stem)) {
+            if !metas.iter().any(|m| m.deliver_stems.contains(&deliver)) {
                 continue;
             }
         }
@@ -675,7 +858,7 @@ fn resolve_pairs(
                 continue;
             }
         }
-        let Some(meta) = metas.iter().find(|m| m.deliver_stems.contains(&stem)) else {
+        let Some(meta) = metas.iter().find(|m| m.deliver_stems.contains(&deliver)) else {
             continue;
         };
         let (Some(total_frames), Some(fps)) = (meta.total_frames, meta.fps) else {
@@ -695,7 +878,7 @@ fn resolve_pairs(
             continue;
         }
         chunk_pairs.push((
-            stem,
+            deliver,
             index,
             (
                 meta.name.clone(),
@@ -900,5 +1083,53 @@ mod tests {
         let sc = read_vmaf_sidecar(&path).expect("read");
         assert!((sc.score - 97.5).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alpha_vmaf_filter_premultiplies_straight_only() {
+        // Straight → premul flatten; already-premul → drop A only (no second premul).
+        let both_straight = vmaf_filter_complex(
+            "4",
+            true,
+            None,
+            AlphaAssociation::Straight,
+            AlphaAssociation::Straight,
+        );
+        assert!(both_straight.contains("premultiply=inplace=1"), "{both_straight}");
+        let mixed = vmaf_filter_complex(
+            "4",
+            true,
+            None,
+            AlphaAssociation::Straight,
+            AlphaAssociation::Premultiplied,
+        );
+        // Ref (straight) premuls; dist (premul) only drops A.
+        assert!(mixed.starts_with("[0:v]format=yuva420p,premultiply=inplace=1"), "{mixed}");
+        assert!(
+            mixed.contains("[1:v]format=yuva420p,format=yuv420p,setpts=PTS-STARTPTS[dist]"),
+            "{mixed}"
+        );
+        assert!(mixed.contains("libvmaf=n_threads=4"), "{mixed}");
+        let opaque = vmaf_filter_complex(
+            "4",
+            false,
+            None,
+            AlphaAssociation::Premultiplied,
+            AlphaAssociation::Premultiplied,
+        );
+        assert!(!opaque.contains("premultiply"), "{opaque}");
+    }
+
+    #[test]
+    fn vp9_alpha_uses_libvpx_decoder_prefix() {
+        let info = serde_json::json!({
+            "streams": [{
+                "codec_type": "video",
+                "codec_name": "vp9",
+                "pix_fmt": "yuva420p",
+            }]
+        });
+        let prefix = vmaf_alpha_decoder_prefix(&info);
+        assert_eq!(prefix, vec!["-c:v".to_string(), "libvpx-vp9".to_string()]);
     }
 }

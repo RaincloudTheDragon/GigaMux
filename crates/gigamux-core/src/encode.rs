@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::chunk::{
-    chunk_frame_range, estimate_total_frames, list_chunk_paths, parse_fps, write_ffconcat,
-    CHUNK_SEEK_PAD_S,
+    chunk_frame_range, chunk_output_name, estimate_total_frames, list_chunk_paths,
+    parse_chunk_filename, parse_fps, write_ffconcat, CHUNK_SEEK_PAD_S,
 };
 use crate::flamenco::{FarmChunkCheck, FarmCleanup, FarmFinalCheck, FarmVmafSpec, FlamencoIntegrity};
 use crate::vmaf::vmaf_sidecar_path;
@@ -123,8 +123,10 @@ pub struct FarmEncodeRequest {
     pub slot: EncodeSlot,
     /// `None` = normal deliver name; `Some` = `test1_` / `test2_` prefix.
     pub test_batch: Option<TestBatch>,
-    /// `1` = single full encode; `>1` = frame-chunked farm graph.
+    /// `1` = single full encode; `>1` = frame-chunked farm graph (alpha / software; opaque HW may ignore).
     pub chunks: u32,
+    /// Hybrid only: when true and `chunks > 1`, also split the QSV color IVF across workers.
+    pub chunk_qsv_color: bool,
 }
 
 /// ffmpeg argv for a Flamenco `misc`/`exec` task (`argv[0]` is the program name).
@@ -152,6 +154,40 @@ pub struct FarmChunkedJob {
     /// Written by the submitter onto shared storage before POST.
     pub ffconcat_path: PathBuf,
     pub chunk_durations_s: Vec<f64>,
+    pub bitrate_k: u32,
+    pub bitrate_label: String,
+}
+
+/// One encode stage in a farm QSV+libvpx alpha hybrid job.
+#[derive(Debug, Clone)]
+pub struct FarmHybridEncodeTask {
+    pub name: String,
+    pub task_type: String,
+    pub argv: Vec<String>,
+    /// When set, task uses `ensure-chunk` (path + expect_dur).
+    pub ensure: Option<FarmChunkCheck>,
+}
+
+/// Farm QSV color + libvpx alpha → Rust remux → audio deliver.
+/// Intermediates sit flat in the output dir (opaque-style `{stem}.cNNNofMMM.ivf` for alpha chunks).
+#[derive(Debug, Clone)]
+pub struct FarmHybridJob {
+    pub final_output: PathBuf,
+    pub color_tasks: Vec<FarmHybridEncodeTask>,
+    pub alpha_tasks: Vec<FarmHybridEncodeTask>,
+    /// ffmpeg concat demuxer → single `{stem}.color.ivf` (when color was chunked).
+    pub color_concat_argv: Option<Vec<String>>,
+    /// ffmpeg concat demuxer → single `{stem}.alpha.ivf` (when alpha was chunked).
+    pub alpha_concat_argv: Option<Vec<String>>,
+    /// ffconcat lists the submitter must write before POST.
+    pub ffconcat_paths: Vec<(PathBuf, Vec<PathBuf>, Vec<f64>)>,
+    /// `gigamux-check` args: `mux-alpha-webm` + paths + optional colour tags.
+    pub remux_check_args: Vec<String>,
+    pub audio_argv: Vec<String>,
+    /// Video-only expect (IVF concat `ensure-out`); ignores longer audio on the source.
+    pub video_expect_dur_s: f64,
+    /// Container/format expect for the final audio mux deliver (may include A/V skew).
+    pub out_expect_dur_s: f64,
     pub bitrate_k: u32,
     pub bitrate_label: String,
 }
@@ -433,6 +469,7 @@ fn build_hybrid_audio_argv(
     info: &serde_json::Value,
     output: &Path,
     preserve_obs: bool,
+    color_meta: &VideoColorMeta,
 ) -> Vec<String> {
     let mut cmd = vec![
         "ffmpeg".into(),
@@ -476,6 +513,10 @@ fn build_hybrid_audio_argv(
             "1".into(),
         ]);
     }
+    // Lavf `-c:v copy` drops Matroska Colour from the Rust remux; re-stamp source range/matrix.
+    append_color_meta_args(&mut cmd, color_meta);
+    // End with the video plane; source audio is often slightly longer; leaving it pads format duration and makes ensure-out (video expect) fail even when the VP9 bitstream is complete.
+    cmd.push("-shortest".into());
     cmd.push("-avoid_negative_ts".into());
     cmd.push("make_zero".into());
     cmd.push(output.to_string_lossy().into_owned());
@@ -530,7 +571,8 @@ fn run_qsv_alpha_hybrid(
         return Err(format!("hybrid remux: {e}"));
     }
 
-    let audio_argv = build_hybrid_audio_argv(&video_webm, input, info, output, preserve_obs);
+    let audio_argv =
+        build_hybrid_audio_argv(&video_webm, input, info, output, preserve_obs, &color_meta);
     on_line("hybrid: mux audio".into(), None);
     if let Err(e) = run_ffmpeg(&audio_argv, cancel, &mut on_line) {
         cleanup(&tmp);
@@ -969,12 +1011,56 @@ fn run_ffmpeg(
 
 fn format_duration_s(info: &serde_json::Value) -> f64 {
     info.pointer("/format/duration")
-        .and_then(|v| {
-            v.as_f64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        })
+        .and_then(parse_ffprobe_duration)
         .unwrap_or(0.0)
         .max(0.0)
+}
+
+/// Parse ffprobe duration: bare seconds, or Matroska-style `HH:MM:SS.nnn` tags.
+fn parse_ffprobe_duration(v: &serde_json::Value) -> Option<f64> {
+    if let Some(f) = v.as_f64() {
+        return Some(f).filter(|x| *x > 0.0);
+    }
+    let s = v.as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Some(f).filter(|x| *x > 0.0);
+    }
+    // `00:00:05.817000000` (stream/format tags.DURATION).
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: f64 = parts[0].parse().ok()?;
+    let m: f64 = parts[1].parse().ok()?;
+    let sec: f64 = parts[2].parse().ok()?;
+    let total = h * 3600.0 + m * 60.0 + sec;
+    Some(total).filter(|x| *x > 0.0)
+}
+
+/// Video bitstream length for video-only farm expects (`ensure-chunk` / IVF concat).
+/// Prefers `nb_frames`/fps, then stream duration tags, not container duration (often audio-led).
+fn video_stream_duration_s(info: &serde_json::Value) -> f64 {
+    if let Some(v) = first_video_stream(info) {
+        if let (Some(fps), Some(n)) = (probe_video_fps(info), probe_nb_frames(info)) {
+            if fps > 0.0 {
+                return n as f64 / fps;
+            }
+        }
+        if let Some(d) = v.get("duration").and_then(parse_ffprobe_duration) {
+            return d;
+        }
+        if let Some(d) = v
+            .pointer("/tags/DURATION")
+            .or_else(|| v.pointer("/tags/duration"))
+            .and_then(parse_ffprobe_duration)
+        {
+            return d;
+        }
+    }
+    format_duration_s(info)
 }
 
 /// Encode all matching files in `opts.input_dir` into `opts.output_dir` sequentially.
@@ -1395,7 +1481,7 @@ fn farm_argv_never_overwrite(argv: &mut [String]) {
 
 /// Build a single-file ffmpeg argv for Flamenco (same flags as local encode).
 /// Uses `-n` instead of `-y` so an existing deliver is never replaced on the worker.
-/// Refuses QSV+libvpx alpha hybrid (multi-process locally; not a single `exec` yet).
+/// QSV+libvpx alpha hybrid must use [`build_farm_hybrid_job`] instead.
 pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegCommand, String> {
     if !req.input.is_file() {
         return Err(format!("input not found: {}", req.input.display()));
@@ -1412,8 +1498,7 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         req.slot.alpha_container == OutContainer::Webm,
     ) {
         return Err(
-            "Flamenco v0 cannot run QSV+libvpx alpha hybrid (multi-ffmpeg); turn off hardware for alpha or encode opaque"
-                .into(),
+            "QSV+libvpx alpha hybrid needs build_farm_hybrid_job (not a single encode argv)".into(),
         );
     }
     let container = req.slot.container_for(has_alpha);
@@ -1515,12 +1600,12 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
         req.slot.alpha_container == OutContainer::Webm,
     ) {
         return Err(
-            "Flamenco chunking cannot run QSV+libvpx alpha hybrid; turn off hardware for alpha or encode opaque"
-                .into(),
+            "QSV+libvpx alpha hybrid needs build_farm_hybrid_job (not opaque chunk graph)".into(),
         );
     }
     let fps = probe_video_fps(&info).ok_or_else(|| "cannot probe video fps for chunking".to_string())?;
-    let duration_s = format_duration_s(&info);
+    // Frame split from video length; container duration can track longer audio and inflate expects.
+    let duration_s = video_stream_duration_s(&info);
     let total_frames = estimate_total_frames(duration_s, fps, probe_nb_frames(&info))
         .ok_or_else(|| "cannot estimate frame count for chunking".to_string())?;
     let container = req.slot.container_for(has_alpha);
@@ -1744,6 +1829,517 @@ pub fn write_farm_ffconcat(job: &FarmChunkedJob) -> Result<(), String> {
     write_ffconcat(&job.chunk_paths, &job.chunk_durations_s, &job.ffconcat_path)
 }
 
+/// Write hybrid IVF concat lists (call before submit).
+pub fn write_farm_hybrid_ffconcats(job: &FarmHybridJob) -> Result<(), String> {
+    for (list_path, paths, durs) in &job.ffconcat_paths {
+        write_ffconcat(paths, durs, list_path)?;
+    }
+    Ok(())
+}
+
+fn build_hybrid_color_argv_impl(
+    input: &Path,
+    info: &serde_json::Value,
+    color_ivf: &Path,
+    bitrate_k: u32,
+    color_meta: &VideoColorMeta,
+    chunk: Option<ChunkTrim>,
+    // Cap output frames so split color/alpha farm encodes stay remux-aligned.
+    frames_v: Option<u64>,
+) -> Vec<String> {
+    let ceiling = format!("{bitrate_k}k");
+    let bufsize = format!("{}k", bitrate_k * 2);
+    let mut cmd = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-stats".into(),
+        "-stats_period".into(),
+        "1.0".into(),
+        "-y".into(),
+        "-init_hw_device".into(),
+        "qsv=hw".into(),
+    ];
+    let vcodec = video_codec_name(info);
+    if vcodec == "vp9" || vcodec == "vp8" {
+        cmd.push("-c:v".into());
+        cmd.push(if vcodec == "vp9" {
+            "libvpx-vp9".into()
+        } else {
+            "libvpx".into()
+        });
+    }
+    let sp = setparams_color_filter(color_meta);
+    let filter = if let Some(tr) = chunk {
+        let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
+        let pre_frame = tr.start_frame.saturating_sub(pad_frames);
+        if pre_frame > 0 {
+            cmd.extend(["-ss".into(), format!("{:.6}", pre_frame as f64 / tr.fps)]);
+        }
+        cmd.push("-i".into());
+        cmd.push(input.to_string_lossy().into_owned());
+        let rel_start = tr.start_frame - pre_frame;
+        let rel_end = rel_start + tr.frame_count;
+        format!(
+            "[0:v]trim=start_frame={rel_start}:end_frame={rel_end},setpts=PTS-STARTPTS,format=yuva420p,format=nv12{sp}[c]"
+        )
+    } else {
+        cmd.push("-i".into());
+        cmd.push(input.to_string_lossy().into_owned());
+        format!("[0:v]format=yuva420p,format=nv12{sp}[c]")
+    };
+    cmd.extend([
+        "-filter_complex".into(),
+        filter,
+        "-map".into(),
+        "[c]".into(),
+        "-an".into(),
+    ]);
+    append_vp9_qsv_args(&mut cmd, "nv12", &ceiling, &bufsize);
+    append_color_meta_args(&mut cmd, color_meta);
+    if let Some(n) = frames_v.filter(|&n| n > 0) {
+        cmd.extend(["-frames:v".into(), n.to_string()]);
+    }
+    cmd.push(color_ivf.to_string_lossy().into_owned());
+    farm_argv_never_overwrite(&mut cmd);
+    cmd
+}
+
+fn build_hybrid_alpha_argv_impl(
+    input: &Path,
+    info: &serde_json::Value,
+    alpha_ivf: &Path,
+    bitrate_k: u32,
+    cq: u32,
+    color_meta: &VideoColorMeta,
+    chunk: Option<ChunkTrim>,
+    frames_v: Option<u64>,
+) -> Vec<String> {
+    let ceiling = format!("{bitrate_k}k");
+    let bufsize = format!("{}k", bitrate_k * 2);
+    let mut cmd = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-stats".into(),
+        "-stats_period".into(),
+        "1.0".into(),
+        "-y".into(),
+    ];
+    let vcodec = video_codec_name(info);
+    if vcodec == "vp9" || vcodec == "vp8" {
+        cmd.push("-c:v".into());
+        cmd.push(if vcodec == "vp9" {
+            "libvpx-vp9".into()
+        } else {
+            "libvpx".into()
+        });
+    }
+    let sp = setparams_color_filter(color_meta);
+    let filter = if let Some(tr) = chunk {
+        let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
+        let pre_frame = tr.start_frame.saturating_sub(pad_frames);
+        if pre_frame > 0 {
+            cmd.extend(["-ss".into(), format!("{:.6}", pre_frame as f64 / tr.fps)]);
+        }
+        cmd.push("-i".into());
+        cmd.push(input.to_string_lossy().into_owned());
+        let rel_start = tr.start_frame - pre_frame;
+        let rel_end = rel_start + tr.frame_count;
+        format!(
+            "[0:v]trim=start_frame={rel_start}:end_frame={rel_end},setpts=PTS-STARTPTS,format=yuva420p,alphaextract,format=yuv420p{sp}[a]"
+        )
+    } else {
+        cmd.push("-i".into());
+        cmd.push(input.to_string_lossy().into_owned());
+        format!("[0:v]format=yuva420p,alphaextract,format=yuv420p{sp}[a]")
+    };
+    cmd.extend([
+        "-filter_complex".into(),
+        filter,
+        "-map".into(),
+        "[a]".into(),
+        "-an".into(),
+        "-c:v".into(),
+        "libvpx-vp9".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-auto-alt-ref".into(),
+        "0".into(),
+        "-deadline".into(),
+        "good".into(),
+        "-cpu-used".into(),
+        "0".into(),
+        "-threads".into(),
+        "0".into(),
+        "-tile-columns".into(),
+        "2".into(),
+        "-tile-rows".into(),
+        "1".into(),
+        "-lag-in-frames".into(),
+        "25".into(),
+        "-row-mt".into(),
+        "1".into(),
+        "-g".into(),
+        "60".into(),
+        "-keyint_min".into(),
+        "60".into(),
+        "-crf".into(),
+        cq.to_string(),
+        "-b:v".into(),
+        ceiling.clone(),
+        "-maxrate".into(),
+        ceiling,
+        "-bufsize".into(),
+        bufsize,
+    ]);
+    append_color_meta_args(&mut cmd, color_meta);
+    if let Some(n) = frames_v.filter(|&n| n > 0) {
+        cmd.extend(["-frames:v".into(), n.to_string()]);
+    }
+    cmd.push(alpha_ivf.to_string_lossy().into_owned());
+    farm_argv_never_overwrite(&mut cmd);
+    cmd
+}
+
+fn ivf_concat_argv(ffconcat: &Path, out_ivf: &Path) -> Vec<String> {
+    let mut cmd = vec![
+        "ffmpeg".into(),
+        "-v".into(),
+        "info".into(),
+        "-y".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        ffconcat.to_string_lossy().into_owned(),
+        "-c".into(),
+        "copy".into(),
+        out_ivf.to_string_lossy().into_owned(),
+    ];
+    farm_argv_never_overwrite(&mut cmd);
+    cmd
+}
+
+fn color_meta_check_tags(meta: &VideoColorMeta) -> [String; 4] {
+    [
+        meta.range.clone().unwrap_or_else(|| "-".into()),
+        meta.space.clone().unwrap_or_else(|| "-".into()),
+        meta.primaries.clone().unwrap_or_else(|| "-".into()),
+        meta.transfer.clone().unwrap_or_else(|| "-".into()),
+    ]
+}
+
+/// Build a farm QSV+libvpx alpha hybrid job (chunkless color by default; optional color chunks).
+pub fn build_farm_hybrid_job(req: &FarmEncodeRequest) -> Result<FarmHybridJob, String> {
+    if !req.input.is_file() {
+        return Err(format!("input not found: {}", req.input.display()));
+    }
+    if !req.output_dir.is_dir() {
+        return Err(format!("output dir not found: {}", req.output_dir.display()));
+    }
+    let info = file_info(&req.input)?;
+    let has_alpha = video_has_alpha(&info);
+    if !wants_qsv_alpha_hybrid(
+        req.slot.use_hardware,
+        has_alpha,
+        req.slot.alpha_video == AlphaVideo::Vp9,
+        req.slot.alpha_container == OutContainer::Webm,
+    ) {
+        return Err("build_farm_hybrid_job: slot/input is not QSV+libvpx alpha hybrid".into());
+    }
+    let container = OutContainer::Webm;
+    let final_output = deliver_path(&req.input, &req.output_dir, container, req.test_batch);
+    let stem = final_output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out")
+        .to_string();
+    // Drop stale flat IVF / plane temps (and legacy `{stem}.hybrid/`) so ensure-chunk `-n` cannot reuse wrong splits.
+    clear_flat_hybrid_temps(&req.output_dir, &stem)?;
+
+    let (auto_k, auto_label) = video_ceiling_k(&req.input, &info, req.use_peak_bitrate);
+    let (bitrate_k, bitrate_label) = match req.slot.maxrate_override_k.filter(|&k| k > 0) {
+        Some(k) => (k, format!("override {k}k (auto {auto_k}k / {auto_label})")),
+        None => (auto_k, auto_label),
+    };
+    let cq = req.slot.cq_override.unwrap_or(0);
+    let color_meta = video_color_meta(&info);
+    // IVF / concat expects track the video stream; final audio mux uses container duration (audio may be longer).
+    let video_dur = video_stream_duration_s(&info);
+    let format_dur = format_duration_s(&info);
+
+    let alpha_chunks = req.chunks.max(1);
+    let color_chunks = if req.chunk_qsv_color && alpha_chunks > 1 {
+        alpha_chunks
+    } else {
+        1
+    };
+
+    // Always probe frames so split color/alpha encodes get matching `-frames:v` (remux requires equal IVF counts).
+    let fps = probe_video_fps(&info);
+    let total_frames = fps.and_then(|f| estimate_total_frames(video_dur, f, probe_nb_frames(&info)));
+    if (alpha_chunks > 1 || color_chunks > 1) && (fps.is_none() || total_frames.is_none()) {
+        return Err("cannot probe fps/frames for hybrid chunking".into());
+    }
+
+    // Same layout as opaque chunks: planes + chunk IVFs sit next to the deliver in output_dir.
+    let color_ivf = req.output_dir.join(format!("{stem}.color.ivf"));
+    let alpha_ivf = req.output_dir.join(format!("{stem}.alpha.ivf"));
+    let video_webm = req.output_dir.join(format!("{stem}.vmux.webm"));
+
+    let mut ffconcat_paths = Vec::new();
+    let mut color_tasks = Vec::new();
+    let mut color_concat_argv = None;
+    if color_chunks == 1 {
+        let argv = build_hybrid_color_argv_impl(
+            &req.input,
+            &info,
+            &color_ivf,
+            bitrate_k,
+            &color_meta,
+            None,
+            total_frames,
+        );
+        color_tasks.push(FarmHybridEncodeTask {
+            name: "encode-color".into(),
+            task_type: "qsv".into(),
+            argv,
+            ensure: Some(FarmChunkCheck {
+                path: path_string(&color_ivf),
+                expect_dur: video_dur,
+            }),
+        });
+    } else {
+        let fps = fps.unwrap();
+        let total_frames = total_frames.unwrap();
+        let mut chunk_paths = Vec::new();
+        let mut chunk_durs = Vec::new();
+        let color_stem = format!("{stem}.color");
+        for i in 0..color_chunks {
+            let (start_frame, frame_count) = chunk_frame_range(total_frames, i, color_chunks)?;
+            let dur = frame_count as f64 / fps;
+            chunk_durs.push(dur);
+            let out = req
+                .output_dir
+                .join(chunk_output_name(&color_stem, i, color_chunks, "ivf"));
+            let argv = build_hybrid_color_argv_impl(
+                &req.input,
+                &info,
+                &out,
+                bitrate_k,
+                &color_meta,
+                Some(ChunkTrim {
+                    start_frame,
+                    frame_count,
+                    fps,
+                }),
+                Some(frame_count),
+            );
+            color_tasks.push(FarmHybridEncodeTask {
+                name: format!("encode-color-c{i}"),
+                task_type: "qsv".into(),
+                argv,
+                ensure: Some(FarmChunkCheck {
+                    path: path_string(&out),
+                    expect_dur: dur,
+                }),
+            });
+            chunk_paths.push(out);
+        }
+        let list = req.output_dir.join(format!("{stem}.color.ffconcat"));
+        color_concat_argv = Some(ivf_concat_argv(&list, &color_ivf));
+        ffconcat_paths.push((list, chunk_paths, chunk_durs));
+    }
+
+    let mut alpha_tasks = Vec::new();
+    let mut alpha_concat_argv = None;
+    if alpha_chunks == 1 {
+        let argv = build_hybrid_alpha_argv_impl(
+            &req.input,
+            &info,
+            &alpha_ivf,
+            bitrate_k,
+            cq,
+            &color_meta,
+            None,
+            total_frames,
+        );
+        alpha_tasks.push(FarmHybridEncodeTask {
+            name: "encode-alpha".into(),
+            task_type: "cpu".into(),
+            argv,
+            ensure: Some(FarmChunkCheck {
+                path: path_string(&alpha_ivf),
+                expect_dur: video_dur,
+            }),
+        });
+    } else {
+        let fps = fps.unwrap();
+        let total_frames = total_frames.unwrap();
+        let mut chunk_paths = Vec::new();
+        let mut chunk_durs = Vec::new();
+        for i in 0..alpha_chunks {
+            let (start_frame, frame_count) = chunk_frame_range(total_frames, i, alpha_chunks)?;
+            let dur = frame_count as f64 / fps;
+            chunk_durs.push(dur);
+            // Deliver stem + opaque-style chunk tag → chunk VMAF / Check discover these like webm chunks.
+            let out = req
+                .output_dir
+                .join(chunk_output_name(&stem, i, alpha_chunks, "ivf"));
+            let argv = build_hybrid_alpha_argv_impl(
+                &req.input,
+                &info,
+                &out,
+                bitrate_k,
+                cq,
+                &color_meta,
+                Some(ChunkTrim {
+                    start_frame,
+                    frame_count,
+                    fps,
+                }),
+                Some(frame_count),
+            );
+            alpha_tasks.push(FarmHybridEncodeTask {
+                name: format!("encode-alpha-c{i}"),
+                task_type: "cpu".into(),
+                argv,
+                ensure: Some(FarmChunkCheck {
+                    path: path_string(&out),
+                    expect_dur: dur,
+                }),
+            });
+            chunk_paths.push(out);
+        }
+        let list = req.output_dir.join(format!("{stem}.ffconcat"));
+        alpha_concat_argv = Some(ivf_concat_argv(&list, &alpha_ivf));
+        ffconcat_paths.push((list, chunk_paths, chunk_durs));
+    }
+
+    let tags = color_meta_check_tags(&color_meta);
+    let remux_check_args = vec![
+        "mux-alpha-webm".into(),
+        path_string(&color_ivf),
+        path_string(&alpha_ivf),
+        path_string(&video_webm),
+        tags[0].clone(),
+        tags[1].clone(),
+        tags[2].clone(),
+        tags[3].clone(),
+    ];
+
+    let mut audio_argv = build_hybrid_audio_argv(
+        &video_webm,
+        &req.input,
+        &info,
+        &final_output,
+        req.preserve_obs_metadata,
+        &color_meta,
+    );
+    // Stamp encoder metadata before the output path.
+    if req.write_encoder_metadata {
+        let hw = req
+            .hw
+            .qsv
+            .as_ref()
+            .map(|q| q.meta_hw_tag())
+            .unwrap_or_else(|| "QSV".into());
+        let tags = encoder_metadata_tags("vp9_qsv+libvpx", Some(&hw));
+        let out = audio_argv.pop();
+        append_gigamux_metadata(&mut audio_argv, OutContainer::Webm, &tags);
+        if let Some(o) = out {
+            audio_argv.push(o);
+        }
+    }
+    farm_argv_never_overwrite(&mut audio_argv);
+
+    Ok(FarmHybridJob {
+        final_output,
+        color_tasks,
+        alpha_tasks,
+        color_concat_argv,
+        alpha_concat_argv,
+        ffconcat_paths,
+        remux_check_args,
+        audio_argv,
+        video_expect_dur_s: video_dur,
+        // Prefer container duration for final A/V; fall back to video when format tag is missing.
+        out_expect_dur_s: if format_dur > 0.0 {
+            format_dur
+        } else {
+            video_dur
+        },
+        bitrate_k,
+        bitrate_label,
+    })
+}
+
+/// Wipe flat hybrid temps for `stem` in `output_dir` (planes, IVF chunks, ffconcats, legacy `.hybrid/`).
+fn clear_flat_hybrid_temps(output_dir: &Path, stem: &str) -> Result<(), String> {
+    let legacy = output_dir.join(format!("{stem}.hybrid"));
+    if legacy.is_dir() {
+        std::fs::remove_dir_all(&legacy).map_err(|e| format!("clear legacy hybrid dir: {e}"))?;
+    }
+    let remove = |path: PathBuf| -> Result<(), String> {
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(|e| format!("clear {}: {e}", path.display()))?;
+        }
+        Ok(())
+    };
+    remove(output_dir.join(format!("{stem}.color.ivf")))?;
+    remove(output_dir.join(format!("{stem}.alpha.ivf")))?;
+    remove(output_dir.join(format!("{stem}.vmux.webm")))?;
+    remove(output_dir.join(format!("{stem}.ffconcat")))?;
+    remove(output_dir.join(format!("{stem}.color.ffconcat")))?;
+    // Any prior chunk count: delete matching IVF chunk names (alpha + optional color plane).
+    let entries = std::fs::read_dir(output_dir).map_err(|e| format!("read output dir: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read output entry: {e}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some((chunk_stem, _, _, ext)) = parse_chunk_filename(name) else {
+            continue;
+        };
+        if !ext.eq_ignore_ascii_case("ivf") {
+            continue;
+        }
+        if chunk_stem == stem || chunk_stem == format!("{stem}.color") {
+            remove(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Integrity for a farm hybrid job (final + cleanup of flat plane/chunk IVFs like opaque).
+pub fn farm_integrity_for_hybrid(
+    req: &FarmEncodeRequest,
+    job: &FarmHybridJob,
+) -> FlamencoIntegrity {
+    let stem = job
+        .final_output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out")
+        .to_string();
+    // Alpha plane uses deliver-stem chunk names; cleanup also removes color plane + `.ivf` siblings.
+    let alpha_chunks = job.alpha_tasks.len() as u32;
+    FlamencoIntegrity {
+        chunk_checks: Vec::new(),
+        final_check: Some(farm_final_check(&req.input, &job.final_output, &req.slot)),
+        cleanup: Some(FarmCleanup {
+            dir: path_string(&req.output_dir),
+            stem,
+            ext: "webm".into(),
+            chunks: if alpha_chunks > 1 { alpha_chunks } else { 0 },
+        }),
+        ..FlamencoIntegrity::default()
+    }
+}
+
 fn path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -1823,6 +2419,145 @@ pub fn farm_integrity_for_chunked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stub_yuva_info() -> serde_json::Value {
+        serde_json::json!({
+            "streams": [{
+                "codec_type": "video",
+                "codec_name": "vp9",
+                "pix_fmt": "yuva420p",
+                "width": 64,
+                "height": 64,
+                "r_frame_rate": "30/1",
+                "color_range": "tv",
+                "color_space": "bt709",
+            }],
+            "format": { "duration": "2.0" }
+        })
+    }
+
+    #[test]
+    fn video_stream_duration_ignores_longer_audio_container() {
+        // Farm IVF ensure must not use format duration when audio pads the container.
+        let info = serde_json::json!({
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "vp9",
+                    "duration": "5.817000",
+                    "r_frame_rate": "60/1",
+                    "nb_frames": "349",
+                },
+                { "codec_type": "audio", "duration": "5.942000" }
+            ],
+            "format": { "duration": "5.942000" }
+        });
+        let video = video_stream_duration_s(&info);
+        let format = format_duration_s(&info);
+        assert!((video - 5.817).abs() < 0.001, "got video={video}");
+        assert!((format - 5.942).abs() < 0.001, "got format={format}");
+        assert!(format - video > 0.1);
+    }
+
+    #[test]
+    fn parse_matroska_duration_tag() {
+        let v = serde_json::json!("00:00:05.817000000");
+        assert!((parse_ffprobe_duration(&v).unwrap() - 5.817).abs() < 0.001);
+    }
+
+    #[test]
+    fn hybrid_color_argv_is_qsv_ivf() {
+        let info = stub_yuva_info();
+        let meta = video_color_meta(&info);
+        let argv = build_hybrid_color_argv_impl(
+            Path::new("in.webm"),
+            &info,
+            Path::new("color.ivf"),
+            4000,
+            &meta,
+            None,
+            Some(60),
+        );
+        assert!(argv.iter().any(|a| a == "vp9_qsv"));
+        assert_eq!(argv.last().map(String::as_str), Some("color.ivf"));
+        assert!(argv.iter().any(|a| a == "-n"));
+        assert!(argv.windows(2).any(|w| w[0] == "-frames:v" && w[1] == "60"));
+    }
+
+    #[test]
+    fn hybrid_alpha_argv_is_libvpx_ivf() {
+        let info = stub_yuva_info();
+        let meta = video_color_meta(&info);
+        let argv = build_hybrid_alpha_argv_impl(
+            Path::new("in.webm"),
+            &info,
+            Path::new("alpha.ivf"),
+            4000,
+            0,
+            &meta,
+            None,
+            Some(60),
+        );
+        assert!(argv.iter().any(|a| a == "libvpx-vp9"));
+        assert!(argv.iter().any(|a| a.contains("alphaextract")));
+        assert_eq!(argv.last().map(String::as_str), Some("alpha.ivf"));
+    }
+
+    #[test]
+    fn hybrid_job_settings_chunkless_color_by_default() {
+        // Construct a minimal FarmHybridJob as build_farm_hybrid_job would with chunks=1.
+        let job = FarmHybridJob {
+            final_output: PathBuf::from("out/clip.webm"),
+            color_tasks: vec![FarmHybridEncodeTask {
+                name: "encode-color".into(),
+                task_type: "qsv".into(),
+                argv: vec!["ffmpeg".into(), "-n".into(), "color.ivf".into()],
+                ensure: None,
+            }],
+            alpha_tasks: vec![FarmHybridEncodeTask {
+                name: "encode-alpha".into(),
+                task_type: "cpu".into(),
+                argv: vec!["ffmpeg".into(), "-n".into(), "alpha.ivf".into()],
+                ensure: None,
+            }],
+            color_concat_argv: None,
+            alpha_concat_argv: None,
+            ffconcat_paths: Vec::new(),
+            remux_check_args: vec![
+                "mux-alpha-webm".into(),
+                "c.ivf".into(),
+                "a.ivf".into(),
+                "v.webm".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+            ],
+            audio_argv: vec!["ffmpeg".into(), "out.webm".into()],
+            video_expect_dur_s: 2.0,
+            out_expect_dur_s: 2.0,
+            bitrate_k: 4000,
+            bitrate_label: "test".into(),
+        };
+        assert_eq!(job.color_tasks.len(), 1);
+        assert_eq!(job.color_tasks[0].task_type, "qsv");
+        assert_eq!(job.alpha_tasks[0].task_type, "cpu");
+        assert!(job.color_concat_argv.is_none());
+        assert_eq!(job.remux_check_args[0], "mux-alpha-webm");
+        let submitted = crate::flamenco::make_gigamux_hybrid_job(
+            "test",
+            None,
+            &job,
+            None,
+            crate::flamenco::CancelExecMode::Direct,
+            None,
+        )
+        .unwrap();
+        let hybrid = submitted.settings.get("hybrid_json").and_then(|v| v.as_str()).unwrap();
+        assert!(hybrid.contains("encode-color"));
+        assert!(hybrid.contains("\"qsv\""));
+        assert!(hybrid.contains("mux-alpha-webm"));
+    }
 
     #[test]
     fn mp4_metadata_gets_use_metadata_tags() {

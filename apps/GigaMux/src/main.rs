@@ -22,9 +22,9 @@ use gigamux_core::check::{
 };
 use gigamux_core::chunk::chunk_time_range;
 use gigamux_core::encode::{
-    build_farm_chunked_job, build_farm_ffmpeg_argv, farm_integrity_for_chunked,
-    farm_integrity_for_single, farm_vmaf_spec, run_batch, write_farm_ffconcat, EncodeEvent,
-    EncodeOptions, FarmEncodeRequest,
+    build_farm_chunked_job, build_farm_ffmpeg_argv, build_farm_hybrid_job, farm_integrity_for_chunked,
+    farm_integrity_for_hybrid, farm_integrity_for_single, farm_vmaf_spec, run_batch,
+    write_farm_ffconcat, write_farm_hybrid_ffconcats, EncodeEvent, EncodeOptions, FarmEncodeRequest,
 };
 use gigamux_core::flamenco::{
     cancel_exec_mode_for_manager_version, delete_probe_pin_tags, deploy_gigamux_manager,
@@ -32,13 +32,14 @@ use gigamux_core::flamenco::{
     farm_task_type_for_slot, fetch_job_status, fetch_job_tasks, fetch_task_log, fetch_workers,
     flamenco_job_terminal, flamenco_script_hint, infer_twoway_local_prefix,
     local_gigamux_js_present, make_gigamux_chunked_job, make_gigamux_encode_job,
-    make_gigamux_probe_job, make_gigamux_vmaf_job, manager_web_url, merge_farm_probe_dir,
-    normalize_check_exe_path, pick_log_task, pin_worker_for_probe, ping_manager,
-    recommend_task_types_from_farm_probe, resolve_flamenco_check_exe,
+    make_gigamux_hybrid_job, make_gigamux_probe_job, make_gigamux_vmaf_job, manager_web_url,
+    merge_farm_probe_dir, normalize_check_exe_path, pick_log_task, pin_worker_for_probe,
+    ping_manager, recommend_task_types_from_farm_probe, resolve_flamenco_check_exe,
     restore_worker_tags_after_probe, submit_job, worker_status_probeable, CancelExecMode,
     FarmProbeInventory, FarmProbeTaskTypeReport, FarmVmafMode, FarmVmafSpec, FlamencoTwoway,
     ProbeWorkerPin, WorkerTaskTypeRecommendation, CAPABILITY_TASK_TYPES,
 };
+use gigamux_core::wants_qsv_alpha_hybrid;
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{
     libvmaf_available, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path, VmafEvent, VmafReport,
@@ -709,6 +710,8 @@ struct FlamencoSubmitPrompt {
     chunks: u32,
     /// Only chunk software/alpha paths; HW opaque stays single-task.
     only_chunk_software: bool,
+    /// Hybrid: also chunk QSV color when Chunk encode is on (multi-QSV farms).
+    chunk_qsv_color: bool,
     /// Farm VMAF for this send only (default Off; not persisted).
     farm_vmaf: FarmVmafMode,
     /// Duration (s) of the first selected input for the chunk estimate label.
@@ -2237,6 +2240,7 @@ impl GigaMuxApp {
             self.prefs.flamenco_chunking = d.flamenco_chunking;
             self.prefs.flamenco_chunks = d.flamenco_chunks;
             self.prefs.flamenco_only_chunk_software = d.flamenco_only_chunk_software;
+            self.prefs.flamenco_chunk_qsv_color = d.flamenco_chunk_qsv_color;
             self.prefs.flamenco_twoway_local = d.flamenco_twoway_local;
             self.prefs.flamenco_twoway_var = d.flamenco_twoway_var;
             self.prefs.flamenco_farm_probe = d.flamenco_farm_probe;
@@ -2335,6 +2339,7 @@ impl GigaMuxApp {
             chunking: self.prefs.flamenco_chunking,
             chunks: self.prefs.flamenco_chunks.clamp(2, 32),
             only_chunk_software: self.prefs.flamenco_only_chunk_software,
+            chunk_qsv_color: self.prefs.flamenco_chunk_qsv_color,
             farm_vmaf: FarmVmafMode::Off,
             estimate_duration_s,
             estimate_name,
@@ -2355,7 +2360,15 @@ impl GigaMuxApp {
             } else {
                 "targets".into()
             };
-            if ty_opaque == ty_alpha {
+            let hybrid = wants_qsv_alpha_hybrid(
+                slot.use_hardware,
+                true,
+                slot.alpha_video == AlphaVideo::Vp9,
+                slot.alpha_container == OutContainer::Webm,
+            );
+            if hybrid {
+                lines.push(format!("{label} → hybrid qsv color + cpu α (α inputs)"));
+            } else if ty_opaque == ty_alpha {
                 lines.push(format!("{label} → {ty_opaque}"));
             } else {
                 lines.push(format!("{label} → opaque {ty_opaque} / α {ty_alpha}"));
@@ -2440,6 +2453,7 @@ impl GigaMuxApp {
         let want_chunk = self.prefs.flamenco_chunking;
         let chunk_n = self.prefs.flamenco_chunks.clamp(2, 32);
         let only_soft = self.prefs.flamenco_only_chunk_software;
+        let chunk_qsv_color = self.prefs.flamenco_chunk_qsv_color;
         // Flamenco only HasPrefix-rewrites whole setting strings; brace paths inside argv JSON ourselves.
         let mut twoway_local = self.prefs.flamenco_twoway_local.trim().to_string();
         if twoway_local.is_empty() {
@@ -2541,6 +2555,12 @@ impl GigaMuxApp {
                 };
                 let hw_opaque = farm_path_is_hw_opaque(&input, &slot);
                 let use_chunks = want_chunk && !(only_soft && hw_opaque);
+                let is_hybrid = wants_qsv_alpha_hybrid(
+                    slot.use_hardware,
+                    has_alpha,
+                    slot.alpha_video == AlphaVideo::Vp9,
+                    slot.alpha_container == OutContainer::Webm,
+                );
                 let req = FarmEncodeRequest {
                     input: input.clone(),
                     output_dir: output_dir.clone(),
@@ -2551,7 +2571,19 @@ impl GigaMuxApp {
                     use_peak_bitrate,
                     slot: slot.clone(),
                     test_batch,
-                    chunks: if use_chunks { chunk_n } else { 1 },
+                    // Alpha hybrid: chunks apply to libvpx alpha (and optional QSV color).
+                    chunks: if is_hybrid {
+                        if want_chunk {
+                            chunk_n
+                        } else {
+                            1
+                        }
+                    } else if use_chunks {
+                        chunk_n
+                    } else {
+                        1
+                    },
+                    chunk_qsv_color: is_hybrid && want_chunk && chunk_qsv_color,
                 };
                 let twoway = if twoway_local.is_empty() {
                     None
@@ -2562,6 +2594,95 @@ impl GigaMuxApp {
                     })
                 };
                 let exe = exe_owned.as_deref();
+
+                if is_hybrid {
+                    let job_built = match build_farm_hybrid_job(&req) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco hybrid argv: {e}"
+                            ))));
+                            failed += 1;
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                            continue;
+                        }
+                    };
+                    let out_name = job_built
+                        .final_output
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| job_built.final_output.display().to_string());
+                    if job_built.final_output.is_file() {
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco skip (exists): {out_name}"
+                        ))));
+                        skipped += 1;
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                        continue;
+                    }
+                    if let Err(e) = write_farm_hybrid_ffconcats(&job_built) {
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                            "Flamenco hybrid ffconcat: {e}"
+                        ))));
+                        failed += 1;
+                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                        continue;
+                    }
+                    let mut integrity = farm_integrity_for_hybrid(&req, &job_built);
+                    integrity.check_exe =
+                        resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
+                    if farm_vmaf == FarmVmafMode::Attached {
+                        integrity.vmaf = Some(farm_vmaf_spec(&req.input, &job_built.final_output));
+                    }
+                    let job = match make_gigamux_hybrid_job(
+                        job_name.clone(),
+                        exe,
+                        &job_built,
+                        twoway,
+                        cancel_exec,
+                        Some(integrity),
+                    ) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco hybrid job: {e}"
+                            ))));
+                            failed += 1;
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                            continue;
+                        }
+                    };
+                    match submit_job(&url, &job) {
+                        Ok(id) => {
+                            let color_n = job_built.color_tasks.len();
+                            let alpha_n = job_built.alpha_tasks.len();
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco submitted: job {id}; {item_label} → {out_name} (hybrid qsv×{color_n} + cpu×{alpha_n}, {}k / {})",
+                                job_built.bitrate_k, job_built.bitrate_label
+                            ))));
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
+                                job_id: id,
+                                name: item_label.clone(),
+                                out_name,
+                                want_separate_vmaf: farm_vmaf == FarmVmafMode::Separate,
+                            }));
+                            ok += 1;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco submit failed ({item_label}): {e}"
+                            ))));
+                            failed += 1;
+                            if let Some(hint) = flamenco_script_hint(&e) {
+                                script_hint = Some(hint.to_string());
+                                let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                                break;
+                            }
+                        }
+                    }
+                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
+                    continue;
+                }
 
                 if use_chunks {
                     let job_built = match build_farm_chunked_job(&req) {
@@ -8377,6 +8498,13 @@ impl GigaMuxApp {
                         &mut prompt.only_chunk_software,
                         "Only chunk software (HW opaque stays single)",
                     );
+                    ui.checkbox(
+                        &mut prompt.chunk_qsv_color,
+                        "Chunk QSV color (multi-QSV)",
+                    )
+                    .on_hover_text(
+                        "Hybrid α VP9/.webm only. Off (default): one chunkless QSV color task. On: split color IVF across QSV workers when Chunk encode is on.",
+                    );
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -8417,6 +8545,7 @@ impl GigaMuxApp {
                     p.chunking = prompt.chunking;
                     p.chunks = prompt.chunks.clamp(2, 32);
                     p.only_chunk_software = prompt.only_chunk_software;
+                    p.chunk_qsv_color = prompt.chunk_qsv_color;
                     p.farm_vmaf = prompt.farm_vmaf;
                 }
 
@@ -8438,6 +8567,7 @@ impl GigaMuxApp {
                         self.prefs.flamenco_chunking = prompt.chunking;
                         self.prefs.flamenco_chunks = prompt.chunks.clamp(2, 32);
                         self.prefs.flamenco_only_chunk_software = prompt.only_chunk_software;
+                        self.prefs.flamenco_chunk_qsv_color = prompt.chunk_qsv_color;
                         let _ = prefs::save(&self.prefs);
                         let names = prompt.names;
                         let farm_vmaf = prompt.farm_vmaf;
