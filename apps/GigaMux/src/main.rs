@@ -2240,6 +2240,7 @@ impl GigaMuxApp {
             self.prefs.flamenco_twoway_local = d.flamenco_twoway_local;
             self.prefs.flamenco_twoway_var = d.flamenco_twoway_var;
             self.prefs.flamenco_farm_probe = d.flamenco_farm_probe;
+            self.prefs.flamenco_nvenc_gen_isolation = d.flamenco_nvenc_gen_isolation;
             touched_prefs = true;
             parts.push("misc".into());
         }
@@ -2342,12 +2343,13 @@ impl GigaMuxApp {
 
     /// Per-slot Flamenco encode task types that Send will use (opaque vs α when they differ).
     fn farm_task_type_summary_lines(&self) -> Vec<String> {
+        let isol = self.prefs.flamenco_nvenc_gen_isolation;
         let mut lines = Vec::new();
         for &b in self.prefs.encode_batches() {
             let mut slot = self.prefs.slot(b).clone();
             slot.use_hardware = farm_slot_use_hardware(&slot);
-            let ty_opaque = farm_task_type_for_slot(&slot, false);
-            let ty_alpha = farm_task_type_for_slot(&slot, true);
+            let ty_opaque = farm_task_type_for_slot(&slot, false, isol);
+            let ty_alpha = farm_task_type_for_slot(&slot, true, isol);
             let label = if self.prefs.test_mode {
                 format!("test{}", b.index() + 1)
             } else {
@@ -2471,6 +2473,7 @@ impl GigaMuxApp {
         let use_peak_bitrate = self.prefs.use_peak_bitrate;
         let check_exe = self.prefs.flamenco_check_exe.clone();
         let scripts_dir_owned = self.prefs.flamenco_scripts_dir.clone();
+        let nvenc_gen_isol = self.prefs.flamenco_nvenc_gen_isolation;
         let total = work.len();
 
         self.cancel.store(false, Ordering::Relaxed);
@@ -2531,7 +2534,7 @@ impl GigaMuxApp {
                 let has_alpha = file_info(&input)
                     .map(|info| video_has_alpha(&info))
                     .unwrap_or(false);
-                let task_type = farm_task_type_for_slot(&slot, has_alpha);
+                let task_type = farm_task_type_for_slot(&slot, has_alpha, nvenc_gen_isol);
                 let job_name = match test_batch {
                     Some(b) => format!("GigaMux test{} {name}", b.index() + 1),
                     None => format!("GigaMux {name}"),
@@ -5893,9 +5896,11 @@ impl GigaMuxApp {
                         }
                     })
                     .response
-                    .on_hover_text(
-                        "Pins Flamenco to nvenc / nvenc-{gen}. Local encode prefers a matching GPU when present.",
-                    );
+                    .on_hover_text(if self.prefs.flamenco_nvenc_gen_isolation {
+                        "Isolates Flamenco job types to only one NVENC generation. Local encode ignores this and uses the selected GPU."
+                    } else {
+                        "Local encode ignores this and uses the selected GPU. Farm uses coarse nvenc (generation isolation off in Settings → Files)."
+                    });
                 if selected != self.prefs.slot(batch).nvenc_gen {
                     let gpu = match selected {
                         None => GpuChoice::Any,
@@ -7406,6 +7411,16 @@ impl GigaMuxApp {
 
     /// Files tab: metadata + delete confirms.
     fn ui_settings_files(&mut self, ui: &mut egui::Ui) {
+        // Keep content above the Close bar as Flamenco prefs grow.
+        egui::ScrollArea::vertical()
+            .id_salt("settings_files_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.ui_settings_files_body(ui);
+            });
+    }
+
+    fn ui_settings_files_body(&mut self, ui: &mut egui::Ui) {
         if ui
             .checkbox(
                 &mut self.prefs.preserve_obs_metadata,
@@ -7692,6 +7707,18 @@ impl GigaMuxApp {
                 }
             }
         });
+        if ui
+            .checkbox(
+                &mut self.prefs.flamenco_nvenc_gen_isolation,
+                "NVENC generation isolation (farm)",
+            )
+            .on_hover_text(
+                "On: farm encode task types follow Targets gen pins (nvenc-turing, nvenc-ampere, etc.). Off: all NVENC uses coarse nvenc (useful when gens score alike).",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
         // Wrap to the visible pane edge (clip_rect), not content min-width from wide TextEdits above.
         let wrap_w = ui.clip_rect().width().max(80.0);
         ui.allocate_ui_with_layout(

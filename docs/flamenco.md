@@ -58,12 +58,12 @@ There is **no Manager API** today to push `task_types` (worker-local update API 
 | `vmaf` | Attached / Separate / batch VMAF (`ensure-vmaf`) |
 | `cpu` | Software encode, mux/remux, final-check/cleanup |
 
-**Encode task type** comes from **Output → Targets** (NVENC generation under Use hardware):
+**Encode task type** comes from **Output → Targets** (NVENC generation under Use hardware), unless **Settings → Files → NVENC generation isolation (farm)** is off (then all NVENC → coarse `nvenc`):
 
 | Slot HW path | Encode task type |
 | --- | --- |
 | Opaque NVENC, generation **Any** | `nvenc` |
-| Opaque NVENC, pinned gen | `nvenc-{gen}` (e.g. `nvenc-turing`) |
+| Opaque NVENC, pinned gen | `nvenc-{gen}` when isolation is on; else `nvenc` |
 | Opaque VP9 HW | `qsv` |
 | Alpha / software | `cpu` |
 

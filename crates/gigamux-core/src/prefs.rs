@@ -178,6 +178,9 @@ pub struct Prefs {
     /// Union of farm probe host reports (gates `nvenc-{gen}` in Send dialog).
     #[serde(default)]
     pub flamenco_farm_probe: crate::flamenco::FarmProbeInventory,
+    /// When true, farm encode task types use `nvenc-{gen}` pins from Targets. When false, all NVENC maps to coarse `nvenc`. Default on.
+    #[serde(default = "default_true")]
+    pub flamenco_nvenc_gen_isolation: bool,
 }
 
 fn default_flamenco_twoway_var() -> String {
@@ -219,6 +222,7 @@ impl Default for Prefs {
             flamenco_twoway_local: String::new(),
             flamenco_twoway_var: "shared_storage_path".into(),
             flamenco_farm_probe: crate::flamenco::FarmProbeInventory::default(),
+            flamenco_nvenc_gen_isolation: true,
         }
     }
 }

@@ -40,12 +40,19 @@ pub fn nvenc_gen_tag_description(slug: &str) -> String {
 
 /// Flamenco encode task type from a Targets slot (jobs are tagless except Probe Farm pins).
 ///
-/// Alpha / software → `cpu`; HW opaque NVENC → `nvenc` or `nvenc-{gen}`; HW opaque VP9 → `qsv`.
-pub fn farm_task_type_for_slot(slot: &EncodeSlot, has_alpha: bool) -> String {
+/// Alpha / software → `cpu`; HW opaque NVENC → `nvenc` or `nvenc-{gen}` when `isolate_nvenc_gen`; HW opaque VP9 → `qsv`.
+pub fn farm_task_type_for_slot(
+    slot: &EncodeSlot,
+    has_alpha: bool,
+    isolate_nvenc_gen: bool,
+) -> String {
     if has_alpha || !slot.use_hardware {
         return "cpu".into();
     }
     if slot.opaque_video.is_nvenc() {
+        if !isolate_nvenc_gen {
+            return "nvenc".into();
+        }
         return match slot.nvenc_gen {
             Some(g) => g
                 .farm_tag_slug()
@@ -2011,17 +2018,18 @@ mod tests {
         slot.opaque_video = OpaqueVideo::Hevc;
         slot.use_hardware = true;
         slot.nvenc_gen = None;
-        assert_eq!(farm_task_type_for_slot(&slot, false), "nvenc");
+        assert_eq!(farm_task_type_for_slot(&slot, false, true), "nvenc");
         slot.nvenc_gen = Some(NvencGeneration::Turing);
-        assert_eq!(farm_task_type_for_slot(&slot, false), "nvenc-turing");
-        assert_eq!(farm_task_type_for_slot(&slot, true), "cpu");
+        assert_eq!(farm_task_type_for_slot(&slot, false, true), "nvenc-turing");
+        assert_eq!(farm_task_type_for_slot(&slot, false, false), "nvenc");
+        assert_eq!(farm_task_type_for_slot(&slot, true, true), "cpu");
         slot.opaque_video = OpaqueVideo::Av1;
         assert!(!farm_slot_use_hardware(&slot)); // Turing has no AV1 NVENC
         slot.nvenc_gen = Some(NvencGeneration::Ada);
         assert!(farm_slot_use_hardware(&slot));
         slot.opaque_video = OpaqueVideo::Vp9;
         slot.nvenc_gen = None;
-        assert_eq!(farm_task_type_for_slot(&slot, false), "qsv");
+        assert_eq!(farm_task_type_for_slot(&slot, false, true), "qsv");
     }
 
     #[test]
