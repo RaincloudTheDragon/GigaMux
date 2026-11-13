@@ -226,6 +226,19 @@ enum AppEvent {
     },
 }
 
+/// Background Input/Output folder scan (never blocks the UI thread on SMB/Ceph).
+struct ListsScanResult {
+    gen: u64,
+    input_ok: bool,
+    output_ok: bool,
+    input_files: Vec<PathBuf>,
+    output_files: Vec<PathBuf>,
+    input_bytes: u64,
+    output_bytes: u64,
+    /// `(out_name, input_name, score)` from `{deliver}.vmaf.json` beside outputs.
+    vmaf_sidecars: Vec<(String, String, f64)>,
+}
+
 /// Incremental preview worker messages (fast chips first, then peeks + thumb).
 enum PreviewMsg {
     Fast {
@@ -291,24 +304,10 @@ impl PreviewCacheEntry {
     }
 
     /// Ready and still matches the file on disk at `path`.
-    fn fresh_for(&self, path: &Path) -> bool {
-        if !self.ready() {
-            return false;
-        }
-        let Some((size, mtime)) = preview_cache::file_fingerprint(path) else {
-            return false;
-        };
-        if self.file_size != size || self.mtime_secs != mtime {
-            return false;
-        }
-        match &self.source_path {
-            Some(src) if src == path => true,
-            Some(src) => match (std::fs::canonicalize(src), std::fs::canonicalize(path)) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => false,
-            },
-            None => false,
-        }
+    /// UI-thread freshness: path match only, never `metadata`/`canonicalize` on a share here.
+    /// Workers re-probe when chips are missing; list scans pick up new/replaced delivers.
+    fn fresh_for_ui(&self, path: &Path) -> bool {
+        self.ready() && self.source_path.as_ref().is_some_and(|src| src == path)
     }
 }
 
@@ -434,6 +433,15 @@ struct GigaMuxApp {
     rename_edit: Option<RenameEdit>,
     /// Last Input/Output `list_media` pass (idle auto-refresh cadence).
     lists_refreshed_at: Instant,
+    /// Bumps when a new folder scan is spawned (ignore stale results).
+    lists_gen: u64,
+    lists_rx: Option<Receiver<ListsScanResult>>,
+    lists_inflight: bool,
+    /// Another refresh was requested while a scan was already running.
+    lists_queued: bool,
+    /// Reachability from the last completed scan (never call share `is_dir` on the UI thread).
+    input_dir_ok: bool,
+    output_dir_ok: bool,
 }
 
 /// How to commit an inline F2 rename.
@@ -797,6 +805,9 @@ impl GigaMuxApp {
         let warn = prefs.sanitize_slot_gpus(&hw.nvenc);
         // Opaque VP8 has no HW path: UI greys the checkbox but keeps the prefs flag.
         let (maxrate_override_edit, cq_override_edit) = Self::draft_edits_from_prefs(&prefs);
+        // Capture before move into Self; never sync-probe share paths on the UI thread.
+        let input_dir_ok = !prefs.input_dir.as_os_str().is_empty();
+        let output_dir_ok = !prefs.output_dir.as_os_str().is_empty();
         let mut app = Self {
             prefs,
             maxrate_override_edit,
@@ -865,9 +876,16 @@ impl GigaMuxApp {
             taskbar_showing: false,
             rename_edit: None,
             lists_refreshed_at: Instant::now(),
+            lists_gen: 0,
+            lists_rx: None,
+            lists_inflight: false,
+            lists_queued: false,
+            input_dir_ok,
+            output_dir_ok,
         };
         app.load_preview_cache_from_disk();
-        app.refresh_lists();
+        // Never block startup on share list_media / metadata; scan on a worker.
+        app.request_refresh_lists();
         let started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         app.push_session(format!("—— session start {started} ——"));
         // Probe is RAM-only (no disk cache); log what we saw at launch.
@@ -1537,7 +1555,7 @@ impl GigaMuxApp {
         let mut to_enrich = VecDeque::new();
         for (key, path) in jobs {
             if let Some(e) = self.preview_cache.get(&key) {
-                if e.fresh_for(&path) {
+                if e.fresh_for_ui(&path) {
                     let need_rates = !e.bitrates_ready;
                     let need_thumb = e.thumb.is_none();
                     if need_rates || need_thumb {
@@ -1780,7 +1798,12 @@ impl GigaMuxApp {
             self.prefs.output_dir = dir;
         }
         let _ = prefs::save(&self.prefs);
-        self.refresh_lists();
+        if is_input {
+            self.input_dir_ok = true;
+        } else {
+            self.output_dir_ok = true;
+        }
+        self.request_refresh_lists();
     }
 
     /// Pointer for folder DnD: egui often has none during an OS drag on Windows.
@@ -1865,20 +1888,89 @@ impl GigaMuxApp {
     /// Idle re-scan interval so farm/external outputs appear without a manual refresh.
     const LISTS_IDLE_REFRESH: Duration = Duration::from_secs(60);
 
-    fn refresh_lists(&mut self) {
+    /// Path configured in prefs (non-empty); does not touch the filesystem.
+    fn folder_configured(dir: &Path) -> bool {
+        !dir.as_os_str().is_empty()
+    }
+
+    /// Last known reachability from a background scan (safe on the UI thread).
+    fn folder_ok_cached(&self, is_input: bool) -> bool {
+        if is_input {
+            Self::folder_configured(&self.prefs.input_dir) && self.input_dir_ok
+        } else {
+            Self::folder_configured(&self.prefs.output_dir) && self.output_dir_ok
+        }
+    }
+
+    /// Both folders configured (encode/VMAF gates); no share `is_dir` on the UI thread.
+    fn folders_configured(&self) -> bool {
+        Self::folder_configured(&self.prefs.input_dir)
+            && Self::folder_configured(&self.prefs.output_dir)
+    }
+
+    /// Queue a background Input/Output scan; coalesces if one is already running.
+    fn request_refresh_lists(&mut self) {
+        if self.lists_inflight {
+            self.lists_queued = true;
+            return;
+        }
+        self.spawn_lists_scan();
+    }
+
+    fn spawn_lists_scan(&mut self) {
+        self.lists_inflight = true;
+        self.lists_queued = false;
+        self.lists_gen = self.lists_gen.wrapping_add(1);
+        let gen = self.lists_gen;
+        let in_dir = self.prefs.input_dir.clone();
+        let out_dir = self.prefs.output_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        self.lists_rx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(scan_media_lists(gen, &in_dir, &out_dir));
+        });
+    }
+
+    fn poll_lists_refresh(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.lists_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.apply_lists_scan(result);
+                if self.lists_queued {
+                    self.spawn_lists_scan();
+                }
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.lists_rx = Some(rx);
+                // Keep the UI alive while a slow share scan runs.
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.lists_inflight = false;
+                if self.lists_queued {
+                    self.spawn_lists_scan();
+                }
+            }
+        }
+    }
+
+    fn apply_lists_scan(&mut self, result: ListsScanResult) {
+        if result.gen != self.lists_gen {
+            // Stale scan (folder changed mid-flight).
+            self.lists_inflight = false;
+            return;
+        }
+        self.lists_inflight = false;
         self.lists_refreshed_at = Instant::now();
-        self.input_files = if prefs::dir_ok(&self.prefs.input_dir) {
-            list_media(&self.prefs.input_dir, true)
-        } else {
-            Vec::new()
-        };
-        self.output_files = if prefs::dir_ok(&self.prefs.output_dir) {
-            list_media(&self.prefs.output_dir, false)
-        } else {
-            Vec::new()
-        };
-        self.input_listed_bytes = Self::sum_file_bytes(&self.input_files);
-        self.output_listed_bytes = Self::sum_file_bytes(&self.output_files);
+        self.input_dir_ok = result.input_ok;
+        self.output_dir_ok = result.output_ok;
+        self.input_files = result.input_files;
+        self.output_files = result.output_files;
+        self.input_listed_bytes = result.input_bytes;
+        self.output_listed_bytes = result.output_bytes;
         // Prune multi-select / primary if files vanished from disk.
         if let Some((side, name)) = self.active.clone() {
             let alive: HashSet<String> = self.names_for(side).into_iter().collect();
@@ -1907,8 +1999,23 @@ impl GigaMuxApp {
         } else {
             self.start_preview_cache();
         }
-        // Farm scores on shared storage → preview_cache (before scrub so twins stay live).
-        self.import_vmaf_sidecars_from_output();
+        // Sidecars gathered off-thread; apply into preview_cache (no share read_dir here).
+        let mut imported = 0usize;
+        for (out_name, input, score) in result.vmaf_sidecars {
+            let already = self
+                .preview_cache
+                .get(&Self::preview_key(FileSide::Output, &out_name))
+                .and_then(|e| e.vmaf_score)
+                .is_some();
+            if already {
+                continue;
+            }
+            self.persist_vmaf_score(&input, &out_name, score);
+            imported += 1;
+        }
+        if imported > 0 {
+            self.push_session(format!("imported {imported} farm VMAF sidecar(s)"));
+        }
         // Output deleted/renamed → drop orphaned input (and vice versa) VMAF so meta stays live.
         if self.scrub_stale_vmaf() {
             self.save_preview_cache_to_disk();
@@ -2067,7 +2174,9 @@ impl GigaMuxApp {
         let due = self.lists_refreshed_at + Self::LISTS_IDLE_REFRESH;
         let now = Instant::now();
         if now >= due {
-            self.refresh_lists();
+            self.request_refresh_lists();
+            // Don't spin until the scan finishes; cadence is from request time.
+            self.lists_refreshed_at = Instant::now();
         }
         let next = self.lists_refreshed_at + Self::LISTS_IDLE_REFRESH;
         ctx.request_repaint_after(next.saturating_duration_since(Instant::now()));
@@ -2128,16 +2237,18 @@ impl GigaMuxApp {
     fn pick_input_folder(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.prefs.input_dir = path;
+            self.input_dir_ok = true;
             let _ = prefs::save(&self.prefs);
-            self.refresh_lists();
+            self.request_refresh_lists();
         }
     }
 
     fn pick_output_folder(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.prefs.output_dir = path;
+            self.output_dir_ok = true;
             let _ = prefs::save(&self.prefs);
-            self.refresh_lists();
+            self.request_refresh_lists();
         }
     }
 
@@ -2167,8 +2278,10 @@ impl GigaMuxApp {
                     let (maxrate, cq) = Self::draft_edits_from_prefs(&self.prefs);
                     self.maxrate_override_edit = maxrate;
                     self.cq_override_edit = cq;
+                    self.input_dir_ok = Self::folder_configured(&self.prefs.input_dir);
+                    self.output_dir_ok = Self::folder_configured(&self.prefs.output_dir);
                     let _ = prefs::save(&self.prefs);
-                    self.refresh_lists();
+                    self.request_refresh_lists();
                     self.push_session(format!("imported profile ← {}", path.display()));
                 }
                 Err(e) => self.alert_error("Import", format!("import failed: {e}")),
@@ -2255,7 +2368,7 @@ impl GigaMuxApp {
             let _ = prefs::save(&self.prefs);
             if p.folders {
                 self.clear_active();
-                self.refresh_lists();
+                self.request_refresh_lists();
             }
         }
 
@@ -2295,7 +2408,7 @@ impl GigaMuxApp {
             );
             return;
         }
-        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+        if !self.folders_configured() {
             self.alert_error(
                 "Flamenco",
                 "set both input and output folders before Flamenco submit",
@@ -2394,7 +2507,7 @@ impl GigaMuxApp {
             );
             return;
         }
-        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+        if !self.folders_configured() {
             self.alert_error(
                 "Flamenco",
                 "set both input and output folders before Flamenco submit",
@@ -2924,7 +3037,7 @@ impl GigaMuxApp {
 
     /// Merge probe JSON from the output share into prefs.
     fn merge_flamenco_farm_probe(&mut self) {
-        if !prefs::dir_ok(&self.prefs.output_dir) {
+        if !Self::folder_configured(&self.prefs.output_dir) {
             self.alert_error("Flamenco", "set output folder before merging farm probe");
             return;
         }
@@ -2972,7 +3085,7 @@ impl GigaMuxApp {
 
     /// Merge share JSON → prefs, recommend task_types, then remove `gigamux-farm-probe/`.
     fn apply_flamenco_farm_probe(&mut self) {
-        if !prefs::dir_ok(&self.prefs.output_dir) {
+        if !Self::folder_configured(&self.prefs.output_dir) {
             self.alert_error("Flamenco", "set output folder before applying farm probe");
             return;
         }
@@ -3006,7 +3119,7 @@ impl GigaMuxApp {
             self.alert_error("Flamenco", "set Flamenco Manager URL first");
             return;
         }
-        if !prefs::dir_ok(&self.prefs.output_dir) {
+        if !Self::folder_configured(&self.prefs.output_dir) {
             self.alert_error("Flamenco", "set output folder first");
             return;
         }
@@ -3033,7 +3146,7 @@ impl GigaMuxApp {
             self.alert_error("Flamenco", "set Flamenco Manager URL first");
             return;
         }
-        if !prefs::dir_ok(&self.prefs.output_dir) {
+        if !Self::folder_configured(&self.prefs.output_dir) {
             self.alert_error("Flamenco", "set output folder (probe JSON is written there)");
             return;
         }
@@ -3165,41 +3278,26 @@ impl GigaMuxApp {
         }
     }
 
-    /// Import `*.vmaf.json` sidecars from the output folder into preview_cache.
+    /// Import `*.vmaf.json` for currently listed outputs only (no share `read_dir` on UI thread).
     fn import_vmaf_sidecars_from_output(&mut self) {
-        let out_dir = self.prefs.output_dir.clone();
-        if !out_dir.is_dir() {
-            return;
-        }
-        let Ok(entries) = std::fs::read_dir(&out_dir) else {
-            return;
-        };
+        let out_files = self.output_files.clone();
         let mut imported = 0usize;
-        for ent in entries.flatten() {
-            let path = ent.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        for path in &out_files {
+            let Some(out_name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if !name.ends_with(".vmaf.json") {
-                continue;
-            }
-            let Some(sc) = read_vmaf_sidecar(&path) else {
-                continue;
-            };
-            // Sidecar is `{deliver}.vmaf.json` — recover deliver basename.
-            let out_name = name
-                .strip_suffix(".vmaf.json")
-                .unwrap_or(&sc.output)
-                .to_string();
             let already = self
                 .preview_cache
-                .get(&Self::preview_key(FileSide::Output, &out_name))
+                .get(&Self::preview_key(FileSide::Output, out_name))
                 .and_then(|e| e.vmaf_score)
                 .is_some();
             if already {
                 continue;
             }
-            self.persist_vmaf_score(&sc.input, &out_name, sc.score);
+            let Some(sc) = read_vmaf_sidecar(&vmaf_sidecar_path(path)) else {
+                continue;
+            };
+            self.persist_vmaf_score(&sc.input, out_name, sc.score);
             imported += 1;
         }
         if imported > 0 {
@@ -3617,7 +3715,7 @@ impl GigaMuxApp {
         if self.busy || self.delete_queue.is_some() || self.history_nav.is_some() {
             return;
         }
-        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+        if !self.folders_configured() {
             self.alert_error(
                 "Encode",
                 "set both input and output folders before Encode",
@@ -4181,7 +4279,7 @@ impl GigaMuxApp {
             pairs: done.clone(),
         }));
 
-        self.refresh_lists();
+        self.request_refresh_lists();
         // Keep focus on the renamed active (its new name).
         let focus = done
             .iter()
@@ -4371,7 +4469,7 @@ impl GigaMuxApp {
         if self.selection_anchor.as_deref() == Some(name) {
             self.selection_anchor = self.selected.iter().next().cloned();
         }
-        self.refresh_lists();
+        self.request_refresh_lists();
         if self.active.as_ref().is_some_and(|(s, n)| *s == side && n == name) {
             if let Some(n) = self
                 .names_for(side)
@@ -4389,7 +4487,7 @@ impl GigaMuxApp {
 
     /// Re-list from disk and restore selection after the cascade finishes.
     fn finish_delete_selection(&mut self, side: FileSide, next_name: Option<String>) {
-        self.refresh_lists();
+        self.request_refresh_lists();
         if let Some(n) = next_name.filter(|n| self.names_for(side).iter().any(|x| x == n)) {
             self.select_file(side, n);
         } else {
@@ -4510,7 +4608,7 @@ impl GigaMuxApp {
             let side = nav.side;
             self.history_nav = None;
             self.undo_history.cursor = target;
-            self.refresh_lists();
+            self.request_refresh_lists();
             if !touched.is_empty() {
                 self.select_restored(side, &touched);
             }
@@ -4543,7 +4641,7 @@ impl GigaMuxApp {
                             nav.remaining.clear();
                             nav.touched = names.clone();
                         }
-                        self.refresh_lists();
+                        self.request_refresh_lists();
                         if !names.is_empty() {
                             self.select_restored(side, &names);
                         }
@@ -4596,7 +4694,7 @@ impl GigaMuxApp {
         };
         let side = nav.side;
         let touched = nav.touched;
-        self.refresh_lists();
+        self.request_refresh_lists();
         if !touched.is_empty() {
             self.select_restored(side, &touched);
         }
@@ -4621,7 +4719,7 @@ impl GigaMuxApp {
             // Batch done — select what this batch touched, then continue.
             let side = nav.side;
             let touched = nav.touched.clone();
-            self.refresh_lists();
+            self.request_refresh_lists();
             if !touched.is_empty() {
                 self.select_restored(side, &touched);
             }
@@ -4648,7 +4746,7 @@ impl GigaMuxApp {
                     if let Some(nav) = self.history_nav.as_mut() {
                         nav.touched.push(name.clone());
                     }
-                    self.refresh_lists();
+                    self.request_refresh_lists();
                     if let Some(nav) = self.history_nav.as_ref() {
                         let names = nav.touched.clone();
                         self.select_restored(side, &names);
@@ -4797,10 +4895,10 @@ impl GigaMuxApp {
         // F5 = re-index files (keep meta/thumb cache); Ctrl+F5 = wipe cache then re-index.
         if ctrl_f5 {
             self.clear_preview_cache();
-            self.refresh_lists();
+            self.request_refresh_lists();
             self.push_session("cleared preview cache; reloaded file lists");
         } else if f5 {
-            self.refresh_lists();
+            self.request_refresh_lists();
             self.push_session("reloaded file lists");
         }
         if f12 {
@@ -4924,7 +5022,7 @@ impl GigaMuxApp {
         if self.busy {
             return;
         }
-        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+        if !self.folders_configured() {
             self.alert_error(
                 "Check",
                 "set both input and output folders before Check",
@@ -4957,7 +5055,7 @@ impl GigaMuxApp {
             );
             return;
         }
-        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+        if !self.folders_configured() {
             self.alert_error(
                 "VMAF",
                 "set both input and output folders before VMAF",
@@ -5101,7 +5199,7 @@ impl GigaMuxApp {
         if !self.history_idle() || self.pending_check.is_some() {
             return;
         }
-        if !prefs::dir_ok(&self.prefs.input_dir) || !prefs::dir_ok(&self.prefs.output_dir) {
+        if !self.folders_configured() {
             self.clear_auto_vmaf_schedule();
             self.push_session("auto VMAF: skipped — set input and output folders");
             return;
@@ -5315,7 +5413,7 @@ impl GigaMuxApp {
                         self.show_alert("Encode", summary);
                     }
                     finished = true;
-                    self.refresh_lists();
+                    self.request_refresh_lists();
                     // Immediate auto-VMAF once the batch produced at least one ok output.
                     if ok > 0 && self.prefs.auto_vmaf_when_idle {
                         self.schedule_auto_vmaf(Duration::ZERO);
@@ -5327,7 +5425,7 @@ impl GigaMuxApp {
                         Ok(report) => self.apply_check_report(report),
                         Err(e) => self.alert_error("Check", format!("check failed: {e}")),
                     }
-                    self.refresh_lists();
+                    self.request_refresh_lists();
                 }
                 AppEvent::Vmaf(ev) => match ev {
                     VmafEvent::Log(msg) => {
@@ -5509,7 +5607,7 @@ impl GigaMuxApp {
                 self.auto_vmaf_pass = false;
                 // 5m while unscored remain (or the pass errored); 1h when caught up.
                 if self.prefs.auto_vmaf_when_idle {
-                    self.refresh_lists();
+                    self.request_refresh_lists();
                     if auto_vmaf_err || !self.unscored_output_names().is_empty() {
                         self.schedule_auto_vmaf(AUTO_VMAF_RETRY_BUSY);
                         self.push_session("auto VMAF: next check in 5 min");
@@ -6294,8 +6392,14 @@ impl GigaMuxApp {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.strong(title);
-                if prefs::dir_ok(dir) {
+                // Use prefs path only; never `is_dir` on a share from the UI thread.
+                if Self::folder_configured(dir) {
                     ui.label(egui::RichText::new(short_path(dir)).weak().small());
+                    if self.lists_inflight {
+                        // Little pending circle while the share scan runs off-thread.
+                        ui.add(egui::Spinner::new().size(12.0))
+                            .on_hover_text("Scanning folder…");
+                    }
                     if ui.small_button("Change…").clicked() {
                         if is_input {
                             self.pick_input_folder();
@@ -6309,7 +6413,7 @@ impl GigaMuxApp {
                     self.ui_test_mode_checkbox(ui);
                 }
             });
-            if !prefs::dir_ok(dir) {
+            if !Self::folder_configured(dir) {
                 // Targets above the empty-folder CTA (non-test only; test needs a real dir for lists).
                 if !is_input && !self.prefs.test_mode {
                     self.ui_output_targets(ui);
@@ -6335,6 +6439,17 @@ impl GigaMuxApp {
                     } else {
                         self.pick_output_folder();
                     }
+                }
+                return;
+            }
+            // Configured but last scan said unreachable (or still waiting).
+            if !self.folder_ok_cached(is_input) && !self.lists_inflight {
+                ui.label(
+                    egui::RichText::new("Folder unreachable (share offline?). Change… or retry.")
+                        .weak(),
+                );
+                if ui.small_button("Retry scan").clicked() {
+                    self.request_refresh_lists();
                 }
                 return;
             }
@@ -6456,7 +6571,14 @@ impl GigaMuxApp {
                 let mut pending_dbl: Option<(String, PathBuf)> = None;
 
                 if files.is_empty() {
-                    ui.label(egui::RichText::new("(empty)").weak());
+                    if self.lists_inflight {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            ui.label(egui::RichText::new("Scanning…").weak());
+                        });
+                    } else {
+                        ui.label(egui::RichText::new("(empty)").weak());
+                    }
                 } else {
                     for path in files {
                         let name = path
@@ -9043,7 +9165,7 @@ impl GigaMuxApp {
                         // Session lines already written — modal only (avoid duplicate via alert_error).
                         self.show_alert("Delete", msg);
                     }
-                    self.refresh_lists();
+                    self.request_refresh_lists();
                 }
             }
         } else if open_log {
@@ -9712,6 +9834,56 @@ fn short_path(path: &Path) -> String {
     }
 }
 
+/// Background folder scan: `list_media` + sizes + VMAF sidecars (safe to block here, not on UI).
+fn scan_media_lists(gen: u64, input_dir: &Path, output_dir: &Path) -> ListsScanResult {
+    let input_ok = prefs::dir_ok(input_dir);
+    let output_ok = prefs::dir_ok(output_dir);
+    let input_files = if input_ok {
+        list_media(input_dir, true)
+    } else {
+        Vec::new()
+    };
+    let output_files = if output_ok {
+        list_media(output_dir, false)
+    } else {
+        Vec::new()
+    };
+    let input_bytes = GigaMuxApp::sum_file_bytes(&input_files);
+    let output_bytes = GigaMuxApp::sum_file_bytes(&output_files);
+    let mut vmaf_sidecars = Vec::new();
+    if output_ok {
+        if let Ok(entries) = std::fs::read_dir(output_dir) {
+            for ent in entries.flatten() {
+                let path = ent.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.ends_with(".vmaf.json") {
+                    continue;
+                }
+                let Some(sc) = read_vmaf_sidecar(&path) else {
+                    continue;
+                };
+                let out_name = name
+                    .strip_suffix(".vmaf.json")
+                    .unwrap_or(&sc.output)
+                    .to_string();
+                vmaf_sidecars.push((out_name, sc.input, sc.score));
+            }
+        }
+    }
+    ListsScanResult {
+        gen,
+        input_ok,
+        output_ok,
+        input_files,
+        output_files,
+        input_bytes,
+        output_bytes,
+        vmaf_sidecars,
+    }
+}
+
 /// Open a path with the OS default handler (same as double-click in Explorer).
 /// Reveal the current multi-selection when `clicked` is part of it; otherwise reveal `clicked` alone.
 impl GigaMuxApp {
@@ -10002,6 +10174,7 @@ impl eframe::App for GigaMuxApp {
         let _ = frame;
         self.tick_delete_queue(ctx);
         self.tick_history_nav(ctx);
+        self.poll_lists_refresh(ctx);
         self.poll_preview_cache(ctx);
         // Pref-armed idle pass: silent Check → filtered VMAF (no purge window).
         // Wake when the next due Instant arrives even if the UI is otherwise idle.
