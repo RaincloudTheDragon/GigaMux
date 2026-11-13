@@ -1590,13 +1590,18 @@ impl GigaMuxApp {
         })
     }
 
-    /// All logical CPUs for preview workers; leave most free while CPU encode runs.
+    /// True while a local libvmaf job owns ffmpeg (F5 must not compete with peeks/thumbs).
+    fn vmaf_job_active(&self) -> bool {
+        self.busy && matches!(self.job, Some(JobKind::Vmaf))
+    }
+
+    /// All logical CPUs for preview workers; leave most free while CPU encode / VMAF runs.
     fn preview_worker_count(&self) -> usize {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
             .max(1);
-        if self.cpu_encode_active() {
+        if self.cpu_encode_active() || self.vmaf_job_active() {
             (cores / 4).max(1)
         } else {
             cores
@@ -1604,6 +1609,7 @@ impl GigaMuxApp {
     }
 
     /// Drop stale cache entries; fast-probe chips in parallel, then enrich peeks + thumbs.
+    /// During local VMAF, only chip-index new/changed files (defer peeks/thumbs until the job ends).
     fn start_preview_cache(&mut self) {
         let mut jobs: Vec<(String, PathBuf)> = Vec::new();
         for (side, files, dir) in [
@@ -1624,6 +1630,7 @@ impl GigaMuxApp {
             .retain(|k, _| key_set.contains(k) || parked.contains(k));
 
         // Full probe vs enrich-only (disk hit with chips but missing peeks/thumb).
+        let defer_enrich = self.vmaf_job_active();
         let mut to_fast = VecDeque::new();
         let mut to_enrich = VecDeque::new();
         for (key, path) in jobs {
@@ -1631,7 +1638,7 @@ impl GigaMuxApp {
                 if e.fresh_for_ui(&path) {
                     let need_rates = !e.bitrates_ready;
                     let need_thumb = e.thumb.is_none();
-                    if need_rates || need_thumb {
+                    if !defer_enrich && (need_rates || need_thumb) {
                         to_enrich.push_back((key, path, need_rates, need_thumb));
                     }
                     continue;
@@ -1677,17 +1684,20 @@ impl GigaMuxApp {
                         {
                             break;
                         }
-                        if let Ok(mut s) = summary {
-                            enrich_summary_bitrates(&path, &mut s);
-                            let _ = tx.send(PreviewMsg::Bitrates {
-                                gen,
-                                name: name.clone(),
-                                peak_video_kbps: s.peak_video_kbps,
-                                avg_video_kbps: s.avg_video_kbps,
-                                peak_audio_kbps: s.peak_audio_kbps,
-                            });
-                            let thumb = thumbnail_rgba(&path, s.duration_s);
-                            let _ = tx.send(PreviewMsg::Thumb { gen, name, thumb });
+                        // During VMAF: chips only; peeks/thumbs wait so libvmaf keeps ffmpeg.
+                        if !defer_enrich {
+                            if let Ok(mut s) = summary {
+                                enrich_summary_bitrates(&path, &mut s);
+                                let _ = tx.send(PreviewMsg::Bitrates {
+                                    gen,
+                                    name: name.clone(),
+                                    peak_video_kbps: s.peak_video_kbps,
+                                    avg_video_kbps: s.avg_video_kbps,
+                                    peak_audio_kbps: s.peak_audio_kbps,
+                                });
+                                let thumb = thumbnail_rgba(&path, s.duration_s);
+                                let _ = tx.send(PreviewMsg::Thumb { gen, name, thumb });
+                            }
                         }
                         continue;
                     }
@@ -5005,13 +5015,20 @@ impl GigaMuxApp {
             self.undo_last_delete();
         }
         // F5 = re-index files (keep meta/thumb cache); Ctrl+F5 = wipe cache then re-index.
+        // Safe during local VMAF: lists + chip index only (peeks deferred); don't Shutter-pause ffmpeg.
         if ctrl_f5 {
             self.clear_preview_cache();
             self.request_refresh_lists();
+            self.last_system_idle_ms = 0;
             self.push_session("cleared preview cache; reloaded file lists");
         } else if f5 {
             self.request_refresh_lists();
-            self.push_session("reloaded file lists");
+            self.last_system_idle_ms = 0;
+            self.push_session(if self.vmaf_job_active() {
+                "reloaded file lists (VMAF running; chips only until job ends)"
+            } else {
+                "reloaded file lists"
+            });
         }
         if f12 {
             self.start_encode(None);
@@ -5481,6 +5498,7 @@ impl GigaMuxApp {
         let mut finished = false;
         // Capture before the job clears so only auto Check→VMAF passes reschedule.
         let auto_pass = self.auto_vmaf_pass;
+        let was_vmaf = matches!(self.job, Some(JobKind::Vmaf));
         let mut auto_vmaf_err = false;
         while let Ok(ev) = rx.try_recv() {
             match ev {
@@ -5796,6 +5814,9 @@ impl GigaMuxApp {
                         self.push_session("auto VMAF: next check in 1 h");
                     }
                 }
+            } else if was_vmaf {
+                // Finish peeks/thumbs deferred while libvmaf held ffmpeg.
+                self.start_preview_cache();
             }
             if self.prefs.job_done_chime {
                 play_job_done_chime();
