@@ -30,9 +30,10 @@ pub use encode::{
 };
 pub use ffmpeg_active::{active_ffmpeg_pid, kill_process_tree, ActiveFfmpegGuard};
 pub use flamenco::{
-    cancel_exec_mode_for_manager_version, check_exe_from_deploy_scripts_dir, delete_probe_pin_tags,
-    delete_worker_tag, deploy_gigamux_js, deploy_gigamux_manager, discover_manager,
-    ensure_named_worker_tag, export_worker_yamls, farm_probe_out_dir, farm_slot_use_hardware,
+    cancel_exec_mode_for_manager_version, check_exe_from_deploy_scripts_dir, cleanup_farm_probe_out_dir,
+    delete_probe_pin_tags, delete_worker_tag, deploy_gigamux_js, deploy_gigamux_manager,
+    discover_manager, ensure_named_worker_tag, export_worker_yamls, farm_probe_out_dir,
+    farm_slot_use_hardware,
     farm_task_type_for_slot, fetch_job_status, fetch_job_tasks, fetch_task_log, fetch_task_logtail,
     fetch_worker_tag_ids, fetch_worker_tags, fetch_workers, flamenco_job_terminal,
     flamenco_script_hint, flamenco_worker_yaml, infer_twoway_local_prefix, is_gigamux_managed_tag,
@@ -41,7 +42,8 @@ pub use flamenco::{
     manager_web_url,
     merge_farm_probe_dir, normalize_check_exe_path, nvenc_gen_tag_description, pick_log_task,
     pin_worker_for_probe, ping_manager, probe_pin_tag_name, recommend_task_types_from_farm_probe,
-    recommended_task_types, resolve_flamenco_check_exe, resolve_worker_tag_uuid,
+    recommend_task_types_from_reports, recommended_task_types, resolve_flamenco_check_exe,
+    resolve_worker_tag_uuid,
     restore_worker_tags_after_probe, rewrite_flamenco_twoway_path, safe_worker_yaml_filename,
     scripts_dir_from_manager_install, set_worker_tags, submit_job, worker_status_probeable,
     write_farm_probe_report, CancelExecMode, DeployReport, FarmChunkCheck, FarmCleanup,

@@ -28,14 +28,15 @@ use gigamux_core::encode::{
 };
 use gigamux_core::flamenco::{
     cancel_exec_mode_for_manager_version, delete_probe_pin_tags, deploy_gigamux_manager,
-    discover_manager, export_worker_yamls, farm_probe_out_dir, farm_slot_use_hardware,
-    farm_task_type_for_slot, fetch_job_status, fetch_job_tasks, fetch_task_log, fetch_workers,
-    flamenco_job_terminal, flamenco_script_hint, infer_twoway_local_prefix,
-    local_gigamux_js_present, make_gigamux_chunked_job, make_gigamux_encode_job,
-    make_gigamux_hybrid_job, make_gigamux_probe_job, make_gigamux_vmaf_job, manager_web_url,
-    merge_farm_probe_dir, normalize_check_exe_path, pick_log_task, pin_worker_for_probe,
-    ping_manager, recommend_task_types_from_farm_probe, resolve_flamenco_check_exe,
-    restore_worker_tags_after_probe, submit_job, worker_status_probeable, CancelExecMode,
+    cleanup_farm_probe_out_dir, discover_manager, export_worker_yamls, farm_probe_out_dir,
+    farm_slot_use_hardware, farm_task_type_for_slot, fetch_job_status, fetch_job_tasks,
+    fetch_task_log, fetch_workers, flamenco_job_terminal, flamenco_script_hint,
+    infer_twoway_local_prefix, local_gigamux_js_present, make_gigamux_chunked_job,
+    make_gigamux_encode_job, make_gigamux_hybrid_job, make_gigamux_probe_job,
+    make_gigamux_vmaf_job, manager_web_url, merge_farm_probe_dir, normalize_check_exe_path,
+    pick_log_task, pin_worker_for_probe, ping_manager, recommend_task_types_from_reports,
+    resolve_flamenco_check_exe, restore_worker_tags_after_probe, submit_job,
+    worker_status_probeable, CancelExecMode,
     FarmProbeInventory, FarmProbeTaskTypeReport, FarmVmafMode, FarmVmafSpec, FlamencoTwoway,
     ProbeWorkerPin, WorkerTaskTypeRecommendation, CAPABILITY_TASK_TYPES,
 };
@@ -2947,7 +2948,7 @@ impl GigaMuxApp {
         });
     }
 
-    /// Merge share JSON → prefs, then recommend task_types (YAML export dialog).
+    /// Merge share JSON → prefs, recommend task_types, then remove `gigamux-farm-probe/`.
     fn apply_flamenco_farm_probe(&mut self) {
         if !prefs::dir_ok(&self.prefs.output_dir) {
             self.alert_error("Flamenco", "set output folder before applying farm probe");
@@ -2959,14 +2960,24 @@ impl GigaMuxApp {
             return;
         }
         self.merge_flamenco_farm_probe();
-        let dir = farm_probe_out_dir(&self.prefs.output_dir);
-        match recommend_task_types_from_farm_probe(&url, &dir) {
-            Ok(rep) => self.open_worker_yaml_prompt(rep),
+        let reports = self.prefs.flamenco_farm_probe.reports.clone();
+        match recommend_task_types_from_reports(&url, &reports) {
+            Ok(rep) => {
+                self.open_worker_yaml_prompt(rep);
+                match cleanup_farm_probe_out_dir(&self.prefs.output_dir) {
+                    Ok(()) => self.push_session(
+                        "Flamenco farm-probe: cleared output/gigamux-farm-probe (kept in prefs)",
+                    ),
+                    Err(e) => self.push_session(format!(
+                        "Flamenco farm-probe: cleanup gigamux-farm-probe: {e}"
+                    )),
+                }
+            }
             Err(e) => self.alert_error("Flamenco", format!("farm probe recommend: {e}")),
         }
     }
 
-    /// Re-open YAML recommendations from current share probe JSON (no new probe jobs).
+    /// Re-open YAML recommendations from prefs host reports (no new probe jobs).
     fn show_worker_yaml_from_probe(&mut self) {
         let url = self.prefs.flamenco_manager_url.trim().to_string();
         if url.is_empty() {
@@ -2977,9 +2988,17 @@ impl GigaMuxApp {
             self.alert_error("Flamenco", "set output folder first");
             return;
         }
+        // Refresh from share JSON when present (mid-probe); else use prefs after cleanup.
         self.merge_flamenco_farm_probe();
-        let dir = farm_probe_out_dir(&self.prefs.output_dir);
-        match recommend_task_types_from_farm_probe(&url, &dir) {
+        let reports = self.prefs.flamenco_farm_probe.reports.clone();
+        if reports.is_empty() {
+            self.alert_error(
+                "Flamenco",
+                "No farm probe host reports yet. Run Probe Farm first",
+            );
+            return;
+        }
+        match recommend_task_types_from_reports(&url, &reports) {
             Ok(rep) => self.open_worker_yaml_prompt(rep),
             Err(e) => self.alert_error("Flamenco", format!("worker YAML recommend: {e}")),
         }
@@ -7747,7 +7766,7 @@ impl GigaMuxApp {
             let probe_btn = ui
                 .add_enabled(can_probe, egui::Button::new("Probe Farm"))
                 .on_hover_text(
-                    "Probe every non-offline worker (gm-… pin tags); when done: merge JSON and open task_types YAML recommendations. Right-click to clear prefs inventory (share JSON kept).",
+                    "Probe every non-offline worker (gm-… pin tags); when done: merge into prefs, open YAML recommendations, then delete output/gigamux-farm-probe. Right-click clears prefs inventory.",
                 )
                 .on_disabled_hover_text("Set Manager URL (or Find) first");
             if probe_btn.clicked() {
@@ -7756,7 +7775,7 @@ impl GigaMuxApp {
             probe_btn.context_menu(|ui| {
                 if ui
                     .button("Clear probe inventory")
-                    .on_hover_text("Clear farm probe inventory in prefs (does not delete JSON on the share).")
+                    .on_hover_text("Clear farm probe inventory in prefs (host reports + aggregates).")
                     .clicked()
                 {
                     self.prefs.flamenco_farm_probe = FarmProbeInventory::default();
@@ -7768,7 +7787,7 @@ impl GigaMuxApp {
             if ui
                 .add_enabled(can_probe, egui::Button::new("Worker YAMLs…"))
                 .on_hover_text(
-                    "Re-open task_types recommendations from existing probe JSON (export {worker}_flamenco-worker.yaml).",
+                    "Re-open task_types recommendations from prefs host reports (export {worker}_flamenco-worker.yaml).",
                 )
                 .on_disabled_hover_text("Set Manager URL first")
                 .clicked()

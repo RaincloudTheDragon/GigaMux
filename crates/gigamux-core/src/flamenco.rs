@@ -1544,6 +1544,9 @@ pub struct FarmProbeInventory {
     /// Hostnames that contributed probe JSON (until Clear).
     #[serde(default)]
     pub hosts: Vec<String>,
+    /// Per-host capability snapshots (survives cleanup of `gigamux-farm-probe/` on the share).
+    #[serde(default)]
+    pub reports: Vec<FarmProbeHostReport>,
     #[serde(default)]
     pub has_qsv: bool,
     #[serde(default)]
@@ -1554,8 +1557,61 @@ pub struct FarmProbeInventory {
 }
 
 impl FarmProbeInventory {
+    /// Insert or replace one host report and refresh aggregate flags from it.
+    pub fn upsert_report(&mut self, report: FarmProbeHostReport) {
+        let host = report.host.trim().to_string();
+        if host.is_empty() {
+            return;
+        }
+        if let Some(slot) = self
+            .reports
+            .iter_mut()
+            .find(|r| r.host.eq_ignore_ascii_case(&host))
+        {
+            *slot = report;
+        } else {
+            self.reports.push(report);
+        }
+        self.reports
+            .sort_by(|a, b| a.host.to_ascii_lowercase().cmp(&b.host.to_ascii_lowercase()));
+        self.recompute_aggregates();
+    }
+
+    /// Rebuild gens/hosts/flags from `reports` (keeps union semantics across upserts).
+    fn recompute_aggregates(&mut self) {
+        self.hosts = self
+            .reports
+            .iter()
+            .map(|r| r.host.clone())
+            .filter(|h| !h.is_empty())
+            .collect();
+        self.hosts.sort();
+        self.hosts.dedup();
+        let mut gens = Vec::new();
+        self.has_qsv = false;
+        self.has_vmaf = false;
+        self.has_cpu = false;
+        for r in &self.reports {
+            self.has_qsv |= r.has_qsv;
+            self.has_vmaf |= r.has_vmaf;
+            self.has_cpu |= r.has_cpu;
+            for g in &r.nvenc_gens {
+                let slug = normalize_nvenc_gen_slug(g);
+                if !slug.is_empty() && !gens.iter().any(|x| x == &slug) {
+                    gens.push(slug);
+                }
+            }
+        }
+        gens.sort();
+        self.nvenc_gens = gens;
+    }
+
     /// Merge another host/dir aggregate into this inventory (union; never drops gens).
     pub fn merge_from(&mut self, other: &FarmProbeInventory) {
+        for report in &other.reports {
+            self.upsert_report(report.clone());
+        }
+        // Legacy prefs without `reports`: still fold aggregate-only fields.
         for g in &other.nvenc_gens {
             let slug = normalize_nvenc_gen_slug(g);
             if !slug.is_empty() && !self.nvenc_gens.iter().any(|x| x == &slug) {
@@ -1603,7 +1659,7 @@ fn normalize_nvenc_gen_slug(s: &str) -> String {
 }
 
 /// One worker's probe JSON on shared storage (`{out_dir}/{host}.json`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FarmProbeHostReport {
     pub host: String,
     /// Full tag slugs (`nvenc-ada`).
@@ -1615,17 +1671,9 @@ pub struct FarmProbeHostReport {
 
 impl FarmProbeHostReport {
     fn into_inventory(self) -> FarmProbeInventory {
-        FarmProbeInventory {
-            nvenc_gens: self.nvenc_gens,
-            hosts: if self.host.is_empty() {
-                Vec::new()
-            } else {
-                vec![self.host]
-            },
-            has_qsv: self.has_qsv,
-            has_vmaf: self.has_vmaf,
-            has_cpu: self.has_cpu,
-        }
+        let mut inv = FarmProbeInventory::default();
+        inv.upsert_report(self);
+        inv
     }
 }
 
@@ -1796,14 +1844,13 @@ pub struct FarmProbeTaskTypeReport {
 }
 
 /// Match each probe host report to a Manager worker (case-insensitive name) and build YAML recommendations.
-pub fn recommend_task_types_from_farm_probe(
+pub fn recommend_task_types_from_reports(
     manager_url: &str,
-    out_dir: &Path,
+    reports: &[FarmProbeHostReport],
 ) -> Result<FarmProbeTaskTypeReport, String> {
-    let reports = load_farm_probe_reports(out_dir)?;
     let workers = fetch_workers(manager_url)?;
     let mut out = FarmProbeTaskTypeReport::default();
-    for host_report in &reports {
+    for host_report in reports {
         let host = host_report.host.trim();
         if host.is_empty() || host.eq_ignore_ascii_case("unknown-host") {
             out.unmatched.push(host_report.host.clone());
@@ -1824,6 +1871,15 @@ pub fn recommend_task_types_from_farm_probe(
     out.recommendations
         .sort_by(|a, b| a.worker_name.to_ascii_lowercase().cmp(&b.worker_name.to_ascii_lowercase()));
     Ok(out)
+}
+
+/// Load share JSON then recommend (prefer [`recommend_task_types_from_reports`] with prefs after merge).
+pub fn recommend_task_types_from_farm_probe(
+    manager_url: &str,
+    out_dir: &Path,
+) -> Result<FarmProbeTaskTypeReport, String> {
+    let reports = load_farm_probe_reports(out_dir)?;
+    recommend_task_types_from_reports(manager_url, &reports)
 }
 
 /// Basename `{worker}_flamenco-worker.yaml` (filesystem-safe).
@@ -1887,6 +1943,15 @@ pub fn export_worker_yamls(
 /// Default shared folder for probe JSON (under output dir).
 pub fn farm_probe_out_dir(output_dir: &Path) -> PathBuf {
     output_dir.join("gigamux-farm-probe")
+}
+
+/// Remove `{output}/gigamux-farm-probe/` after host JSON has been merged into prefs.
+pub fn cleanup_farm_probe_out_dir(output_dir: &Path) -> Result<(), String> {
+    let dir = farm_probe_out_dir(output_dir);
+    if !dir.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(&dir).map_err(|e| format!("cleanup {}: {e}", dir.display()))
 }
 
 /// Submit a short farm-probe job (`gigamux-check farm-probe <dir>`).
@@ -2128,6 +2193,47 @@ mod tests {
             safe_worker_yaml_filename("host / gpu0"),
             "host___gpu0_flamenco-worker.yaml"
         );
+    }
+
+    #[test]
+    fn farm_probe_cleanup_removes_out_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "gigamux_probe_cleanup_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let probe = farm_probe_out_dir(&root);
+        fs::create_dir_all(&probe).unwrap();
+        fs::write(probe.join("host-a.json"), b"{}").unwrap();
+        cleanup_farm_probe_out_dir(&root).unwrap();
+        assert!(!probe.exists());
+        cleanup_farm_probe_out_dir(&root).unwrap(); // idempotent
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn farm_probe_inventory_upserts_reports() {
+        let mut inv = FarmProbeInventory::default();
+        inv.upsert_report(FarmProbeHostReport {
+            host: "Ada".into(),
+            nvenc_gens: vec!["nvenc-ada".into()],
+            has_qsv: false,
+            has_vmaf: true,
+            has_cpu: true,
+        });
+        inv.upsert_report(FarmProbeHostReport {
+            host: "ada".into(), // case-insensitive replace
+            nvenc_gens: vec!["nvenc-ada".into(), "nvenc-turing".into()],
+            has_qsv: true,
+            has_vmaf: true,
+            has_cpu: true,
+        });
+        assert_eq!(inv.reports.len(), 1);
+        assert_eq!(inv.hosts, vec!["ada".to_string()]);
+        assert!(inv.has_qsv && inv.has_vmaf && inv.has_cpu);
+        assert!(inv.nvenc_gens.iter().any(|g| g == "nvenc-ada"));
+        assert!(inv.nvenc_gens.iter().any(|g| g == "nvenc-turing"));
     }
 
     #[test]
