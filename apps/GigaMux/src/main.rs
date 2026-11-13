@@ -211,6 +211,78 @@ enum FarmSubmitEvent {
     ItemDone,
 }
 
+/// Result of "deliver already on disk" during Flamenco encode submit.
+enum ExistingDeliverOutcome {
+    /// No encode, no VMAF (Off, or already scored).
+    Skipped,
+    /// VMAF-only job POSTed (Attached/Separate when output exists).
+    VmafSubmitted,
+    Failed,
+}
+
+/// Skip encode when the deliver exists; if farm VMAF ≠ Off, submit a VMAF-only job instead.
+fn farm_submit_existing_deliver(
+    farm_vmaf: FarmVmafMode,
+    input: &Path,
+    output: &Path,
+    out_name: &str,
+    item_label: &str,
+    url: &str,
+    exe: Option<&str>,
+    check_exe: &str,
+    twoway: Option<FlamencoTwoway<'_>>,
+    tx: &mpsc::Sender<AppEvent>,
+) -> ExistingDeliverOutcome {
+    if farm_vmaf == FarmVmafMode::Off {
+        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+            "Flamenco skip (exists): {out_name}"
+        ))));
+        return ExistingDeliverOutcome::Skipped;
+    }
+    if read_vmaf_sidecar(&vmaf_sidecar_path(output)).is_some() {
+        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+            "Flamenco skip (exists, already scored): {out_name}"
+        ))));
+        return ExistingDeliverOutcome::Skipped;
+    }
+    let spec = farm_vmaf_spec(input, output);
+    let job = match make_gigamux_vmaf_job(
+        format!("GigaMux VMAF {out_name}"),
+        exe,
+        &[spec],
+        twoway,
+        check_exe,
+    ) {
+        Ok(j) => j,
+        Err(e) => {
+            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                "Flamenco VMAF-only (exists) job: {e}"
+            ))));
+            return ExistingDeliverOutcome::Failed;
+        }
+    };
+    match submit_job(url, &job) {
+        Ok(id) => {
+            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                "Flamenco VMAF-only (exists): job {id}; {item_label} → {out_name}"
+            ))));
+            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
+                job_id: id,
+                name: item_label.to_string(),
+                out_name: out_name.to_string(),
+                want_separate_vmaf: false,
+            }));
+            ExistingDeliverOutcome::VmafSubmitted
+        }
+        Err(e) => {
+            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                "Flamenco VMAF-only (exists) failed ({item_label}): {e}"
+            ))));
+            ExistingDeliverOutcome::Failed
+        }
+    }
+}
+
 enum AppEvent {
     Encode(EncodeEvent),
     CheckDone(Result<CheckReport, String>),
@@ -2728,10 +2800,23 @@ impl GigaMuxApp {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| job_built.final_output.display().to_string());
                     if job_built.final_output.is_file() {
-                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                            "Flamenco skip (exists): {out_name}"
-                        ))));
-                        skipped += 1;
+                        let check = resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
+                        match farm_submit_existing_deliver(
+                            farm_vmaf,
+                            &req.input,
+                            &job_built.final_output,
+                            &out_name,
+                            &item_label,
+                            &url,
+                            exe,
+                            &check,
+                            twoway,
+                            &tx,
+                        ) {
+                            ExistingDeliverOutcome::Skipped => skipped += 1,
+                            ExistingDeliverOutcome::VmafSubmitted => ok += 1,
+                            ExistingDeliverOutcome::Failed => failed += 1,
+                        }
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                         continue;
                     }
@@ -2825,10 +2910,23 @@ impl GigaMuxApp {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| job_built.final_output.display().to_string());
                     if job_built.final_output.is_file() {
-                        let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                            "Flamenco skip (exists): {out_name}"
-                        ))));
-                        skipped += 1;
+                        let check = resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
+                        match farm_submit_existing_deliver(
+                            farm_vmaf,
+                            &req.input,
+                            &job_built.final_output,
+                            &out_name,
+                            &item_label,
+                            &url,
+                            exe,
+                            &check,
+                            twoway,
+                            &tx,
+                        ) {
+                            ExistingDeliverOutcome::Skipped => skipped += 1,
+                            ExistingDeliverOutcome::VmafSubmitted => ok += 1,
+                            ExistingDeliverOutcome::Failed => failed += 1,
+                        }
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                         continue;
                     }
@@ -2927,12 +3025,25 @@ impl GigaMuxApp {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| cmd.output.display().to_string());
-                // Same as local encode: never replace an existing deliver (do not submit).
+                // Never replace an existing deliver; VMAF-only when Farm VMAF ≠ Off.
                 if cmd.output.is_file() {
-                    let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                        "Flamenco skip (exists): {out_name}"
-                    ))));
-                    skipped += 1;
+                    let check = resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
+                    match farm_submit_existing_deliver(
+                        farm_vmaf,
+                        &req.input,
+                        &cmd.output,
+                        &out_name,
+                        &item_label,
+                        &url,
+                        exe,
+                        &check,
+                        twoway,
+                        &tx,
+                    ) {
+                        ExistingDeliverOutcome::Skipped => skipped += 1,
+                        ExistingDeliverOutcome::VmafSubmitted => ok += 1,
+                        ExistingDeliverOutcome::Failed => failed += 1,
+                    }
                     let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                     continue;
                 }

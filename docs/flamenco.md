@@ -122,6 +122,8 @@ Flamenco soft-fail retries only that task, so `mux` and `remux` stay separate (a
 | Attached | Trailing `ensure-vmaf` on the encode job (task_type `vmaf` — those workers need `libvmaf`) |
 | Separate | After encode **completed**, submit a VMAF-only job (task_type `vmaf`) |
 
+If the deliver **already exists**, encode is skipped; with Attached or Separate, GigaMux submits a **VMAF-only** job for that pair instead (unless `{deliver}.vmaf.json` already has a score).
+
 Right-click the main **VMAF** button to submit a VMAF-only job for unscored completed finals (`vmaf`).
 
 `gigamux-check ensure-vmaf` writes `{deliver}.vmaf.json` next to the output and **skips** ffmpeg when that sidecar already has a score (soft-fail/retry never redoes heavy scoring). Local VMAF writes the same sidecar and skips pairs that already have one (manual / idle / single-file); farm **Attached** omits the trailing task when the sidecar exists, and Separate / right-click batch already skip scored finals. Alpha WebMs decode via libvpx; before `libvmaf`, each side is probed for **straight vs premultiplied** association (short YAVG sample: if `premultiply` removes ≥15% mean luma → straight) and flattened onto black accordingly. Straight gets `premultiply`, already-premul only drops A (no double-darken). Native VP9 without libvpx drops α and compares transparent-region YUV trash. GigaMux imports sidecars into the preview cache on list refresh / farm poll. Redeploy `GigaMux.js` and update worker `gigamux-check` after this change.
