@@ -929,12 +929,14 @@ fn resolve_pairs(
 /// Score one pair (`only_basename`), an output-name allowlist, or every matched pair.
 /// Also writes a gzipped per-job log under `%APPDATA%\GigaMux\config\logs\`.
 /// `slots` is non-test `(None, …)` or one entry per active test batch.
+/// When `force`, ignore existing `{out}.vmaf.json` and re-run libvmaf (overwrite sidecar).
 pub fn run_vmaf(
     input_dir: &Path,
     output_dir: &Path,
     slots: &[(Option<TestBatch>, OutputTargets)],
     only_basename: Option<String>,
     only_outputs: Option<HashSet<String>>,
+    force: bool,
     cancel: &AtomicBool,
     mut on_event: impl FnMut(VmafEvent),
 ) -> Result<VmafReport, String> {
@@ -1009,28 +1011,36 @@ pub fn run_vmaf(
             total: total_files,
             duration_s: *duration_s,
         });
-        // Durable skip: same `{out}.vmaf.json` as farm `ensure-vmaf` (no re-libvmaf).
+        // Durable skip: same `{out}.vmaf.json` as farm `ensure-vmaf` (no re-libvmaf) unless `force`.
         let sidecar = vmaf_sidecar_path(out_path);
-        if let Some(sc) = read_vmaf_sidecar(&sidecar) {
-            ok += 1;
+        if !force {
+            if let Some(sc) = read_vmaf_sidecar(&sidecar) {
+                ok += 1;
+                on_event(VmafEvent::Log(format!(
+                    "VMAF {}/{}: {in_name} → {out_name} — skip (sidecar {:.4})",
+                    i + 1,
+                    total_files,
+                    sc.score
+                )));
+                on_event(VmafEvent::FileDone {
+                    name: in_name.clone(),
+                    output: out_name.clone(),
+                    score: sc.score,
+                });
+                report.results.push(VmafResult {
+                    input: in_name.clone(),
+                    output: out_name.clone(),
+                    score: Some(sc.score),
+                    error: None,
+                });
+                continue;
+            }
+        } else if sidecar.is_file() {
             on_event(VmafEvent::Log(format!(
-                "VMAF {}/{}: {in_name} → {out_name} — skip (sidecar {:.4})",
+                "VMAF {}/{}: {in_name} → {out_name}: re-score (ignoring sidecar)",
                 i + 1,
-                total_files,
-                sc.score
+                total_files
             )));
-            on_event(VmafEvent::FileDone {
-                name: in_name.clone(),
-                output: out_name.clone(),
-                score: sc.score,
-            });
-            report.results.push(VmafResult {
-                input: in_name.clone(),
-                output: out_name.clone(),
-                score: Some(sc.score),
-                error: None,
-            });
-            continue;
         }
         on_event(VmafEvent::Log(format!(
             "VMAF {}/{}: {in_name} → {out_name}…",
