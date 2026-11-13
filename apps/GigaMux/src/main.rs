@@ -53,7 +53,7 @@ use gigamux_core::probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, file_info, format_bytes,
     format_length, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,
     rate_mode_heat, size_delta, thumbnail_rgba, truncate_cli_err, video_has_alpha, FrameTiming,
-    MediaSummary, RgbaThumb, SizeDelta, THUMB_W,
+    MediaSummary, RgbaThumb, SizeDelta, THUMB_FMT, THUMB_H, THUMB_W,
 };
 use gigamux_core::targets::{
     audio_encode_for, audio_must_recode, cycle_alpha_container, cycle_opaque_container, pair_stem,
@@ -1415,14 +1415,14 @@ impl GigaMuxApp {
             let Some(summary) = e.summary.clone() else {
                 continue;
             };
-            let (thumb_file, thumb_width, thumb_height, thumb_err) = match &e.thumb {
+            let (thumb_file, thumb_width, thumb_height, thumb_err, thumb_fmt) = match &e.thumb {
                 Some(Ok(thumb)) => match preview_cache::write_thumb(key, thumb) {
-                    Ok(name) => (Some(name), thumb.width, thumb.height, None),
-                    Err(err) => (None, 0, 0, Some(truncate_cli_err(&err, 800))),
+                    Ok(name) => (Some(name), thumb.width, thumb.height, None, THUMB_FMT),
+                    Err(err) => (None, 0, 0, Some(truncate_cli_err(&err, 800)), 0),
                 },
                 // Don't persist multi‑k‑line ffmpeg dumps into preview_cache.json.
-                Some(Err(err)) => (None, 0, 0, Some(truncate_cli_err(err, 800))),
-                None => (None, 0, 0, None),
+                Some(Err(err)) => (None, 0, 0, Some(truncate_cli_err(err, 800)), 0),
+                None => (None, 0, 0, None, 0),
             };
             entries.insert(
                 key.clone(),
@@ -1435,6 +1435,7 @@ impl GigaMuxApp {
                     thumb_width,
                     thumb_height,
                     thumb_err,
+                    thumb_fmt,
                     bitrates_ready: e.bitrates_ready,
                     vmaf_score: e.vmaf_score,
                 },
@@ -7306,12 +7307,14 @@ impl GigaMuxApp {
         };
         let key = Self::preview_key(side, &name);
         let Some(entry) = self.preview_cache.get(&key) else {
-            ui.label("Loading preview…");
+            let max_w = ui.available_width().max(1.0);
+            let scale = (max_w / THUMB_W as f32).min(1.0);
+            let size = egui::vec2(THUMB_W as f32 * scale, THUMB_H as f32 * scale);
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            egui::Spinner::new().size(28.0).paint_at(ui, rect);
+            ui.ctx().request_repaint();
             return;
         };
-        if entry.pending {
-            ui.label("Loading preview…");
-        }
         // During encode, prefer the live out-time frame over the static mid-clip thumb.
         let live_tex = self.encode_progress.as_ref().and_then(|p| {
             if p.file_name == name {
@@ -7321,13 +7324,40 @@ impl GigaMuxApp {
             }
         });
         let tex = live_tex.or(entry.texture.as_ref());
+        // Checker under transparent pixels; panel bg alone reads as solid black.
+        let has_alpha = entry
+            .summary
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .is_some_and(|s| s.has_alpha);
+        // Thumb still in flight (not a failed grab).
+        let thumb_pending = tex.is_none()
+            && match &entry.thumb {
+                Some(Err(_)) => false,
+                Some(Ok(_)) => entry.texture.is_none(), // texture hydrate on next poll
+                None => entry.pending || self.cache_rx.is_some(),
+            };
         if let Some(tex) = tex {
             // Fit inside the center column; never spill into side panes.
             let max_w = ui.available_width().max(1.0);
             let tex_size = tex.size_vec2();
             let scale = (max_w / tex_size.x).min(1.0);
             let size = egui::vec2(tex_size.x * scale, tex_size.y * scale);
-            ui.add(egui::Image::new((tex.id(), size)).maintain_aspect_ratio(true));
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            if has_alpha {
+                paint_alpha_checkerboard(ui, rect);
+            }
+            egui::Image::new((tex.id(), size))
+                .maintain_aspect_ratio(true)
+                .paint_at(ui, rect);
+        } else if thumb_pending {
+            // Reserve the normal thumb footprint so meta doesn't jump when the frame lands.
+            let max_w = ui.available_width().max(1.0);
+            let scale = (max_w / THUMB_W as f32).min(1.0);
+            let size = egui::vec2(THUMB_W as f32 * scale, THUMB_H as f32 * scale);
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            egui::Spinner::new().size(28.0).paint_at(ui, rect);
+            ui.ctx().request_repaint();
         }
         if let Some(Err(e)) = &entry.thumb {
             // Never paint raw multi‑k‑line ffmpeg dumps into egui (freezes the window).
@@ -9229,6 +9259,37 @@ fn check_group_checkbox(
         Some(on)
     } else {
         None
+    }
+}
+
+/// Classic α mat under a thumb so transparent pixels read as holes, not black.
+fn paint_alpha_checkerboard(ui: &egui::Ui, rect: egui::Rect) {
+    let cell = 8.0;
+    let (c0, c1) = if ui.visuals().dark_mode {
+        (
+            egui::Color32::from_rgb(42, 44, 48),
+            egui::Color32::from_rgb(58, 60, 66),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(200, 200, 204),
+            egui::Color32::from_rgb(240, 240, 244),
+        )
+    };
+    let painter = ui.painter();
+    let cols = (rect.width() / cell).ceil() as i32;
+    let rows = (rect.height() / cell).ceil() as i32;
+    for y in 0..rows {
+        for x in 0..cols {
+            let color = if (x + y) % 2 == 0 { c0 } else { c1 };
+            let x0 = rect.min.x + x as f32 * cell;
+            let y0 = rect.min.y + y as f32 * cell;
+            let tile = egui::Rect::from_min_max(
+                egui::pos2(x0, y0),
+                egui::pos2((x0 + cell).min(rect.max.x), (y0 + cell).min(rect.max.y)),
+            );
+            painter.rect_filled(tile, 0.0, color);
+        }
     }
 }
 

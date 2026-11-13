@@ -18,6 +18,70 @@ pub fn chunk_deliver_stem(stem: &str) -> &str {
     stem.strip_suffix(".color").unwrap_or(stem)
 }
 
+/// Hybrid alpha plane: `{stem}.alpha.ivf` or deliver-stem `{stem}.cNNNofMMM.ivf` (luma = α).
+pub fn is_hybrid_alpha_plane_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".alpha.ivf") {
+        return true;
+    }
+    if let Some((stem, _, _, ext)) = parse_chunk_filename(name) {
+        return ext.eq_ignore_ascii_case("ivf") && !stem.to_ascii_lowercase().ends_with(".color");
+    }
+    false
+}
+
+/// Hybrid color plane: `{stem}.color.ivf` or `{stem}.color.cNNNofMMM.ivf`.
+pub fn is_hybrid_color_plane_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".color.ivf") {
+        return true;
+    }
+    if let Some((stem, _, _, ext)) = parse_chunk_filename(name) {
+        return ext.eq_ignore_ascii_case("ivf") && stem.to_ascii_lowercase().ends_with(".color");
+    }
+    false
+}
+
+fn strip_ascii_suffix<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    let n = name.as_bytes();
+    let s = suffix.as_bytes();
+    if n.len() < s.len() {
+        return None;
+    }
+    let tail = &n[n.len() - s.len()..];
+    if tail.eq_ignore_ascii_case(s) {
+        Some(&name[..name.len() - s.len()])
+    } else {
+        None
+    }
+}
+
+/// Sibling plane for hybrid thumbs (`color.ivf` ↔ `alpha.ivf`, or matching chunk pair), when present.
+pub fn hybrid_plane_mate(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let dir = path.parent()?;
+    if let Some((stem, idx, count, ext)) = parse_chunk_filename(name) {
+        if !ext.eq_ignore_ascii_case("ivf") {
+            return None;
+        }
+        let mate = if stem.to_ascii_lowercase().ends_with(".color") {
+            dir.join(chunk_output_name(chunk_deliver_stem(&stem), idx, count, "ivf"))
+        } else {
+            dir.join(chunk_output_name(&format!("{stem}.color"), idx, count, "ivf"))
+        };
+        return mate.is_file().then_some(mate);
+    }
+    if let Some(stem) = strip_ascii_suffix(name, ".color.ivf") {
+        let mate = dir.join(format!("{stem}.alpha.ivf"));
+        return mate.is_file().then_some(mate);
+    }
+    if let Some(stem) = strip_ascii_suffix(name, ".alpha.ivf") {
+        let mate = dir.join(format!("{stem}.color.ivf"));
+        return mate.is_file().then_some(mate);
+    }
+    None
+}
+
 /// Inverse of [`chunk_output_name`]: `(deliver_stem, index, count, ext)`.
 /// Stem is the final deliver basename without `.cNNNofMMM` — not `Path::file_stem()`, which keeps the chunk tag.
 pub fn parse_chunk_filename(name: &str) -> Option<(String, u32, u32, String)> {

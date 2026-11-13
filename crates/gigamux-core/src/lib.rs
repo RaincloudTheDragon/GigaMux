@@ -21,7 +21,10 @@ pub use check::{
     issue_has_deletable_output, list_media, permanent_delete_file, restore_trashed_file, run_check,
     trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
-pub use chunk::{chunk_time_range, estimate_total_frames, parse_fps};
+pub use chunk::{
+    chunk_time_range, estimate_total_frames, hybrid_plane_mate, is_hybrid_alpha_plane_filename,
+    is_hybrid_color_plane_filename, parse_fps,
+};
 pub use encode::{
     build_farm_chunked_job, build_farm_ffmpeg_argv, build_farm_hybrid_job, farm_integrity_for_chunked,
     farm_integrity_for_hybrid, farm_integrity_for_single, farm_vmaf_spec, run_batch,
@@ -67,7 +70,7 @@ pub use probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
     media_summary, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,
     rate_mode_heat, size_delta, thumbnail_rgba, truncate_cli_err, video_color_meta, FrameTiming,
-    MediaSummary, RgbaThumb, SizeDelta, VideoColorMeta, THUMB_W,
+    MediaSummary, RgbaThumb, SizeDelta, VideoColorMeta, THUMB_FMT, THUMB_H, THUMB_W,
 };
 pub use targets::{
     alpha_pair_ok, audio_encode_for, audio_must_recode, cycle_alpha_container,

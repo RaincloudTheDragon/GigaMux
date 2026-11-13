@@ -6,6 +6,10 @@ use std::process::Command;
 
 use serde_json::Value;
 
+use crate::chunk::{
+    hybrid_plane_mate, is_hybrid_alpha_plane_filename, is_hybrid_color_plane_filename,
+};
+
 const DEFAULT_BITRATE_K: u32 = 20_000;
 // Explicit alpha pix_fmts; yuva*/gbra* families are also matched by prefix in video_has_alpha.
 const ALPHA_PIX_FMTS: &[&str] = &[
@@ -106,7 +110,7 @@ impl MediaSummary {
     pub const SCHEMA: u32 = 5;
 }
 
-/// RGBA thumbnail extracted via ffmpeg (fixed canvas for easy UI upload).
+/// RGBA thumbnail extracted via ffmpeg (fixed canvas for easy UI upload; alpha preserved when the source has it).
 #[derive(Debug, Clone)]
 pub struct RgbaThumb {
     pub width: u32,
@@ -116,6 +120,8 @@ pub struct RgbaThumb {
 
 pub const THUMB_W: u32 = 320;
 pub const THUMB_H: u32 = 180;
+/// Bump when the ffmpeg thumb filter/decoder choice changes in a way that invalidates on-disk `.rgba` blobs.
+pub const THUMB_FMT: u32 = 3;
 
 fn first_video_stream(info: &Value) -> Option<&Value> {
     let streams = info.get("streams")?.as_array()?;
@@ -863,7 +869,13 @@ pub fn media_summary_fast(path: &Path) -> Result<MediaSummary, String> {
         has_obs_chapters: chapter_count > 0,
         from_obs,
         encoder,
-        has_alpha: video_has_alpha(&info),
+        // Hybrid α IVF stores α as luma (no alpha_mode). Color plane + mate also gets the α chip/checker.
+        has_alpha: {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            video_has_alpha(&info)
+                || is_hybrid_alpha_plane_filename(name)
+                || (is_hybrid_color_plane_filename(name) && hybrid_plane_mate(path).is_some())
+        },
         pix_fmt: video
             .and_then(|v| v.get("pix_fmt"))
             .and_then(|v| v.as_str())
@@ -931,20 +943,84 @@ pub fn thumbnail_rgba(path: &Path, duration_s: f64) -> Result<RgbaThumb, String>
     thumbnail_rgba_at(path, seek)
 }
 
-/// Grab one letterboxed RGBA frame at `seek_s` (input seek before decode).
+/// Grab one letterboxed RGBA frame at `seek_s`.
 pub fn thumbnail_rgba_at(path: &Path, seek_s: f64) -> Result<RgbaThumb, String> {
     let seek = seek_s.max(0.0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    // Hybrid planes: α lives in a separate IVF (luma). Pair when possible; else show α as holes.
+    if is_hybrid_alpha_plane_filename(name) {
+        if let Some(color) = hybrid_plane_mate(path) {
+            return thumbnail_hybrid_planes(&color, path, seek);
+        }
+        return thumbnail_alpha_plane_only(path, seek);
+    }
+    if is_hybrid_color_plane_filename(name) {
+        if let Some(alpha) = hybrid_plane_mate(path) {
+            return thumbnail_hybrid_planes(path, &alpha, seek);
+        }
+    }
+
+    // WebM VP8/VP9 BlockAdditional α: DXVA/default → opaque; libvpx merges into yuva.
+    // Input `-ss` before `-i` often fails mid-file with libvpx+`-xerror` → was falling back opaque.
+    if thumb_needs_libvpx_for_alpha(path) {
+        return thumbnail_vp9_alpha_webm(path, seek);
+    }
+
     // Default decoder first; on AV1/libaom level failures retry NVDEC then generic `av1`.
-    match thumbnail_rgba_at_with(path, seek, None, None) {
+    match thumbnail_single(path, seek, None, None, false, None) {
         Ok(t) => Ok(t),
         Err(e) if thumb_err_suggests_av1_decoder_gap(&e) => {
-            // Keep full stderr in the Err so the UI can offer Copy while only painting a truncate.
-            thumbnail_rgba_at_with(path, seek, Some("cuda"), Some("av1_cuvid"))
-                .or_else(|_| thumbnail_rgba_at_with(path, seek, None, Some("av1")))
+            thumbnail_single(path, seek, Some("cuda"), Some("av1_cuvid"), false, None)
+                .or_else(|_| thumbnail_single(path, seek, None, Some("av1"), false, None))
                 .map_err(|e2| format!("{e}\n--- fallback ---\n{e2}"))
         }
         Err(e) => Err(e),
     }
+}
+
+fn thumb_needs_libvpx_for_alpha(path: &Path) -> bool {
+    let Ok(info) = file_info(path) else {
+        return false;
+    };
+    if !video_has_alpha(&info) {
+        return false;
+    }
+    let codec = first_video_stream(&info)
+        .and_then(|s| s.get("codec_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(codec.as_str(), "vp8" | "vp9")
+}
+
+fn thumb_has_transparency(t: &RgbaThumb) -> bool {
+    t.rgba.chunks(4).any(|px| px.get(3).copied().unwrap_or(255) < 255)
+}
+
+fn thumbnail_vp9_alpha_webm(path: &Path, seek: f64) -> Result<RgbaThumb, String> {
+    // Output seek (after `-i`) keeps BlockAdditional α; retry t=0 if mid-seek still fails.
+    let try_at = |ss: f64| {
+        thumbnail_single(path, ss, None, Some("libvpx-vp9"), true, None)
+            .or_else(|_| thumbnail_single(path, ss, None, Some("libvpx"), true, None))
+    };
+    match try_at(seek) {
+        Ok(t) if thumb_has_transparency(&t) || seek <= 0.05 => Ok(t),
+        Ok(_) | Err(_) => match try_at(0.0) {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                // Last resort: still avoid DXVA opaque “success”; surface the libvpx error.
+                Err(format!("libvpx alpha thumb failed: {e}"))
+            }
+        },
+    }
+}
+
+/// Letterbox scale/pad shared by single-input thumbs.
+fn thumb_vf_letterbox() -> String {
+    format!(
+        "format=rgba,scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:black"
+    )
 }
 
 fn thumb_err_suggests_av1_decoder_gap(err: &str) -> bool {
@@ -955,15 +1031,15 @@ fn thumb_err_suggests_av1_decoder_gap(err: &str) -> bool {
         || e.contains("no sequence header")
 }
 
-fn thumbnail_rgba_at_with(
+fn thumbnail_single(
     path: &Path,
     seek: f64,
     hwaccel: Option<&str>,
     decoder: Option<&str>,
+    ss_after_input: bool,
+    vf_override: Option<&str>,
 ) -> Result<RgbaThumb, String> {
-    let vf = format!(
-        "scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:black"
-    );
+    let vf_owned = vf_override.map(|s| s.to_string()).unwrap_or_else(thumb_vf_letterbox);
     let path_s = path.to_str().ok_or("non-utf8 path")?;
     let seek_s = format!("{seek:.3}");
     let mut args: Vec<&str> = vec![
@@ -979,25 +1055,153 @@ fn thumbnail_rgba_at_with(
     if let Some(d) = decoder {
         args.extend(["-c:v", d]);
     }
+    if ss_after_input {
+        args.extend(["-i", path_s, "-ss", &seek_s]);
+    } else {
+        args.extend(["-ss", &seek_s, "-i", path_s]);
+    }
     args.extend([
-        "-ss",
-        &seek_s,
-        "-i",
-        path_s,
         "-frames:v",
         "1",
         "-vf",
-        &vf,
+        &vf_owned,
         "-f",
         "rawvideo",
         "-pix_fmt",
         "rgba",
         "-",
     ]);
+    run_ffmpeg_rgba_stdout(&args)
+}
+
+/// α-only IVF: luma → alpha over white (checker shows through in the UI).
+fn thumbnail_alpha_plane_only(path: &Path, seek: f64) -> Result<RgbaThumb, String> {
+    let vf = format!(
+        "scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:black,format=gray"
+    );
+    // lavfi white + alphamerge; geq-from-gray is flaky across builds.
+    let path_s = path.to_str().ok_or("non-utf8 path")?;
+    let seek_s = format!("{seek:.3}");
+    let color = format!("color=c=white:s={THUMB_W}x{THUMB_H}:d=1");
+    let fc = format!("[1:v]{vf}[a];[0:v][a]alphamerge,format=rgba");
+    let args = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-xerror",
+        "-f",
+        "lavfi",
+        "-i",
+        &color,
+        "-c:v",
+        "libvpx-vp9",
+        "-ss",
+        &seek_s,
+        "-i",
+        path_s,
+        "-frames:v",
+        "1",
+        "-filter_complex",
+        &fc,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-",
+    ];
+    run_ffmpeg_rgba_stdout(&args).or_else(|_| {
+        // Output seek if input seek fails mid-chunk.
+        let args = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-xerror",
+            "-f",
+            "lavfi",
+            "-i",
+            &color,
+            "-c:v",
+            "libvpx-vp9",
+            "-i",
+            path_s,
+            "-ss",
+            "0",
+            "-frames:v",
+            "1",
+            "-filter_complex",
+            &fc,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-",
+        ];
+        run_ffmpeg_rgba_stdout(&args)
+    })
+}
+
+/// Color IVF + alpha IVF → one RGBA thumb (QSV color is often premultiplied on black).
+fn thumbnail_hybrid_planes(color: &Path, alpha: &Path, seek: f64) -> Result<RgbaThumb, String> {
+    let color_s = color.to_str().ok_or("non-utf8 color path")?;
+    let alpha_s = alpha.to_str().ok_or("non-utf8 alpha path")?;
+    let scale = format!(
+        "scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:black"
+    );
+    let fc = format!(
+        "[0:v]{scale},format=rgba[c];[1:v]{scale},format=gray[a];[c][a]alphamerge,format=rgba"
+    );
+    let run = |ss: f64| {
+        let seek_s = format!("{ss:.3}");
+        let args: Vec<String> = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-xerror",
+            "-c:v",
+            "libvpx-vp9",
+            "-i",
+            color_s,
+            "-c:v",
+            "libvpx-vp9",
+            "-i",
+            alpha_s,
+            "-ss",
+            &seek_s,
+            "-frames:v",
+            "1",
+            "-filter_complex",
+            &fc,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-",
+        ]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+        run_ffmpeg_rgba_stdout_owned(&args)
+    };
+    run(seek).or_else(|_| run(0.0))
+}
+
+fn run_ffmpeg_rgba_stdout(args: &[&str]) -> Result<RgbaThumb, String> {
     let out = Command::new("ffmpeg")
-        .args(&args)
+        .args(args)
         .output()
         .map_err(|e| format!("ffmpeg thumb: {e}"))?;
+    parse_ffmpeg_rgba_stdout(out)
+}
+
+fn run_ffmpeg_rgba_stdout_owned(args: &[String]) -> Result<RgbaThumb, String> {
+    let out = Command::new("ffmpeg")
+        .args(args)
+        .output()
+        .map_err(|e| format!("ffmpeg thumb: {e}"))?;
+    parse_ffmpeg_rgba_stdout(out)
+}
+
+fn parse_ffmpeg_rgba_stdout(out: std::process::Output) -> Result<RgbaThumb, String> {
     if !out.status.success() {
         // Full stderr kept for Copy; UI truncates for display. `-xerror` keeps this short in practice.
         return Err(format!(

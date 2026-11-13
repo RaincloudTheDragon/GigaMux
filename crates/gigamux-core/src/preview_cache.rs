@@ -8,7 +8,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 
 use crate::prefs::prefs_dir;
-use crate::probe::{MediaSummary, RgbaThumb};
+use crate::probe::{MediaSummary, RgbaThumb, THUMB_FMT};
 
 /// On-disk index (`preview_cache.json`); RGBA bytes live beside it in `preview_thumbs/`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -33,6 +33,9 @@ pub struct PersistedPreviewEntry {
     /// When thumb probe failed (no `thumb_file`).
     #[serde(default)]
     pub thumb_err: Option<String>,
+    /// Matches [`THUMB_FMT`] when the `.rgba` was written; older blobs are dropped on load.
+    #[serde(default)]
+    pub thumb_fmt: u32,
     /// False when only the fast probe ran (peaks still need enrich). Old caches default true.
     #[serde(default = "default_true")]
     pub bitrates_ready: bool,
@@ -94,9 +97,16 @@ pub fn load(schema: u32) -> PersistedPreviewCache {
     if disk.schema != schema {
         return PersistedPreviewCache::default();
     }
-    // Drop entries whose thumb file vanished.
+    // Drop missing thumb files; stale filter versions keep meta but force a re-grab.
     let thumb_root = thumbs_dir();
     disk.entries.retain(|_, e| {
+        if e.thumb_fmt < THUMB_FMT {
+            e.thumb_file = None;
+            e.thumb_err = None;
+            e.thumb_width = 0;
+            e.thumb_height = 0;
+            e.thumb_fmt = 0;
+        }
         if let Some(name) = &e.thumb_file {
             let Some(root) = thumb_root.as_ref() else {
                 return false;
