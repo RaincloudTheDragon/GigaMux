@@ -145,6 +145,9 @@ pub struct Prefs {
     /// When idle: Check then VMAF unscored intact pairs (startup/encode/toggle; then 5m while work remains, 1h when caught up). Default off.
     #[serde(default)]
     pub auto_vmaf_when_idle: bool,
+    /// On open (first output list scan): delete `{deliver}.vmaf.json` / part sidecars whose deliver media is gone. Default on.
+    #[serde(default = "default_true")]
+    pub purge_unused_vmaf_on_open: bool,
     /// Shutter-style: suspend encode/VMAF ffmpeg on input; resume after 1 s idle. Default off.
     #[serde(default)]
     pub work_during_inactivity: bool,
@@ -217,6 +220,7 @@ impl Default for Prefs {
             job_done_chime: true,
             check_ignore_orphan_outputs: false,
             auto_vmaf_when_idle: false,
+            purge_unused_vmaf_on_open: true,
             work_during_inactivity: false,
             flamenco_manager_url: String::new(),
             flamenco_scripts_dir: String::new(),

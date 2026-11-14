@@ -269,6 +269,59 @@ pub fn read_vmaf_sidecar(path: &Path) -> Option<VmafSidecar> {
     Some(sc)
 }
 
+/// Deliver path implied by a final or part VMAF sidecar name, if the suffix matches.
+fn deliver_path_for_vmaf_sidecar(sidecar: &Path) -> Option<PathBuf> {
+    let name = sidecar.file_name()?.to_str()?;
+    let parent = sidecar.parent().unwrap_or_else(|| Path::new(""));
+    if let Some(stem) = name.strip_suffix(".vmaf.json") {
+        // Part sidecars end with `.vmaf.pIIIofNNN.json`, not bare `.vmaf.json`.
+        if stem.contains(".vmaf.p") {
+            return None;
+        }
+        return Some(parent.join(stem));
+    }
+    // `{deliver}.vmaf.p000of004.json` → deliver
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^(.+)\.vmaf\.p\d+of\d+\.json$").expect("vmaf part strip re")
+    });
+    let caps = re.captures(name)?;
+    Some(parent.join(caps.get(1)?.as_str()))
+}
+
+/// Delete `{deliver}.vmaf.json` / `.vmaf.p*of*.json` whose deliver media is missing from `output_dir`.
+/// Returns how many files were removed.
+pub fn purge_unused_vmaf_sidecars(output_dir: &Path) -> Result<usize, String> {
+    if !output_dir.is_dir() {
+        return Ok(0);
+    }
+    let entries = std::fs::read_dir(output_dir)
+        .map_err(|e| format!("vmaf purge read_dir {}: {e}", output_dir.display()))?;
+    let mut removed = 0usize;
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(deliver) = deliver_path_for_vmaf_sidecar(&path) else {
+            continue;
+        };
+        if deliver.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                eprintln!(
+                    "vmaf purge: could not remove {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Atomic write of a VMAF sidecar (temp + rename).
 pub fn write_vmaf_sidecar(path: &Path, sc: &VmafSidecar) -> Result<(), String> {
     if let Some(parent) = path.parent() {
@@ -1429,6 +1482,43 @@ pub fn run_vmaf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purge_unused_vmaf_sidecars_removes_orphans_keeps_live() {
+        let dir = std::env::temp_dir().join(format!("gigamux_vmaf_purge_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("keep.mp4");
+        std::fs::write(&live, b"x").unwrap();
+        write_vmaf_sidecar(
+            &vmaf_sidecar_path(&live),
+            &VmafSidecar {
+                version: 1,
+                score: 90.0,
+                input: "in.mp4".into(),
+                output: "keep.mp4".into(),
+            },
+        )
+        .unwrap();
+        // Orphan final + part (no deliver).
+        write_vmaf_sidecar(
+            &dir.join("gone.mp4.vmaf.json"),
+            &VmafSidecar {
+                version: 1,
+                score: 80.0,
+                input: "in.mp4".into(),
+                output: "gone.mp4".into(),
+            },
+        )
+        .unwrap();
+        std::fs::write(dir.join("gone.mp4.vmaf.p000of002.json"), b"{}").unwrap();
+        let n = purge_unused_vmaf_sidecars(&dir).unwrap();
+        assert_eq!(n, 2);
+        assert!(vmaf_sidecar_path(&live).is_file());
+        assert!(!dir.join("gone.mp4.vmaf.json").exists());
+        assert!(!dir.join("gone.mp4.vmaf.p000of002.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sidecar_path_and_round_trip() {

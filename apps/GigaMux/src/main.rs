@@ -43,7 +43,8 @@ use gigamux_core::flamenco::{
 use gigamux_core::wants_qsv_alpha_hybrid;
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{
-    libvmaf_available, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path, VmafEvent, VmafReport,
+    libvmaf_available, purge_unused_vmaf_sidecars, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path,
+    VmafEvent, VmafReport,
 };
 use gigamux_core::gpu::{probe_local_encoders, GpuChoice, HwCatalog, NvencGeneration};
 use gigamux_core::job_log;
@@ -321,6 +322,8 @@ struct ListsScanResult {
     output_bytes: u64,
     /// `(out_name, input_name, score)` from `{deliver}.vmaf.json` beside outputs.
     vmaf_sidecars: Vec<(String, String, f64)>,
+    /// Orphan VMAF sidecars removed when purge-on-open / Alt purge ran with this scan.
+    vmaf_purged: usize,
 }
 
 /// Incremental preview worker messages (fast chips first, then peeks + thumb).
@@ -532,6 +535,8 @@ struct GigaMuxApp {
     lists_queued: bool,
     /// Next [`Self::start_preview_cache`] should re-read filesystem mtime into cached summaries (manual F5).
     mtime_refresh_on_next_lists: bool,
+    /// Next lists scan should purge orphan VMAF sidecars in output (startup pref / Alt purge).
+    vmaf_purge_on_next_lists: bool,
     /// Reachability from the last completed scan (never call share `is_dir` on the UI thread).
     input_dir_ok: bool,
     output_dir_ok: bool,
@@ -858,6 +863,8 @@ struct PurgePrompt {
     session_log: bool,
     file_logs: bool,
     job_logs: bool,
+    /// One-shot: delete orphan `{deliver}.vmaf.json` / part sidecars in the output folder.
+    unused_vmaf: bool,
 }
 
 impl Default for PurgePrompt {
@@ -872,6 +879,7 @@ impl Default for PurgePrompt {
             session_log: false,
             file_logs: false,
             job_logs: false,
+            unused_vmaf: true,
         }
     }
 }
@@ -886,6 +894,7 @@ impl PurgePrompt {
             || self.session_log
             || self.file_logs
             || self.job_logs
+            || self.unused_vmaf
     }
 }
 
@@ -901,6 +910,8 @@ impl GigaMuxApp {
         // Capture before move into Self; never sync-probe share paths on the UI thread.
         let input_dir_ok = !prefs.input_dir.as_os_str().is_empty();
         let output_dir_ok = !prefs.output_dir.as_os_str().is_empty();
+        // Pref on → first list scan deletes orphan VMAF sidecars in output.
+        let vmaf_purge_on_next_lists = prefs.purge_unused_vmaf_on_open;
         let mut app = Self {
             prefs,
             maxrate_override_edit,
@@ -974,6 +985,7 @@ impl GigaMuxApp {
             lists_inflight: false,
             lists_queued: false,
             mtime_refresh_on_next_lists: false,
+            vmaf_purge_on_next_lists,
             input_dir_ok,
             output_dir_ok,
         };
@@ -2073,10 +2085,11 @@ impl GigaMuxApp {
         let gen = self.lists_gen;
         let in_dir = self.prefs.input_dir.clone();
         let out_dir = self.prefs.output_dir.clone();
+        let purge_vmaf = std::mem::take(&mut self.vmaf_purge_on_next_lists);
         let (tx, rx) = mpsc::channel();
         self.lists_rx = Some(rx);
         thread::spawn(move || {
-            let _ = tx.send(scan_media_lists(gen, &in_dir, &out_dir));
+            let _ = tx.send(scan_media_lists(gen, &in_dir, &out_dir, purge_vmaf));
         });
     }
 
@@ -2165,6 +2178,12 @@ impl GigaMuxApp {
         }
         if imported > 0 {
             self.push_session(format!("imported {imported} farm VMAF sidecar(s)"));
+        }
+        if result.vmaf_purged > 0 {
+            self.push_session(format!(
+                "purged {} unused VMAF sidecar(s)",
+                result.vmaf_purged
+            ));
         }
         // Output deleted/renamed → drop orphaned input (and vice versa) VMAF so meta stays live.
         if self.scrub_stale_vmaf() {
@@ -2496,6 +2515,7 @@ impl GigaMuxApp {
             self.prefs.job_done_chime = d.job_done_chime;
             self.prefs.check_ignore_orphan_outputs = d.check_ignore_orphan_outputs;
             self.prefs.auto_vmaf_when_idle = d.auto_vmaf_when_idle;
+            self.prefs.purge_unused_vmaf_on_open = d.purge_unused_vmaf_on_open;
             self.prefs.work_during_inactivity = d.work_during_inactivity;
             self.prefs.flamenco_manager_url = d.flamenco_manager_url;
             self.prefs.flamenco_scripts_dir = d.flamenco_scripts_dir;
@@ -2539,6 +2559,12 @@ impl GigaMuxApp {
                 Ok(n) => parts.push(format!("job logs ({n})")),
                 Err(e) => self.alert_error("Purge", format!("job log purge failed: {e}")),
             }
+        }
+        if p.unused_vmaf {
+            // Run with the next output list scan (same worker path as startup purge).
+            self.vmaf_purge_on_next_lists = true;
+            parts.push("unused VMAF (queued)".into());
+            self.request_refresh_lists();
         }
 
         if parts.is_empty() {
@@ -8244,6 +8270,18 @@ impl GigaMuxApp {
         }
         if ui
             .checkbox(
+                &mut self.prefs.purge_unused_vmaf_on_open,
+                "Purge unused VMAF sidecars on open",
+            )
+            .on_hover_text(
+                "At launch, delete `{deliver}.vmaf.json` / part sidecars in Output whose deliver media is missing. Also offered when holding Alt at start.",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
+        if ui
+            .checkbox(
                 &mut self.prefs.check_ignore_orphan_outputs,
                 "Check: ignore outputs without inputs",
             )
@@ -8691,6 +8729,15 @@ impl GigaMuxApp {
                 ui.checkbox(&mut prompt.session_log, "Session log");
                 ui.checkbox(&mut prompt.file_logs, "Per-file logs (this session)");
                 ui.checkbox(&mut prompt.job_logs, "Job logs (encode + VMAF .log.gz)");
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Output").strong().small());
+                ui.checkbox(
+                    &mut prompt.unused_vmaf,
+                    "Unused VMAF sidecars (deliver missing)",
+                )
+                .on_hover_text(
+                    "Delete `{deliver}.vmaf.json` / `.vmaf.p*of*.json` in the output folder when the deliver file is gone.",
+                );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let can = prompt.any_selected();
@@ -10304,9 +10351,22 @@ fn short_path(path: &Path) -> String {
 }
 
 /// Background folder scan: `list_media` + sizes + VMAF sidecars (safe to block here, not on UI).
-fn scan_media_lists(gen: u64, input_dir: &Path, output_dir: &Path) -> ListsScanResult {
+fn scan_media_lists(
+    gen: u64,
+    input_dir: &Path,
+    output_dir: &Path,
+    purge_unused_vmaf: bool,
+) -> ListsScanResult {
     let input_ok = prefs::dir_ok(input_dir);
     let output_ok = prefs::dir_ok(output_dir);
+    let vmaf_purged = if purge_unused_vmaf && output_ok {
+        purge_unused_vmaf_sidecars(output_dir).unwrap_or_else(|e| {
+            eprintln!("vmaf purge: {e}");
+            0
+        })
+    } else {
+        0
+    };
     let input_files = if input_ok {
         list_media(input_dir, true)
     } else {
@@ -10327,7 +10387,8 @@ fn scan_media_lists(gen: u64, input_dir: &Path, output_dir: &Path) -> ListsScanR
                 let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if !name.ends_with(".vmaf.json") {
+                // Final sidecars only (`….mp4.vmaf.json`); skip `….vmaf.p000of004.json`.
+                if !name.ends_with(".vmaf.json") || name.contains(".vmaf.p") {
                     continue;
                 }
                 let Some(sc) = read_vmaf_sidecar(&path) else {
@@ -10350,6 +10411,7 @@ fn scan_media_lists(gen: u64, input_dir: &Path, output_dir: &Path) -> ListsScanR
         input_bytes,
         output_bytes,
         vmaf_sidecars,
+        vmaf_purged,
     }
 }
 

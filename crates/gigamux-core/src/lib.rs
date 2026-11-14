@@ -84,7 +84,8 @@ pub use targets::{
 };
 pub use vmaf::{
     ensure_vmaf, ensure_vmaf_part, libvmaf_available, libvmaf_available_exe, merge_vmaf_parts,
-    read_vmaf_sidecar, resolve_ffmpeg_for_vmaf, run_vmaf, vmaf_part_sidecar_path, vmaf_sidecar_path,
-    write_vmaf_sidecar, VmafEvent, VmafPartSidecar, VmafReport, VmafResult, VmafSidecar,
+    purge_unused_vmaf_sidecars, read_vmaf_sidecar, resolve_ffmpeg_for_vmaf, run_vmaf,
+    vmaf_part_sidecar_path, vmaf_sidecar_path, write_vmaf_sidecar, VmafEvent, VmafPartSidecar,
+    VmafReport, VmafResult, VmafSidecar,
 };
 pub use webm_alpha::wants_qsv_alpha_hybrid;
