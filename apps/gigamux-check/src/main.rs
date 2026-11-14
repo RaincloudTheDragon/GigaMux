@@ -7,7 +7,7 @@
 //! - `gigamux-check ensure-vmaf-part <ref> <dist> <part_sidecar> <start_frame> <frame_count> <fps> [ffmpeg_exe]` (temporal slice; sidecar name `*.vmaf.pIIIofNNN.json`)
 //! - `gigamux-check merge-vmaf <final_sidecar> <part_sidecar…>` (frame-weighted mean → final; deletes parts)
 //! - `gigamux-check chunk <path> <expect_dur_secs>`
-//! - `gigamux-check final <input> <output> <opaque_video> <opaque_container> <alpha_video> <alpha_container>`
+//! - `gigamux-check final <input> <output> <opaque_video> <opaque_container> <alpha_video> <alpha_container> [preserve_mtime]` (`preserve_mtime`: `true`/`false`, default true)
 //! - `gigamux-check cleanup <dir> <stem> <ext> <chunks>`
 //! - `gigamux-check mux-alpha-webm <color.ivf> <alpha.ivf> <out.webm> [range] [space] [primaries] [transfer]`
 //! - `gigamux-check farm-probe <out_dir>` (write `{host}.json` GPU/QSV/VMAF inventory)
@@ -245,8 +245,18 @@ fn main() -> ExitCode {
             let oc = args.next().unwrap_or_default();
             let av = args.next().unwrap_or_default();
             let ac = args.next().unwrap_or_default();
+            // Optional; omit / empty → true (old jobs + default-on pref).
+            let preserve_mtime = match args.next().unwrap_or_default().to_ascii_lowercase().as_str()
+            {
+                "" | "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                other => {
+                    eprintln!("final: bad preserve_mtime {other:?} (want true/false)");
+                    return ExitCode::from(2);
+                }
+            };
             if input.is_empty() || output.is_empty() {
-                eprintln!("final: need input output opaque_video opaque_container alpha_video alpha_container");
+                eprintln!("final: need input output opaque_video opaque_container alpha_video alpha_container [preserve_mtime]");
                 return ExitCode::from(2);
             }
             let spec = match (|| -> Result<FarmFinalCheck, String> {
@@ -257,6 +267,7 @@ fn main() -> ExitCode {
                     opaque_container: parse_container(&oc)?,
                     alpha_video: parse_alpha_video(&av)?,
                     alpha_container: parse_container(&ac)?,
+                    preserve_mtime,
                 })
             })() {
                 Ok(s) => s,
@@ -269,6 +280,7 @@ fn main() -> ExitCode {
                 PathBuf::from(&spec.input).as_path(),
                 PathBuf::from(&spec.output).as_path(),
                 spec.targets(),
+                spec.preserve_mtime,
             )
         }
         "cleanup" => {

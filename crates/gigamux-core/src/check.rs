@@ -267,10 +267,12 @@ pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
 }
 
 /// One input/output pair integrity check (same rules as directory Check).
+/// When `preserve_mtime`, copy input mtime onto the deliver after a successful check (best-effort warn).
 pub fn check_output_pair(
     input_path: &Path,
     output_path: &Path,
     targets: OutputTargets,
+    preserve_mtime: bool,
 ) -> Result<(), String> {
     if !input_path.is_file() {
         return Err(format!("input missing: {}", input_path.display()));
@@ -281,7 +283,19 @@ pub fn check_output_pair(
     let input_info = file_info(input_path)?;
     let output_info = file_info(output_path)?;
     match check_pair_inner(output_path, &input_info, &output_info, targets) {
-        None => Ok(()),
+        None => {
+            if preserve_mtime {
+                match crate::probe::copy_mtime(input_path, output_path) {
+                    Ok(()) => eprintln!(
+                        "mtime preserved {} → {}",
+                        input_path.display(),
+                        output_path.display()
+                    ),
+                    Err(e) => eprintln!("mtime preserve {}: {e}", output_path.display()),
+                }
+            }
+            Ok(())
+        }
         Some(msg) => Err(msg),
     }
 }

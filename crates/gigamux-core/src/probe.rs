@@ -1,10 +1,28 @@
 //! ffprobe helpers: file info, alpha detect, peak bitrate for encode ceilings.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 use std::process::Command;
+use std::time::UNIX_EPOCH;
 
+use chrono::{Local, TimeZone};
 use serde_json::Value;
+
+/// Copy `src`’s modified time onto `dst` (best-effort after a successful write).
+pub fn copy_mtime(src: &Path, dst: &Path) -> Result<(), String> {
+    let mtime = std::fs::metadata(src)
+        .map_err(|e| format!("mtime read {}: {e}", src.display()))?
+        .modified()
+        .map_err(|e| format!("mtime modified {}: {e}", src.display()))?;
+    let f = File::options()
+        .write(true)
+        .open(dst)
+        .map_err(|e| format!("mtime open {}: {e}", dst.display()))?;
+    f.set_modified(mtime)
+        .map_err(|e| format!("mtime set {}: {e}", dst.display()))?;
+    Ok(())
+}
 
 use crate::chunk::{
     hybrid_plane_mate, is_hybrid_alpha_plane_filename, is_hybrid_color_plane_filename,
@@ -103,11 +121,14 @@ pub struct MediaSummary {
     /// First video stream `pix_fmt` (e.g. yuv422p); empty when unknown.
     #[serde(default)]
     pub pix_fmt: String,
+    /// Filesystem modification time as Unix seconds (`0` = unknown).
+    #[serde(default)]
+    pub mtime_unix: i64,
 }
 
 impl MediaSummary {
     /// Bump when summary fields change so UI preview cache re-fetches.
-    pub const SCHEMA: u32 = 5;
+    pub const SCHEMA: u32 = 6;
 }
 
 /// RGBA thumbnail extracted via ffmpeg (fixed canvas for easy UI upload; alpha preserved when the source has it).
@@ -726,6 +747,19 @@ pub fn size_delta(input_bytes: u64, output_bytes: u64) -> Option<SizeDelta> {
     }
 }
 
+/// Local wall time for a Unix mtime (`—` when unknown).
+pub fn format_mtime(unix_secs: i64) -> String {
+    if unix_secs <= 0 {
+        return "—".into();
+    }
+    match Local.timestamp_opt(unix_secs, 0) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+            dt.format("%Y-%m-%d %H:%M:%S").to_string()
+        }
+        chrono::LocalResult::None => "—".into(),
+    }
+}
+
 /// Collapsing length: `M:SS` or `H:MM:SS` (no frame digits).
 pub fn format_length(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
@@ -846,6 +880,14 @@ pub fn media_summary_fast(path: &Path) -> Result<MediaSummary, String> {
         .unwrap_or(0);
     let (from_obs, encoder) = detect_obs_origin(&info);
 
+    // Same fingerprint source as preview_cache (indexed with the summary).
+    let mtime_unix = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
     Ok(MediaSummary {
         container,
         duration_s,
@@ -881,6 +923,7 @@ pub fn media_summary_fast(path: &Path) -> Result<MediaSummary, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_ascii_lowercase(),
+        mtime_unix,
     })
 }
 

@@ -103,6 +103,9 @@ pub struct Prefs {
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
     pub preserve_obs_metadata: bool,
+    /// Copy input file mtime onto the final deliver after a successful encode. Default on.
+    #[serde(default = "default_true")]
+    pub preserve_mtime: bool,
     /// Stamp `GigaMux_encoder` / `GigaMux_hw` into output containers. Default on.
     #[serde(default = "default_true")]
     pub write_encoder_metadata: bool,
@@ -200,6 +203,7 @@ impl Default for Prefs {
             input_dir: PathBuf::new(),
             output_dir: PathBuf::new(),
             preserve_obs_metadata: false,
+            preserve_mtime: true,
             write_encoder_metadata: true,
             use_peak_bitrate: false,
             test_mode: false,

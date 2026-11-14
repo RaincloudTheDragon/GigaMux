@@ -51,7 +51,8 @@ use gigamux_core::prefs::{self, EncodeSlot, Prefs};
 use gigamux_core::preview_cache::{self, PersistedPreviewCache, PersistedPreviewEntry};
 use gigamux_core::probe::{
     codec_heat, codec_tag, container_heat, enrich_summary_bitrates, file_info, format_bytes,
-    format_length, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,
+    format_length, format_mtime, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat,
+    rate_mode_chip_tag,
     rate_mode_heat, size_delta, thumbnail_rgba, truncate_cli_err, video_has_alpha, FrameTiming,
     MediaSummary, RgbaThumb, SizeDelta, THUMB_FMT, THUMB_H, THUMB_W,
 };
@@ -341,6 +342,13 @@ enum PreviewMsg {
         name: String,
         thumb: Result<RgbaThumb, String>,
     },
+    /// Manual F5: refresh filesystem mtime/size only (keep chips/thumb).
+    Mtime {
+        gen: u64,
+        name: String,
+        file_size: u64,
+        mtime_secs: i64,
+    },
 }
 
 /// Cached thumb + metadata for one file (RAM + optional AppData persistence).
@@ -522,6 +530,8 @@ struct GigaMuxApp {
     lists_inflight: bool,
     /// Another refresh was requested while a scan was already running.
     lists_queued: bool,
+    /// Next [`Self::start_preview_cache`] should re-read filesystem mtime into cached summaries (manual F5).
+    mtime_refresh_on_next_lists: bool,
     /// Reachability from the last completed scan (never call share `is_dir` on the UI thread).
     input_dir_ok: bool,
     output_dir_ok: bool,
@@ -963,6 +973,7 @@ impl GigaMuxApp {
             lists_rx: None,
             lists_inflight: false,
             lists_queued: false,
+            mtime_refresh_on_next_lists: false,
             input_dir_ok,
             output_dir_ok,
         };
@@ -1622,6 +1633,7 @@ impl GigaMuxApp {
     /// Drop stale cache entries; fast-probe chips in parallel, then enrich peeks + thumbs.
     /// During local VMAF, only chip-index new/changed files (defer peeks/thumbs until the job ends).
     fn start_preview_cache(&mut self) {
+        let refresh_mtime = std::mem::take(&mut self.mtime_refresh_on_next_lists);
         let mut jobs: Vec<(String, PathBuf)> = Vec::new();
         for (side, files, dir) in [
             (FileSide::Input, &self.input_files, &self.prefs.input_dir),
@@ -1644,9 +1656,14 @@ impl GigaMuxApp {
         let defer_enrich = self.vmaf_job_active();
         let mut to_fast = VecDeque::new();
         let mut to_enrich = VecDeque::new();
+        let mut to_mtime = VecDeque::new();
         for (key, path) in jobs {
             if let Some(e) = self.preview_cache.get(&key) {
                 if e.fresh_for_ui(&path) {
+                    // Manual F5: cheap fingerprint so center-column mtime isn't sticky after farm preserve.
+                    if refresh_mtime {
+                        to_mtime.push_back((key.clone(), path.clone()));
+                    }
                     let need_rates = !e.bitrates_ready;
                     let need_thumb = e.thumb.is_none();
                     if !defer_enrich && (need_rates || need_thumb) {
@@ -1659,7 +1676,7 @@ impl GigaMuxApp {
                 .insert(key.clone(), PreviewCacheEntry::pending());
             to_fast.push_back((key, path));
         }
-        if to_fast.is_empty() && to_enrich.is_empty() {
+        if to_fast.is_empty() && to_enrich.is_empty() && to_mtime.is_empty() {
             return;
         }
 
@@ -1670,10 +1687,12 @@ impl GigaMuxApp {
 
         let fast_q = Arc::new(Mutex::new(to_fast));
         let enrich_q = Arc::new(Mutex::new(to_enrich));
+        let mtime_q = Arc::new(Mutex::new(to_mtime));
         let workers = self.preview_worker_count();
         for _ in 0..workers {
             let fast_q = Arc::clone(&fast_q);
             let enrich_q = Arc::clone(&enrich_q);
+            let mtime_q = Arc::clone(&mtime_q);
             let gen_flag = Arc::clone(&gen_flag);
             let tx = tx.clone();
             thread::spawn(move || {
@@ -1708,6 +1727,24 @@ impl GigaMuxApp {
                                 });
                                 let thumb = thumbnail_rgba(&path, s.duration_s);
                                 let _ = tx.send(PreviewMsg::Thumb { gen, name, thumb });
+                            }
+                        }
+                        continue;
+                    }
+                    let next_mtime = mtime_q.lock().ok().and_then(|mut q| q.pop_front());
+                    if let Some((name, path)) = next_mtime {
+                        if let Some((file_size, mtime_secs)) = preview_cache::file_fingerprint(&path)
+                        {
+                            if tx
+                                .send(PreviewMsg::Mtime {
+                                    gen,
+                                    name,
+                                    file_size,
+                                    mtime_secs,
+                                })
+                                .is_err()
+                            {
+                                break;
                             }
                         }
                         continue;
@@ -1837,6 +1874,24 @@ impl GigaMuxApp {
                     .or_insert_with(PreviewCacheEntry::pending);
                 entry.thumb = Some(thumb);
                 entry.texture = texture;
+            }
+            PreviewMsg::Mtime {
+                gen,
+                name,
+                file_size,
+                mtime_secs,
+            } => {
+                if gen != self.cache_gen.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some(entry) = self.preview_cache.get_mut(&name) else {
+                    return;
+                };
+                entry.file_size = file_size;
+                entry.mtime_secs = mtime_secs;
+                if let Some(Ok(s)) = entry.summary.as_mut() {
+                    s.mtime_unix = mtime_secs;
+                }
             }
         }
     }
@@ -2085,6 +2140,7 @@ impl GigaMuxApp {
             }
         }
         if self.input_files.is_empty() && self.output_files.is_empty() {
+            self.mtime_refresh_on_next_lists = false;
             self.cache_gen.fetch_add(1, Ordering::Relaxed);
             self.cache_rx = None;
             // Preserve undo-parked thumbs/metadata even when both panes are empty.
@@ -2433,6 +2489,7 @@ impl GigaMuxApp {
         }
         if p.misc {
             self.prefs.preserve_obs_metadata = d.preserve_obs_metadata;
+            self.prefs.preserve_mtime = d.preserve_mtime;
             self.prefs.write_encoder_metadata = d.write_encoder_metadata;
             self.prefs.warn_recycle_delete = d.warn_recycle_delete;
             self.prefs.warn_permanent_delete = d.warn_permanent_delete;
@@ -2691,6 +2748,7 @@ impl GigaMuxApp {
         let output_dir = self.prefs.output_dir.clone();
         let hw = self.hw.clone();
         let preserve_obs_metadata = self.prefs.preserve_obs_metadata;
+        let preserve_mtime = self.prefs.preserve_mtime;
         let write_encoder_metadata = self.prefs.write_encoder_metadata;
         let use_peak_bitrate = self.prefs.use_peak_bitrate;
         let check_exe = self.prefs.flamenco_check_exe.clone();
@@ -2775,6 +2833,7 @@ impl GigaMuxApp {
                     gpu: GpuChoice::Any,
                     hw: hw.clone(),
                     preserve_obs_metadata,
+                    preserve_mtime,
                     write_encoder_metadata,
                     use_peak_bitrate,
                     slot: slot.clone(),
@@ -3918,6 +3977,7 @@ impl GigaMuxApp {
             gpu: GpuChoice::Any,
             hw: self.hw.clone(),
             preserve_obs_metadata: self.prefs.preserve_obs_metadata,
+            preserve_mtime: self.prefs.preserve_mtime,
             write_encoder_metadata: self.prefs.write_encoder_metadata,
             use_peak_bitrate: self.prefs.use_peak_bitrate,
             test_mode: self.prefs.test_mode,
@@ -5061,20 +5121,22 @@ impl GigaMuxApp {
         } else if ctrl_z {
             self.undo_last_delete();
         }
-        // F5 = re-index files (keep meta/thumb cache); Ctrl+F5 = wipe cache then re-index.
+        // F5 = re-index files (keep meta/thumb cache) + refresh filesystem mtimes; Ctrl+F5 = wipe cache then re-index.
         // Safe during local VMAF: lists + chip index only (peeks deferred); don't Shutter-pause ffmpeg.
         if ctrl_f5 {
+            self.mtime_refresh_on_next_lists = false;
             self.clear_preview_cache();
             self.request_refresh_lists();
             self.last_system_idle_ms = 0;
             self.push_session("cleared preview cache; reloaded file lists");
         } else if f5 {
+            self.mtime_refresh_on_next_lists = true;
             self.request_refresh_lists();
             self.last_system_idle_ms = 0;
             self.push_session(if self.vmaf_job_active() {
-                "reloaded file lists (VMAF running; chips only until job ends)"
+                "reloaded file lists + mtimes (VMAF running; chips only until job ends)"
             } else {
-                "reloaded file lists"
+                "reloaded file lists + mtimes"
             });
         }
         if f12 {
@@ -7827,6 +7889,7 @@ impl GigaMuxApp {
                     },
                 );
                 row(ui, "Length", &format_length(s.duration_s));
+                row(ui, "mtime", &format_mtime(s.mtime_unix));
                 row(
                     ui,
                     "Encoder",
@@ -8073,6 +8136,18 @@ impl GigaMuxApp {
             )
             .on_hover_text(
                 "Keep creation time / chapters / tags from OBS Hybrid MP4 across re-encode",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.preserve_mtime,
+                "Preserve source mtime on deliver",
+            )
+            .on_hover_text(
+                "Copy the input file’s modification time onto the final deliver after a successful encode (local and farm)",
             )
             .changed()
         {

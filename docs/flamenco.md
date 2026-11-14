@@ -136,6 +136,8 @@ Right-click the main **VMAF** button to submit a VMAF-only job for unscored comp
 
 `mux` / `remux` run `setts=TS-STARTPTS` so A/V start times land at zero; residual A/V start / container skew on Check is a Low WARN only (does not hard-fail or block cleanup). Farm `final` compares **video-stream** durations (not audio-led container tags). Local MP4 encode and farm MP4 remux use `-movflags +use_metadata_tags` so `GigaMux_version` / `GigaMux_*` tags show in ffprobe (Lavf may still overwrite the standard `encoder` tag).
 
+**Preserve source mtime on deliver** (Settings → Files, default on): after a successful local encode or farm `final-check`, the deliver’s filesystem mtime is copied from the input (capture-ordered sort). Sidecars / chunks / plane IVFs / `.vmux.*` are left alone. Farm apply runs inside `gigamux-check final` — redeploy the worker helper after upgrading.
+
 Flamenco (not GigaMux) soft-fails a task across ~3 workers before marking the task `failed`. The **job** only goes `failed` when enough tasks have failed (Manager percentage threshold) or no worker can finish it; one failed `final-check` among dozens of chunk tasks can leave the job `active`.
 
 `mux` stages through Matroska so multi-audio MP4 copy does not hit mid-file `-22`; there is no `.vcat` intermediate (join+audio is one pass). On a bad final, requeue `remux` + `final-check` (and `mux` only if `.vmux.mkv` is missing/bad).

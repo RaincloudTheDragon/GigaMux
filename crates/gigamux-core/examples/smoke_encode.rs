@@ -19,6 +19,7 @@ fn main() {
         gpu: GpuChoice::Any,
         hw: probe_local_encoders(),
         preserve_obs_metadata: false,
+        preserve_mtime: true,
         write_encoder_metadata: true,
         use_peak_bitrate: false,
         test_mode: false,

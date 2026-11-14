@@ -68,10 +68,11 @@ pub use gpu::{
 }; // NvencGeneration used by EncodeSlot.nvenc_gen + farm tags
 pub use prefs::{logs_dir, EncodeSlot, Prefs};
 pub use probe::{
-    codec_heat, codec_tag, container_heat, enrich_summary_bitrates, format_bytes, format_length,
-    media_summary, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat, rate_mode_chip_tag,
-    rate_mode_heat, size_delta, thumbnail_rgba, truncate_cli_err, video_color_meta, FrameTiming,
-    MediaSummary, RgbaThumb, SizeDelta, VideoColorMeta, THUMB_FMT, THUMB_H, THUMB_W,
+    codec_heat, codec_tag, container_heat, copy_mtime, enrich_summary_bitrates, format_bytes,
+    format_length, format_mtime, media_summary, media_summary_fast, pix_fmt_chip_tag, pix_fmt_heat,
+    rate_mode_chip_tag, rate_mode_heat, size_delta, thumbnail_rgba, truncate_cli_err,
+    video_color_meta, FrameTiming, MediaSummary, RgbaThumb, SizeDelta, VideoColorMeta, THUMB_FMT,
+    THUMB_H, THUMB_W,
 };
 pub use targets::{
     alpha_pair_ok, audio_encode_for, audio_must_recode, cycle_alpha_container,

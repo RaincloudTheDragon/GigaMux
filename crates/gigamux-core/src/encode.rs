@@ -16,6 +16,7 @@ use crate::chunk::{
 use crate::flamenco::{
     FarmChunkCheck, FarmCleanup, FarmFinalCheck, FarmVmafPart, FarmVmafSpec, FlamencoIntegrity,
 };
+use crate::probe::copy_mtime;
 use crate::vmaf::{vmaf_part_sidecar_path, vmaf_sidecar_path};
 use crate::gpu::{encoder_metadata_tags, GpuChoice, HwCatalog};
 use crate::job_log::{JobLog, JobLogKind};
@@ -80,6 +81,8 @@ pub struct EncodeOptions {
     /// Local probe snapshot for `GigaMux_hw` labels (generation / device).
     pub hw: HwCatalog,
     pub preserve_obs_metadata: bool,
+    /// Copy input mtime onto the final deliver after a successful encode.
+    pub preserve_mtime: bool,
     /// Write `GigaMux_encoder` / `GigaMux_hw` into outputs.
     pub write_encoder_metadata: bool,
     /// Ceiling from 1s video peak when true; otherwise average rate.
@@ -120,6 +123,8 @@ pub struct FarmEncodeRequest {
     pub gpu: GpuChoice,
     pub hw: HwCatalog,
     pub preserve_obs_metadata: bool,
+    /// Copy input mtime onto the final deliver after farm `final-check`.
+    pub preserve_mtime: bool,
     pub write_encoder_metadata: bool,
     pub use_peak_bitrate: bool,
     pub slot: EncodeSlot,
@@ -1451,6 +1456,14 @@ pub fn run_batch(
 
         match encode_result {
             Ok(()) => {
+                if opts.preserve_mtime {
+                    if let Err(e) = copy_mtime(&input, &output) {
+                        on_event(EncodeEvent::Log(format!(
+                            "mtime preserve {}: {e}",
+                            output.display()
+                        )));
+                    }
+                }
                 flush_thumbs(&mut on_event);
                 ok += 1;
                 on_event(EncodeEvent::FileDone { name: name.clone() });
@@ -2331,7 +2344,12 @@ pub fn farm_integrity_for_hybrid(
     let alpha_chunks = job.alpha_tasks.len() as u32;
     FlamencoIntegrity {
         chunk_checks: Vec::new(),
-        final_check: Some(farm_final_check(&req.input, &job.final_output, &req.slot)),
+        final_check: Some(farm_final_check(
+            &req.input,
+            &job.final_output,
+            &req.slot,
+            req.preserve_mtime,
+        )),
         cleanup: Some(FarmCleanup {
             dir: path_string(&req.output_dir),
             stem,
@@ -2346,7 +2364,12 @@ fn path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn farm_final_check(input: &Path, output: &Path, slot: &EncodeSlot) -> FarmFinalCheck {
+fn farm_final_check(
+    input: &Path,
+    output: &Path,
+    slot: &EncodeSlot,
+    preserve_mtime: bool,
+) -> FarmFinalCheck {
     FarmFinalCheck {
         input: path_string(input),
         output: path_string(output),
@@ -2354,6 +2377,7 @@ fn farm_final_check(input: &Path, output: &Path, slot: &EncodeSlot) -> FarmFinal
         opaque_container: slot.opaque_container,
         alpha_video: slot.alpha_video,
         alpha_container: slot.alpha_container,
+        preserve_mtime,
     }
 }
 
@@ -2433,7 +2457,12 @@ pub fn farm_integrity_for_single(
     cmd: &FarmFfmpegCommand,
 ) -> FlamencoIntegrity {
     FlamencoIntegrity {
-        final_check: Some(farm_final_check(&req.input, &cmd.output, &req.slot)),
+        final_check: Some(farm_final_check(
+            &req.input,
+            &cmd.output,
+            &req.slot,
+            req.preserve_mtime,
+        )),
         cleanup: None,
         ..FlamencoIntegrity::default()
     }
@@ -2468,7 +2497,12 @@ pub fn farm_integrity_for_chunked(
     let chunks = chunk_checks.len() as u32;
     FlamencoIntegrity {
         chunk_checks,
-        final_check: Some(farm_final_check(&req.input, &job.final_output, &req.slot)),
+        final_check: Some(farm_final_check(
+            &req.input,
+            &job.final_output,
+            &req.slot,
+            req.preserve_mtime,
+        )),
         cleanup: Some(FarmCleanup {
             dir: path_string(&req.output_dir),
             stem,

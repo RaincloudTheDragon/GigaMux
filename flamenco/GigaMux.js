@@ -88,7 +88,7 @@ const JOB_TYPE = {
             type: "string",
             required: false,
             default: "",
-            description: "JSON FarmFinalCheck for input→output integrity (separate task; job fails on error)",
+            description: "JSON FarmFinalCheck {input,output,opaque_*,alpha_*,preserve_mtime?} for integrity + optional source mtime on deliver (default true)",
         },
         {
             key: "cleanup_json",
@@ -506,6 +506,8 @@ function compileHybridJob(job, settings, exe, checkExe, cancelMode, vmafAttached
             finalSpec.opaque_container,
             finalSpec.alpha_video,
             finalSpec.alpha_container,
+            // Default on when omitted (old jobs / older submitters).
+            finalSpec.preserve_mtime === false ? "false" : "true",
         ]);
         if (cleanupRaw.length > 0) {
             let cleanSpec;
@@ -718,6 +720,8 @@ function compileJob(job) {
             finalSpec.opaque_container,
             finalSpec.alpha_video,
             finalSpec.alpha_container,
+            // Default on when omitted (old jobs / older submitters).
+            finalSpec.preserve_mtime === false ? "false" : "true",
         ]);
         if (cleanupRaw.length > 0) {
             let cleanSpec;

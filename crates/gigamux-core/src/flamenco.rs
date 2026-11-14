@@ -176,6 +176,13 @@ pub struct FarmFinalCheck {
     pub opaque_container: OutContainer,
     pub alpha_video: AlphaVideo,
     pub alpha_container: OutContainer,
+    /// Copy input mtime onto deliver after a successful final check. Default on (old jobs).
+    #[serde(default = "default_preserve_mtime")]
+    pub preserve_mtime: bool,
+}
+
+fn default_preserve_mtime() -> bool {
+    true
 }
 
 impl FarmFinalCheck {
@@ -2061,6 +2068,7 @@ mod tests {
                 opaque_container: OutContainer::Mp4,
                 alpha_video: AlphaVideo::Vp9,
                 alpha_container: OutContainer::Webm,
+                preserve_mtime: true,
             }),
             ..FlamencoIntegrity::default()
         };
