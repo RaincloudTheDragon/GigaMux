@@ -20,7 +20,7 @@ use gigamux_core::check::{
     is_chunk_filename, issue_has_deletable_output, list_media, permanent_delete_file,
     restore_trashed_file, run_check, trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
-use gigamux_core::chunk::chunk_time_range;
+use gigamux_core::chunk::{chunk_time_range, farm_auto_chunks, FARM_CHUNK_MAX};
 use gigamux_core::encode::{
     build_farm_chunked_job, build_farm_ffmpeg_argv, build_farm_hybrid_job, farm_integrity_for_chunked,
     farm_integrity_for_hybrid, farm_integrity_for_single, farm_vmaf_spec, run_batch,
@@ -808,7 +808,7 @@ struct FlamencoSubmitPrompt {
     ffmpeg_exe: String,
     /// Enable frame chunking (N encode + concat/mux).
     chunking: bool,
-    /// Chunk count when `chunking` (2..=32).
+    /// Max chunks when `chunking` (2..=128); per-job N is auto from duration.
     chunks: u32,
     /// Only chunk software/alpha paths; HW opaque stays single-task.
     only_chunk_software: bool,
@@ -2602,7 +2602,7 @@ impl GigaMuxApp {
             names,
             ffmpeg_exe: self.prefs.flamenco_ffmpeg_exe.clone(),
             chunking: self.prefs.flamenco_chunking,
-            chunks: self.prefs.flamenco_chunks.clamp(2, 32),
+            chunks: self.prefs.flamenco_chunks.clamp(2, FARM_CHUNK_MAX),
             only_chunk_software: self.prefs.flamenco_only_chunk_software,
             chunk_qsv_color: self.prefs.flamenco_chunk_qsv_color,
             farm_vmaf: FarmVmafMode::Off,
@@ -2716,7 +2716,8 @@ impl GigaMuxApp {
             }
         };
         let want_chunk = self.prefs.flamenco_chunking;
-        let chunk_n = self.prefs.flamenco_chunks.clamp(2, 32);
+        // Pref is a ceiling; per-input N = ceil(dur/3min) via farm_auto_chunks.
+        let chunk_max = self.prefs.flamenco_chunks.clamp(2, FARM_CHUNK_MAX);
         let only_soft = self.prefs.flamenco_only_chunk_software;
         let chunk_qsv_color = self.prefs.flamenco_chunk_qsv_color;
         // Flamenco only HasPrefix-rewrites whole setting strings; brace paths inside argv JSON ourselves.
@@ -2811,9 +2812,23 @@ impl GigaMuxApp {
                     let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::ItemDone));
                     continue;
                 }
-                let has_alpha = file_info(&input)
-                    .map(|info| video_has_alpha(&info))
-                    .unwrap_or(false);
+                let info = file_info(&input).ok();
+                let has_alpha = info.as_ref().map(|i| video_has_alpha(i)).unwrap_or(false);
+                let duration_s = info
+                    .as_ref()
+                    .and_then(|i| i.get("format"))
+                    .and_then(|f| f.get("duration"))
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .unwrap_or(0.0);
+                // Auto N when chunking; unknown duration → chunk_max (helper fallback).
+                let chunk_n = if want_chunk {
+                    farm_auto_chunks(duration_s, chunk_max)
+                } else {
+                    1
+                };
                 let task_type = farm_task_type_for_slot(&slot, has_alpha, nvenc_gen_isol);
                 let job_name = match test_batch {
                     Some(b) => format!("GigaMux test{} {name}", b.index() + 1),
@@ -2891,7 +2906,7 @@ impl GigaMuxApp {
                             exe,
                             &check,
                             twoway,
-                            chunk_n,
+                            chunk_max,
                             &tx,
                         ) {
                             ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -2919,7 +2934,7 @@ impl GigaMuxApp {
                                 "Flamenco VMAF skip (already scored): {out_name}"
                             ))));
                         } else {
-                            let vmaf = farm_vmaf_spec(&req.input, &job_built.final_output, chunk_n);
+                            let vmaf = farm_vmaf_spec(&req.input, &job_built.final_output, chunk_max);
                             let note = farm_vmaf_parts_suffix(&vmaf);
                             if !note.is_empty() {
                                 let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(
@@ -3008,7 +3023,7 @@ impl GigaMuxApp {
                             exe,
                             &check,
                             twoway,
-                            chunk_n,
+                            chunk_max,
                             &tx,
                         ) {
                             ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3036,7 +3051,7 @@ impl GigaMuxApp {
                                 "Flamenco VMAF skip (already scored): {out_name}"
                             ))));
                         } else {
-                            let vmaf = farm_vmaf_spec(&req.input, &job_built.final_output, chunk_n);
+                            let vmaf = farm_vmaf_spec(&req.input, &job_built.final_output, chunk_max);
                             let note = farm_vmaf_parts_suffix(&vmaf);
                             if !note.is_empty() {
                                 let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(
@@ -3132,7 +3147,7 @@ impl GigaMuxApp {
                         exe,
                         &check,
                         twoway,
-                        chunk_n,
+                        chunk_max,
                         &tx,
                     ) {
                         ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3150,7 +3165,7 @@ impl GigaMuxApp {
                             "Flamenco VMAF skip (already scored): {out_name}"
                         ))));
                     } else {
-                        let vmaf = farm_vmaf_spec(&req.input, &cmd.output, chunk_n);
+                        let vmaf = farm_vmaf_spec(&req.input, &cmd.output, chunk_max);
                         let note = farm_vmaf_parts_suffix(&vmaf);
                         if !note.is_empty() {
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
@@ -3537,7 +3552,7 @@ impl GigaMuxApp {
             self.push_session(format!("Farm VMAF skip (missing output): {out_name}"));
             return;
         }
-        let parts = self.prefs.flamenco_chunks.clamp(2, 32);
+        let parts = self.prefs.flamenco_chunks.clamp(2, FARM_CHUNK_MAX);
         let spec = farm_vmaf_spec(&in_path, &out_path, parts);
         self.submit_farm_vmaf_job(format!("GigaMux VMAF {out_name}"), &[spec], out_name);
     }
@@ -3554,7 +3569,7 @@ impl GigaMuxApp {
         }
         self.import_vmaf_sidecars_from_output();
         let unscored = self.unscored_output_names();
-        let vmaf_parts = self.prefs.flamenco_chunks.clamp(2, 32);
+        let vmaf_parts = self.prefs.flamenco_chunks.clamp(2, FARM_CHUNK_MAX);
         let mut pairs: Vec<FarmVmafSpec> = Vec::new();
         for out_name in &unscored {
             if is_chunk_filename(out_name) {
@@ -9069,28 +9084,35 @@ impl GigaMuxApp {
                 ui.checkbox(&mut prompt.chunking, "Chunk encode (N workers → concat → mux)");
                 if prompt.chunking {
                     ui.horizontal(|ui| {
-                        ui.label("Chunks");
-                        ui.add(egui::Slider::new(&mut prompt.chunks, 2..=32));
+                        ui.label("Max chunks");
+                        ui.add(egui::Slider::new(&mut prompt.chunks, 2..=FARM_CHUNK_MAX));
                     });
                     if prompt.estimate_duration_s > 0.0 {
+                        let auto_n =
+                            farm_auto_chunks(prompt.estimate_duration_s, prompt.chunks);
                         // Equal time slices for the label; last chunk absorbs remainder frames.
-                        let (_, per) =
-                            chunk_time_range(prompt.estimate_duration_s, 0, prompt.chunks)
-                                .unwrap_or((0.0, prompt.estimate_duration_s / prompt.chunks as f64));
+                        let (_, per) = chunk_time_range(prompt.estimate_duration_s, 0, auto_n)
+                            .unwrap_or((
+                                0.0,
+                                prompt.estimate_duration_s / auto_n.max(1) as f64,
+                            ));
                         ui.label(
                             egui::RichText::new(format!(
-                                "≈ {} per chunk from {} (last may be longer)",
+                                "auto {auto_n} ≈ {} per chunk from {} (ceil(dur/3min), max {})",
                                 format_length(per),
-                                prompt.estimate_name
+                                prompt.estimate_name,
+                                prompt.chunks
                             ))
                             .weak()
                             .small(),
                         );
                     } else {
                         ui.label(
-                            egui::RichText::new("duration unknown for estimate")
-                                .weak()
-                                .small(),
+                            egui::RichText::new(
+                                "duration unknown: jobs use max chunks until probed",
+                            )
+                            .weak()
+                            .small(),
                         );
                     }
                     ui.checkbox(
@@ -9142,7 +9164,7 @@ impl GigaMuxApp {
                 if let Some(p) = self.pending_flamenco.as_mut() {
                     p.ffmpeg_exe = prompt.ffmpeg_exe.clone();
                     p.chunking = prompt.chunking;
-                    p.chunks = prompt.chunks.clamp(2, 32);
+                    p.chunks = prompt.chunks.clamp(2, FARM_CHUNK_MAX);
                     p.only_chunk_software = prompt.only_chunk_software;
                     p.chunk_qsv_color = prompt.chunk_qsv_color;
                     p.farm_vmaf = prompt.farm_vmaf;
@@ -9164,7 +9186,7 @@ impl GigaMuxApp {
                     {
                         self.prefs.flamenco_ffmpeg_exe = prompt.ffmpeg_exe.trim().to_string();
                         self.prefs.flamenco_chunking = prompt.chunking;
-                        self.prefs.flamenco_chunks = prompt.chunks.clamp(2, 32);
+                        self.prefs.flamenco_chunks = prompt.chunks.clamp(2, FARM_CHUNK_MAX);
                         self.prefs.flamenco_only_chunk_software = prompt.only_chunk_software;
                         self.prefs.flamenco_chunk_qsv_color = prompt.chunk_qsv_color;
                         let _ = prefs::save(&self.prefs);

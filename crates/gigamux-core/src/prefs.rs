@@ -166,7 +166,7 @@ pub struct Prefs {
     /// Flamenco sender: enable frame chunking (N encode tasks + concat/mux). Default off.
     #[serde(default)]
     pub flamenco_chunking: bool,
-    /// Chunk count when chunking is on (clamped 2..=32). Default 4.
+    /// Max farm encode chunks / VMAF parts (clamped 2..=128). Per-job count is auto `ceil(dur/3min)`. Default 128.
     #[serde(default = "default_flamenco_chunks")]
     pub flamenco_chunks: u32,
     /// When chunking: only apply to software / alpha paths; HW opaque stays single-task. Default on.
@@ -194,7 +194,7 @@ fn default_flamenco_twoway_var() -> String {
 }
 
 fn default_flamenco_chunks() -> u32 {
-    4
+    128
 }
 
 impl Default for Prefs {
@@ -224,7 +224,7 @@ impl Default for Prefs {
             flamenco_worker_tag: String::new(),
             flamenco_ffmpeg_exe: String::new(),
             flamenco_chunking: false,
-            flamenco_chunks: 4,
+            flamenco_chunks: 128,
             flamenco_only_chunk_software: true,
             flamenco_twoway_local: String::new(),
             flamenco_twoway_var: "shared_storage_path".into(),

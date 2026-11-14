@@ -1461,6 +1461,7 @@ mod tests {
             "4",
             true,
             None,
+            None,
             AlphaAssociation::Straight,
             AlphaAssociation::Straight,
         );
@@ -1468,6 +1469,7 @@ mod tests {
         let mixed = vmaf_filter_complex(
             "4",
             true,
+            None,
             None,
             AlphaAssociation::Straight,
             AlphaAssociation::Premultiplied,
@@ -1482,6 +1484,7 @@ mod tests {
         let opaque = vmaf_filter_complex(
             "4",
             false,
+            None,
             None,
             AlphaAssociation::Premultiplied,
             AlphaAssociation::Premultiplied,

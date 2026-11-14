@@ -2385,7 +2385,7 @@ fn farm_final_check(
 const FARM_VMAF_MIN_PART_S: f64 = 3.0;
 
 /// Paths for trailing / separate farm VMAF (`ensure-vmaf` + sidecar next to deliver).
-/// `max_parts` is `prefs.flamenco_chunks` (clamped 1..=32); short delivers stay a single part.
+/// `max_parts` is prefs max chunks (clamped 1..=[`crate::chunk::FARM_CHUNK_MAX`]); short delivers stay a single part.
 pub fn farm_vmaf_spec(input: &Path, output: &Path, max_parts: u32) -> FarmVmafSpec {
     let mut spec = FarmVmafSpec {
         input: path_string(input),
@@ -2393,7 +2393,7 @@ pub fn farm_vmaf_spec(input: &Path, output: &Path, max_parts: u32) -> FarmVmafSp
         sidecar: path_string(&vmaf_sidecar_path(output)),
         parts: Vec::new(),
     };
-    let want = max_parts.clamp(1, 32);
+    let want = max_parts.clamp(1, crate::chunk::FARM_CHUNK_MAX);
     if want <= 1 {
         return spec;
     }

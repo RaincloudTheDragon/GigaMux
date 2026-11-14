@@ -7,6 +7,23 @@ use regex::Regex;
 /// Rough input `-ss` pad (seconds) before the exact frame cut — speeds demux; trim still exact.
 pub const CHUNK_SEEK_PAD_S: f64 = 1.0;
 
+/// Absolute max farm encode / VMAF part count (`cNNNofMMM` still fits `:03`).
+pub const FARM_CHUNK_MAX: u32 = 128;
+
+/// Target seconds per farm encode chunk for [`farm_auto_chunks`] (~3 min).
+pub const FARM_CHUNK_TARGET_S: f64 = 180.0;
+
+/// Auto chunk count: `ceil(duration / 180s)`, clamped to `1..=max_chunks` (`max` capped at [`FARM_CHUNK_MAX`]).
+/// Bad/unknown duration falls back to `max_chunks` (caller's ceiling).
+pub fn farm_auto_chunks(duration_s: f64, max_chunks: u32) -> u32 {
+    let max = max_chunks.clamp(1, FARM_CHUNK_MAX);
+    if !duration_s.is_finite() || duration_s <= 0.0 {
+        return max;
+    }
+    let n = (duration_s / FARM_CHUNK_TARGET_S).ceil() as u32;
+    n.clamp(1, max)
+}
+
 /// `{stem}.c000of004.mp4` style name (0-based index).
 pub fn chunk_output_name(stem: &str, index: u32, count: u32, ext: &str) -> String {
     let ext = ext.trim_start_matches('.');
@@ -264,5 +281,18 @@ mod tests {
         assert!((s - 0.0).abs() < 1e-9 && (d - 30.0).abs() < 1e-9);
         let (s, d) = chunk_time_range(120.0, 3, 4).unwrap();
         assert!((s - 90.0).abs() < 1e-9 && (d - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn farm_auto_chunks_scales_and_caps() {
+        assert_eq!(farm_auto_chunks(30.0, 128), 1);
+        assert_eq!(farm_auto_chunks(180.0, 128), 1);
+        assert_eq!(farm_auto_chunks(181.0, 128), 2);
+        // 3.5h → 70 at max 128; still 32 when max is 32.
+        assert_eq!(farm_auto_chunks(3.5 * 3600.0, 128), 70);
+        assert_eq!(farm_auto_chunks(3.5 * 3600.0, 32), 32);
+        assert_eq!(farm_auto_chunks(0.0, 64), 64);
+        assert_eq!(farm_auto_chunks(f64::NAN, 8), 8);
+        assert_eq!(farm_auto_chunks(100.0, 999), 1); // max clamped to 128, still 1 for 100s
     }
 }

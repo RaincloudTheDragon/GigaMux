@@ -22,8 +22,9 @@ pub use check::{
     trash_file, CheckIssue, CheckReport, CheckSeverity,
 };
 pub use chunk::{
-    chunk_time_range, estimate_total_frames, hybrid_plane_mate, is_hybrid_alpha_plane_filename,
-    is_hybrid_color_plane_filename, parse_fps,
+    chunk_time_range, estimate_total_frames, farm_auto_chunks, hybrid_plane_mate,
+    is_hybrid_alpha_plane_filename, is_hybrid_color_plane_filename, parse_fps, FARM_CHUNK_MAX,
+    FARM_CHUNK_TARGET_S,
 };
 pub use encode::{
     build_farm_chunked_job, build_farm_ffmpeg_argv, build_farm_hybrid_job, farm_integrity_for_chunked,
