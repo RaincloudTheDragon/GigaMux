@@ -8112,7 +8112,7 @@ impl GigaMuxApp {
                 "Write encoder metadata",
             )
             .on_hover_text(
-                "Stamp GigaMux (version[+git SHA]), GigaMux_encoder, and GigaMux_hw into output files.",
+                "Stamp GigaMux (version[+git SHA]), GigaMux_encoder, and GigaMux_hw into output files. Farm adds GigaMux[flam] / GigaMux_farm.",
             )
             .changed()
         {
@@ -8174,7 +8174,7 @@ impl GigaMuxApp {
                 "Write encoder metadata",
             )
             .on_hover_text(
-                "Stamp GigaMux (version[+git SHA]), GigaMux_encoder, and GigaMux_hw into outputs (also on Settings → Encode).",
+                "Stamp GigaMux (version[+git SHA]), GigaMux_encoder, and GigaMux_hw into outputs (also on Settings → Encode). Farm adds GigaMux[flam].",
             )
             .changed()
         {

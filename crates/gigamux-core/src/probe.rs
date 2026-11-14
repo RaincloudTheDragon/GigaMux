@@ -603,7 +603,7 @@ fn tag_strings(info: &Value) -> Vec<String> {
 }
 
 /// True when any format/stream/chapter tag key or value mentions OBS.
-/// Encoder display prefers GigaMux stamps over Lavf when present (OBS-style `GigaMux (0.1.0+…)`).
+/// Encoder display prefers GigaMux stamps over Lavf when present (OBS-style `GigaMux (0.1.0+…)` / farm `GigaMux[flam]`).
 fn detect_obs_origin(info: &Value) -> (bool, Option<String>) {
     let tags = info.pointer("/format/tags");
     let gigamux_ver = tags
@@ -616,11 +616,30 @@ fn detect_obs_origin(info: &Value) -> (bool, Option<String>) {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let farm = tags
+        .and_then(|t| t.get("GigaMux_farm"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| {
+            let t = s.trim();
+            !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+        })
+        || tags
+            .and_then(|t| t.get("encoder"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("[flam]"));
     let encoder = if let Some(ver) = gigamux_ver {
-        Some(format!("GigaMux ({ver})"))
+        Some(if farm {
+            format!("GigaMux[flam] ({ver})")
+        } else {
+            format!("GigaMux ({ver})")
+        })
     } else if gigamux_enc.is_some() {
         // Older outputs stamped codec/hw but not version.
-        Some("GigaMux".into())
+        Some(if farm {
+            "GigaMux[flam]".into()
+        } else {
+            "GigaMux".into()
+        })
     } else {
         tags.and_then(|t| t.get("encoder"))
             .and_then(|v| v.as_str())

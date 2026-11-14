@@ -635,6 +635,8 @@ fn build_cmd(
     chunk: Option<ChunkTrim>,
     // Optional `GigaMux_hw` value (NVENC gen / QSV); encoder name is derived from the path.
     hw_meta: Option<String>,
+    // Flamenco deliver: stamp `GigaMux[flam]` / `GigaMux_farm=1`.
+    farm_meta: bool,
 ) -> Vec<String> {
     let ceiling = format!("{bitrate_k}k");
     let bufsize = format!("{}k", bitrate_k * 2);
@@ -854,7 +856,11 @@ fn build_cmd(
         } else {
             None
         };
-        append_gigamux_metadata(&mut cmd, out_container, &encoder_metadata_tags(enc_name, hw.as_deref()));
+        append_gigamux_metadata(
+            &mut cmd,
+            out_container,
+            &encoder_metadata_tags(enc_name, hw.as_deref(), farm_meta),
+        );
     }
 
     cmd.push("-avoid_negative_ts".into());
@@ -1415,6 +1421,7 @@ pub fn run_batch(
                         slot.alpha_container,
                         None,
                         None,
+                        false,
                     );
                     run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
                 }
@@ -1450,6 +1457,7 @@ pub fn run_batch(
                 slot.alpha_container,
                 None,
                 hw_meta,
+                false,
             );
             run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
         };
@@ -1561,6 +1569,7 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         req.slot.alpha_container,
         None,
         hw_meta,
+        true,
     );
     farm_argv_never_overwrite(&mut argv);
     Ok(FarmFfmpegCommand {
@@ -1666,6 +1675,7 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
                 fps,
             }),
             None,
+            true,
         );
         // Submitted as `-n`; `gigamux-check ensure-chunk` only forces `-y` when re-encoding a bad/missing file.
         farm_argv_never_overwrite(&mut argv);
@@ -1703,7 +1713,7 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
         } else {
             None
         };
-        encoder_metadata_tags(enc_name, hw.as_deref())
+        encoder_metadata_tags(enc_name, hw.as_deref(), true)
     } else {
         Vec::new()
     };
@@ -2261,7 +2271,7 @@ pub fn build_farm_hybrid_job(req: &FarmEncodeRequest) -> Result<FarmHybridJob, S
             .as_ref()
             .map(|q| q.meta_hw_tag())
             .unwrap_or_else(|| "QSV".into());
-        let tags = encoder_metadata_tags("vp9_qsv+libvpx", Some(&hw));
+        let tags = encoder_metadata_tags("vp9_qsv+libvpx", Some(&hw), true);
         let out = audio_argv.pop();
         append_gigamux_metadata(&mut audio_argv, OutContainer::Webm, &tags);
         if let Some(o) = out {
@@ -2658,7 +2668,7 @@ mod tests {
 
     #[test]
     fn mp4_metadata_gets_use_metadata_tags() {
-        let tags = encoder_metadata_tags("hevc_nvenc", Some("NVENC_Ada"));
+        let tags = encoder_metadata_tags("hevc_nvenc", Some("NVENC_Ada"), false);
         let mut mp4 = Vec::new();
         append_gigamux_metadata(&mut mp4, OutContainer::Mp4, &tags);
         assert!(mp4.windows(2).any(|w| w[0] == "-movflags" && w[1] == "+use_metadata_tags"));

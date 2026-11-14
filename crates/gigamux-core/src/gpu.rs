@@ -639,18 +639,25 @@ pub fn gigamux_version_payload() -> String {
     }
 }
 
-/// OBS-style label, e.g. `GigaMux (0.1.0+abcdef12)`.
-pub fn gigamux_version_label() -> String {
-    format!("GigaMux ({})", gigamux_version_payload())
+/// OBS-style label, e.g. `GigaMux (0.1.0+abcdef12)` or farm `GigaMux[flam] (…)`.
+pub fn gigamux_version_label(farm: bool) -> String {
+    let payload = gigamux_version_payload();
+    if farm {
+        format!("GigaMux[flam] ({payload})")
+    } else {
+        format!("GigaMux ({payload})")
+    }
 }
 
 /// Build metadata pairs stamped into outputs when Write encoder metadata is on.
+/// `farm`: Flamenco deliver; label `GigaMux[flam]` + `GigaMux_farm=1` for probe display.
 pub fn encoder_metadata_tags(
     encoder_name: &str,
     hw: Option<&str>,
+    farm: bool,
 ) -> Vec<(String, String)> {
     let payload = gigamux_version_payload();
-    let label = gigamux_version_label();
+    let label = gigamux_version_label(farm);
     let mut tags = vec![
         ("GigaMux_encoder".into(), sanitize_meta_token(encoder_name)),
         // Keep `0.1.0+abcdef12` literal (do not run through sanitize_meta_token — it mangles `+` / `.`).
@@ -661,6 +668,9 @@ pub fn encoder_metadata_tags(
     if let Some(h) = hw {
         // `hw` is already built from sanitize_meta_token pieces.
         tags.push(("GigaMux_hw".into(), h.to_string()));
+    }
+    if farm {
+        tags.push(("GigaMux_farm".into(), "1".into()));
     }
     tags
 }
@@ -714,7 +724,7 @@ mod tests {
     #[test]
     fn version_label_shape() {
         let payload = gigamux_version_payload();
-        let label = gigamux_version_label();
+        let label = gigamux_version_label(false);
         assert!(label.starts_with("GigaMux ("));
         assert!(label.ends_with(')'));
         assert!(label.contains(env!("CARGO_PKG_VERSION")));
@@ -724,6 +734,13 @@ mod tests {
             assert_eq!(env!("GIGAMUX_GIT_SHA").len(), 8);
         }
         assert_eq!(label, format!("GigaMux ({payload})"));
+        let flam = gigamux_version_label(true);
+        assert_eq!(flam, format!("GigaMux[flam] ({payload})"));
+        let tags = encoder_metadata_tags("hevc_nvenc", None, true);
+        assert!(tags.iter().any(|(k, v)| k == "GigaMux_farm" && v == "1"));
+        assert!(tags
+            .iter()
+            .any(|(k, v)| k == "encoder" && v.starts_with("GigaMux[flam]")));
     }
 
     #[test]
