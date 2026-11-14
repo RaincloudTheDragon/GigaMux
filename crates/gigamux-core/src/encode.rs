@@ -13,8 +13,10 @@ use crate::chunk::{
     chunk_frame_range, chunk_output_name, estimate_total_frames, list_chunk_paths,
     parse_chunk_filename, parse_fps, write_ffconcat, CHUNK_SEEK_PAD_S,
 };
-use crate::flamenco::{FarmChunkCheck, FarmCleanup, FarmFinalCheck, FarmVmafSpec, FlamencoIntegrity};
-use crate::vmaf::vmaf_sidecar_path;
+use crate::flamenco::{
+    FarmChunkCheck, FarmCleanup, FarmFinalCheck, FarmVmafPart, FarmVmafSpec, FlamencoIntegrity,
+};
+use crate::vmaf::{vmaf_part_sidecar_path, vmaf_sidecar_path};
 use crate::gpu::{encoder_metadata_tags, GpuChoice, HwCatalog};
 use crate::job_log::{JobLog, JobLogKind};
 use crate::probe::{
@@ -2355,13 +2357,74 @@ fn farm_final_check(input: &Path, output: &Path, slot: &EncodeSlot) -> FarmFinal
     }
 }
 
+/// Minimum seconds of deliver duration per temporal VMAF part (skip split when shorter).
+const FARM_VMAF_MIN_PART_S: f64 = 3.0;
+
 /// Paths for trailing / separate farm VMAF (`ensure-vmaf` + sidecar next to deliver).
-pub fn farm_vmaf_spec(input: &Path, output: &Path) -> FarmVmafSpec {
-    FarmVmafSpec {
+/// `max_parts` is `prefs.flamenco_chunks` (clamped 1..=32); short delivers stay a single part.
+pub fn farm_vmaf_spec(input: &Path, output: &Path, max_parts: u32) -> FarmVmafSpec {
+    let mut spec = FarmVmafSpec {
         input: path_string(input),
         output: path_string(output),
         sidecar: path_string(&vmaf_sidecar_path(output)),
+        parts: Vec::new(),
+    };
+    let want = max_parts.clamp(1, 32);
+    if want <= 1 {
+        return spec;
     }
+    // Probe the deliver for duration/fps; fall back to unsplit if probe fails.
+    let Ok(info) = file_info(output) else {
+        return spec;
+    };
+    let duration_s = info
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0.0);
+    if duration_s < FARM_VMAF_MIN_PART_S * 2.0 {
+        return spec;
+    }
+    let Some(fps) = probe_video_fps(&info) else {
+        return spec;
+    };
+    let Some(total_frames) =
+        estimate_total_frames(duration_s, fps, probe_nb_frames(&info)).filter(|&n| n > 0)
+    else {
+        return spec;
+    };
+    // Cap by ~3s/part so tiny clips never over-split.
+    let max_by_dur = ((duration_s / FARM_VMAF_MIN_PART_S).floor() as u32).max(1);
+    let n = want.min(max_by_dur).max(1);
+    if n <= 1 || total_frames < u64::from(n) {
+        return spec;
+    }
+    let mut parts = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let Ok((start_frame, frame_count)) = chunk_frame_range(total_frames, i, n) else {
+            return FarmVmafSpec {
+                parts: Vec::new(),
+                ..spec
+            };
+        };
+        if frame_count == 0 {
+            return FarmVmafSpec {
+                parts: Vec::new(),
+                ..spec
+            };
+        }
+        parts.push(FarmVmafPart {
+            sidecar: path_string(&vmaf_part_sidecar_path(output, i, n)),
+            start_frame,
+            frame_count,
+            fps,
+        });
+    }
+    spec.parts = parts;
+    spec
 }
 
 /// Hybrid integrity for a single-file farm encode (final check only; no chunk cleanup).

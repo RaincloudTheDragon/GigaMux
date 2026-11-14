@@ -4,7 +4,7 @@
 
 | File | Platform |
 | --- | --- |
-| `gigamux-check.exe` | Windows workers (`ensure-chunk` / `ensure-out` / `ensure-vmaf` / `final` / `cleanup` / `mux-alpha-webm` / `farm-probe`) |
+| `gigamux-check.exe` | Windows workers (`ensure-chunk` / `ensure-out` / `ensure-vmaf` / `ensure-vmaf-part` / `merge-vmaf` / `final` / `cleanup` / `mux-alpha-webm` / `farm-probe`) |
 | `gigamux-check` | Linux workers (ELF, no extension) |
 
 ## End users (release)
@@ -24,7 +24,7 @@ Deploy defaults **Worker check helper** to `{ManagerInstall}/tools/gigamux-check
 
 ## Maintainers / from-source
 
-Build into this folder (gitignored), or rely on `target/release` / release `helpers/` search roots:
+Build into this folder (gitignored), or rely on `target/release` / release `helpers/` search roots. **Deploy picks the newest mtime** among search hits; a fresh `target/release` build beats a stale copy here.
 
 Windows (from repo root):
 

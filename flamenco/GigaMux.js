@@ -3,7 +3,8 @@
 // Single file: encode task_type from settings → optional final-check (cpu) → optional trailing vmaf.
 // Chunked: N encode-c* → mux/remux/final-check (cpu) → optional vmaf.
 // Hybrid: hybrid_json → encode-color (qsv) + encode-alpha (cpu) → remux-alpha → audio → final.
-// VMAF-only: vmaf_pairs_json → ensure-vmaf tasks (task_type vmaf); jobs are tagless.
+// VMAF-only: vmaf_pairs_json → ensure-vmaf (or vmaf-p* + vmaf-merge when parts[]); jobs are tagless.
+// Temporal parts: same frame range on ref+dist; merge writes final .vmaf.json and deletes part sidecars.
 // Farm-probe stays misc + gm-… pin tag (Probe Farm isolation only).
 // mux and remux are separate Flamenco tasks so remux soft-fail never re-runs the stage join.
 // Deploy via Settings → Files → Deploy GigaMux… (Manager install → scripts/ + tools/ helpers).
@@ -101,14 +102,14 @@ const JOB_TYPE = {
             type: "string",
             required: false,
             default: "",
-            description: "JSON {input,output,sidecar}: trailing ensure-vmaf after final-check (task_type vmaf)",
+            description: "JSON {input,output,sidecar,parts?}: trailing VMAF after final-check (task_type vmaf); parts → parallel ensure-vmaf-part + merge-vmaf",
         },
         {
             key: "vmaf_pairs_json",
             type: "string",
             required: false,
             default: "",
-            description: "JSON array of {input,output,sidecar} — VMAF-only job (no encode)",
+            description: "JSON array of {input,output,sidecar,parts?}; VMAF-only job (no encode); parts → parallel temporal slices",
         },
         {
             key: "encode_task_type",
@@ -242,6 +243,25 @@ function addEnsureOut(task, checkExe, exe, outPath, expectDur, argv) {
     ].concat(argv));
 }
 
+function normalizeVmafParts(spec, label) {
+    if (!spec.parts) {
+        spec.parts = [];
+        return;
+    }
+    if (!Array.isArray(spec.parts)) {
+        throw "GigaMux: " + label + " parts must be an array";
+    }
+    for (let i = 0; i < spec.parts.length; i++) {
+        const p = spec.parts[i];
+        if (!p || typeof p.sidecar !== "string" || !p.sidecar) {
+            throw "GigaMux: " + label + " parts[" + i + "] needs sidecar";
+        }
+        if (typeof p.start_frame !== "number" || typeof p.frame_count !== "number" || typeof p.fps !== "number") {
+            throw "GigaMux: " + label + " parts[" + i + "] needs start_frame, frame_count, fps numbers";
+        }
+    }
+}
+
 function parseVmafSpec(raw, label) {
     if (typeof raw !== "string" || raw.trim().length === 0) {
         return null;
@@ -258,6 +278,7 @@ function parseVmafSpec(raw, label) {
     if (!spec.input || !spec.output || !spec.sidecar) {
         throw "GigaMux: " + label + " paths must be non-empty";
     }
+    normalizeVmafParts(spec, label);
     return spec;
 }
 
@@ -280,6 +301,7 @@ function parseVmafPairs(raw) {
         if (!p || typeof p.input !== "string" || typeof p.output !== "string" || typeof p.sidecar !== "string") {
             throw "GigaMux: vmaf_pairs_json[" + i + "] needs input, output, sidecar";
         }
+        normalizeVmafParts(p, "vmaf_pairs_json[" + i + "]");
         out.push(p);
     }
     return out;
@@ -293,6 +315,59 @@ function addEnsureVmaf(task, checkExe, exe, spec) {
         spec.sidecar,
         exe,
     ]);
+}
+
+function addEnsureVmafPart(task, checkExe, exe, spec, part) {
+    addCheckExec(task, checkExe, [
+        "ensure-vmaf-part",
+        spec.input,
+        spec.output,
+        part.sidecar,
+        String(part.start_frame),
+        String(part.frame_count),
+        String(part.fps),
+        exe,
+    ]);
+}
+
+function addMergeVmaf(task, checkExe, spec) {
+    const args = ["merge-vmaf", spec.sidecar];
+    for (let i = 0; i < spec.parts.length; i++) {
+        args.push(spec.parts[i].sidecar);
+    }
+    addCheckExec(task, checkExe, args);
+}
+
+// Attach full-file ensure-vmaf, or parallel vmaf-p* + vmaf-merge when parts are present.
+function addVmafPairGraph(job, checkExe, exe, spec, namePrefix, dependOn) {
+    const parts = Array.isArray(spec.parts) ? spec.parts : [];
+    if (parts.length === 0) {
+        const task = author.Task(namePrefix, "vmaf");
+        addEnsureVmaf(task, checkExe, exe, spec);
+        if (dependOn) {
+            task.addDependency(dependOn);
+        }
+        job.addTask(task);
+        return;
+    }
+    const partTasks = [];
+    for (let i = 0; i < parts.length; i++) {
+        const pad = ("000" + i).slice(-3);
+        const name = namePrefix + "-p" + pad;
+        const task = author.Task(name, "vmaf");
+        addEnsureVmafPart(task, checkExe, exe, spec, parts[i]);
+        if (dependOn) {
+            task.addDependency(dependOn);
+        }
+        job.addTask(task);
+        partTasks.push(task);
+    }
+    const merge = author.Task(namePrefix + "-merge", "vmaf");
+    addMergeVmaf(merge, checkExe, spec);
+    for (let i = 0; i < partTasks.length; i++) {
+        merge.addDependency(partTasks[i]);
+    }
+    job.addTask(merge);
 }
 
 function addHybridEncodeTask(job, spec, exe, checkExe) {
@@ -455,10 +530,7 @@ function compileHybridJob(job, settings, exe, checkExe, cancelMode, vmafAttached
     }
 
     if (vmafAttached !== null) {
-        const vmafTask = author.Task("vmaf", "vmaf");
-        addEnsureVmaf(vmafTask, checkExe, exe, vmafAttached);
-        vmafTask.addDependency(gateTask);
-        job.addTask(vmafTask);
+        addVmafPairGraph(job, checkExe, exe, vmafAttached, "vmaf", gateTask);
     }
 }
 
@@ -489,9 +561,11 @@ function compileJob(job) {
         print("GigaMux compileJob: vmaf-only pairs=", vmafPairs.length, " check_exe=", checkExe);
         for (let i = 0; i < vmafPairs.length; i++) {
             const name = vmafPairs.length === 1 ? "vmaf" : "vmaf-" + i;
-            const task = author.Task(name, "vmaf");
-            addEnsureVmaf(task, checkExe, exe, vmafPairs[i]);
-            job.addTask(task);
+            const nParts = Array.isArray(vmafPairs[i].parts) ? vmafPairs[i].parts.length : 0;
+            if (nParts > 0) {
+                print("GigaMux compileJob: pair", i, "temporal parts=", nParts);
+            }
+            addVmafPairGraph(job, checkExe, exe, vmafPairs[i], name, null);
         }
         return;
     }
@@ -672,9 +746,6 @@ function compileJob(job) {
         if (!gateTask) {
             throw "GigaMux: vmaf_json requires encode/mux/final-check tasks";
         }
-        const vmafTask = author.Task("vmaf", "vmaf");
-        addEnsureVmaf(vmafTask, checkExe, exe, vmafAttached);
-        vmafTask.addDependency(gateTask);
-        job.addTask(vmafTask);
+        addVmafPairGraph(job, checkExe, exe, vmafAttached, "vmaf", gateTask);
     }
 }

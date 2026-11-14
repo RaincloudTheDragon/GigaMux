@@ -4,6 +4,8 @@
 //! - `gigamux-check ensure-chunk <path> <expect_dur> <ffmpeg_exe> -- <ffmpeg argv…>` (argv includes leading program name; do **not** nest paths in JSON: Flamenco two-way expands `{var}` to `W:\…` and breaks JSON escapes)
 //! - `gigamux-check ensure-out <path> <expect_dur> <ffmpeg_exe> -- <ffmpeg argv…>` (same for mux stage vmux / remux final; rebuilds incomplete leftovers)
 //! - `gigamux-check ensure-vmaf <ref> <dist> <sidecar> [ffmpeg_exe]` (reuse sidecar score; else libvmaf + write)
+//! - `gigamux-check ensure-vmaf-part <ref> <dist> <part_sidecar> <start_frame> <frame_count> <fps> [ffmpeg_exe]` (temporal slice; sidecar name `*.vmaf.pIIIofNNN.json`)
+//! - `gigamux-check merge-vmaf <final_sidecar> <part_sidecar…>` (frame-weighted mean → final; deletes parts)
 //! - `gigamux-check chunk <path> <expect_dur_secs>`
 //! - `gigamux-check final <input> <output> <opaque_video> <opaque_container> <alpha_video> <alpha_container>`
 //! - `gigamux-check cleanup <dir> <stem> <ext> <chunks>`
@@ -21,7 +23,7 @@ use gigamux_core::check::{
 use gigamux_core::flamenco::{write_farm_probe_report, FarmFinalCheck};
 use gigamux_core::probe::VideoColorMeta;
 use gigamux_core::targets::{AlphaVideo, OutContainer, OpaqueVideo};
-use gigamux_core::vmaf::ensure_vmaf;
+use gigamux_core::vmaf::{ensure_vmaf, ensure_vmaf_part, merge_vmaf_parts};
 use gigamux_core::webm_alpha::mux_vp9_alpha_webm;
 
 fn parse_opaque_video(s: &str) -> Result<OpaqueVideo, String> {
@@ -56,7 +58,7 @@ fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let Some(cmd) = args.next() else {
         eprintln!(
-            "usage: gigamux-check ensure-chunk|ensure-out|ensure-vmaf|chunk|final|cleanup|mux-alpha-webm|farm-probe …"
+            "usage: gigamux-check ensure-chunk|ensure-out|ensure-vmaf|ensure-vmaf-part|merge-vmaf|chunk|final|cleanup|mux-alpha-webm|farm-probe …"
         );
         return ExitCode::from(2);
     };
@@ -136,6 +138,93 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "ensure-vmaf-part" => {
+            let reference = PathBuf::from(args.next().unwrap_or_default());
+            let distorted = PathBuf::from(args.next().unwrap_or_default());
+            let part_sidecar = PathBuf::from(args.next().unwrap_or_default());
+            let start_s = args.next().unwrap_or_default();
+            let count_s = args.next().unwrap_or_default();
+            let fps_s = args.next().unwrap_or_default();
+            let ffmpeg_exe = args.next().unwrap_or_else(|| "ffmpeg".into());
+            if reference.as_os_str().is_empty()
+                || distorted.as_os_str().is_empty()
+                || part_sidecar.as_os_str().is_empty()
+                || start_s.is_empty()
+                || count_s.is_empty()
+                || fps_s.is_empty()
+            {
+                eprintln!(
+                    "ensure-vmaf-part: need <ref> <dist> <part_sidecar> <start_frame> <frame_count> <fps> [ffmpeg_exe]"
+                );
+                return ExitCode::from(2);
+            }
+            let start_frame: u64 = match start_s.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("ensure-vmaf-part: bad start_frame {start_s:?}");
+                    return ExitCode::from(2);
+                }
+            };
+            let frame_count: u64 = match count_s.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("ensure-vmaf-part: bad frame_count {count_s:?}");
+                    return ExitCode::from(2);
+                }
+            };
+            let fps: f64 = match fps_s.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("ensure-vmaf-part: bad fps {fps_s:?}");
+                    return ExitCode::from(2);
+                }
+            };
+            match ensure_vmaf_part(
+                &reference,
+                &distorted,
+                &part_sidecar,
+                start_frame,
+                frame_count,
+                fps,
+                &ffmpeg_exe,
+            ) {
+                Ok(score) => {
+                    println!("gigamux-check ensure-vmaf-part: ok score={score:.6}");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("gigamux-check ensure-vmaf-part: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        "merge-vmaf" => {
+            let final_sidecar = PathBuf::from(args.next().unwrap_or_default());
+            if final_sidecar.as_os_str().is_empty() {
+                eprintln!("merge-vmaf: need <final_sidecar> <part_sidecar…>");
+                return ExitCode::from(2);
+            }
+            let mut parts: Vec<PathBuf> = Vec::new();
+            for p in args {
+                if !p.is_empty() {
+                    parts.push(PathBuf::from(p));
+                }
+            }
+            if parts.is_empty() {
+                eprintln!("merge-vmaf: need at least one <part_sidecar>");
+                return ExitCode::from(2);
+            }
+            match merge_vmaf_parts(&final_sidecar, &parts) {
+                Ok(score) => {
+                    println!("gigamux-check merge-vmaf: ok score={score:.6}");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("gigamux-check merge-vmaf: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         "chunk" => {
             let path = PathBuf::from(args.next().unwrap_or_default());
             let dur_s = args.next().unwrap_or_default();
@@ -149,7 +238,7 @@ fn main() -> ExitCode {
             check_chunk_file(&path, expect)
         }
         "final" => {
-            // Discrete args — avoid JSON (same two-way backslash issue).
+            // Discrete args; avoid JSON (same two-way backslash issue).
             let input = args.next().unwrap_or_default();
             let output = args.next().unwrap_or_default();
             let ov = args.next().unwrap_or_default();

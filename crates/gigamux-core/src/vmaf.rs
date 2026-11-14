@@ -30,6 +30,24 @@ pub struct VmafRefTrim {
     pub fps: f64,
 }
 
+/// Symmetric trim for farm temporal VMAF parts (same frame range on reference and distorted).
+#[derive(Debug, Clone, Copy)]
+pub struct VmafBothTrim {
+    pub start_frame: u64,
+    pub frame_count: u64,
+    pub fps: f64,
+}
+
+impl VmafBothTrim {
+    fn as_ref_trim(self) -> VmafRefTrim {
+        VmafRefTrim {
+            start_frame: self.start_frame,
+            frame_count: self.frame_count,
+            fps: self.fps,
+        }
+    }
+}
+
 /// One file pair’s VMAF outcome.
 #[derive(Debug, Clone)]
 pub struct VmafResult {
@@ -73,7 +91,20 @@ pub enum VmafEvent {
 
 /// True when this ffmpeg build exposes the `libvmaf` filter.
 pub fn libvmaf_available() -> bool {
-    let Ok(out) = Command::new("ffmpeg")
+    libvmaf_available_exe("ffmpeg")
+}
+
+/// True when `ffmpeg_exe` lists a `libvmaf` filter (`-filters`).
+pub fn libvmaf_available_exe(ffmpeg_exe: &str) -> bool {
+    let exe = {
+        let t = ffmpeg_exe.trim();
+        if t.is_empty() {
+            "ffmpeg"
+        } else {
+            t
+        }
+    };
+    let Ok(out) = Command::new(exe)
         .args(["-hide_banner", "-filters"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -83,6 +114,68 @@ pub fn libvmaf_available() -> bool {
     };
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines().any(|l| l.contains("libvmaf"))
+}
+
+/// Prefer the requested exe when it has libvmaf; else Manager `tools/` siblings of this helper.
+///
+/// Linux PATH ffmpeg often lacks libvmaf while Deploy ships `ffmpeg-linux-amd64` next to
+/// `gigamux-check` — farm VMAF must use that build.
+pub fn resolve_ffmpeg_for_vmaf(ffmpeg_exe: &str) -> Result<String, String> {
+    let requested = {
+        let t = ffmpeg_exe.trim();
+        if t.is_empty() {
+            "ffmpeg".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    if libvmaf_available_exe(&requested) {
+        return Ok(requested);
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(me) = std::env::current_exe() {
+        if let Some(dir) = me.parent() {
+            // Deploy layout: Manager tools/ next to gigamux-check.
+            #[cfg(windows)]
+            {
+                candidates.push(dir.join("ffmpeg-windows-amd64.exe"));
+                candidates.push(dir.join("ffmpeg.exe"));
+            }
+            #[cfg(not(windows))]
+            {
+                candidates.push(dir.join("ffmpeg-linux-amd64"));
+                candidates.push(dir.join("ffmpeg"));
+            }
+        }
+    }
+    for c in &candidates {
+        if !c.is_file() {
+            continue;
+        }
+        let s = c.to_string_lossy().into_owned();
+        if libvmaf_available_exe(&s) {
+            println!(
+                "vmaf: {requested} has no libvmaf; using {} instead",
+                c.display()
+            );
+            return Ok(s);
+        }
+    }
+    Err(format!(
+        "ffmpeg has no libvmaf filter (tried {requested}{}); install a full build or place ffmpeg-linux-amd64 / ffmpeg-windows-amd64.exe next to gigamux-check",
+        if candidates.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " + siblings {}",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    ))
 }
 
 /// On-disk farm/local VMAF score next to a deliver (`clip.mp4.vmaf.json`).
@@ -99,6 +192,71 @@ pub fn vmaf_sidecar_path(output: &Path) -> PathBuf {
     let mut s = output.as_os_str().to_os_string();
     s.push(".vmaf.json");
     PathBuf::from(s)
+}
+
+/// Temporal part sidecar: `{output_path}.vmaf.pIIIofNNN.json`.
+pub fn vmaf_part_sidecar_path(output: &Path, part: u32, parts: u32) -> PathBuf {
+    let mut s = output.as_os_str().to_os_string();
+    s.push(format!(".vmaf.p{part:03}of{parts:03}.json"));
+    PathBuf::from(s)
+}
+
+/// One farm temporal slice’s score (merged into the final deliver sidecar).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmafPartSidecar {
+    pub version: u32,
+    pub score: f64,
+    pub frames: u64,
+    pub input: String,
+    pub output: String,
+    pub part: u32,
+    pub parts: u32,
+}
+
+/// Parse `….vmaf.pIIIofNNN.json` → `(part, parts)`.
+pub fn parse_vmaf_part_sidecar_name(path: &Path) -> Option<(u32, u32)> {
+    let name = path.file_name()?.to_str()?;
+    // Stem may be `clip.mp4.vmaf.p000of004` — match trailing `.vmaf.pIIIofNNN.json`.
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"\.vmaf\.p(\d+)of(\d+)\.json$").expect("vmaf part re")
+    });
+    let caps = re.captures(name)?;
+    let part: u32 = caps.get(1)?.as_str().parse().ok()?;
+    let parts: u32 = caps.get(2)?.as_str().parse().ok()?;
+    if parts == 0 || part >= parts {
+        return None;
+    }
+    Some((part, parts))
+}
+
+/// Read a finite-score part sidecar, or `None` if missing/invalid.
+pub fn read_vmaf_part_sidecar(path: &Path) -> Option<VmafPartSidecar> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let sc: VmafPartSidecar = serde_json::from_str(&raw).ok()?;
+    if sc.version == 0 || !sc.score.is_finite() || sc.frames == 0 || sc.parts == 0 {
+        return None;
+    }
+    Some(sc)
+}
+
+/// Atomic write of a VMAF part sidecar (temp + rename).
+pub fn write_vmaf_part_sidecar(path: &Path, sc: &VmafPartSidecar) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("vmaf part sidecar mkdir: {e}"))?;
+    }
+    let tmp = {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    let body =
+        serde_json::to_string_pretty(sc).map_err(|e| format!("vmaf part sidecar json: {e}"))?;
+    std::fs::write(&tmp, body).map_err(|e| format!("vmaf part sidecar write: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("vmaf part sidecar rename: {e}")
+    })
 }
 
 /// Read a finite-score sidecar, or `None` if missing/invalid.
@@ -152,15 +310,8 @@ pub fn ensure_vmaf(
     if !distorted.is_file() {
         return Err(format!("ensure-vmaf: distorted missing: {}", distorted.display()));
     }
-    let exe = {
-        let t = ffmpeg_exe.trim();
-        if t.is_empty() {
-            "ffmpeg"
-        } else {
-            t
-        }
-    };
-    let score = run_vmaf_pair_exe(exe, reference, distorted)?;
+    let exe = resolve_ffmpeg_for_vmaf(ffmpeg_exe)?;
+    let score = run_vmaf_pair_exe(&exe, reference, distorted, None)?;
     let in_name = reference
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -179,6 +330,131 @@ pub fn ensure_vmaf(
         },
     )?;
     println!("ensure-vmaf: wrote {} (score {:.6})", sidecar.display(), score);
+    Ok(score)
+}
+
+/// Farm temporal part: skip if part sidecar exists; else score the shared frame range on both inputs.
+pub fn ensure_vmaf_part(
+    reference: &Path,
+    distorted: &Path,
+    part_sidecar: &Path,
+    start_frame: u64,
+    frame_count: u64,
+    fps: f64,
+    ffmpeg_exe: &str,
+) -> Result<f64, String> {
+    if let Some(sc) = read_vmaf_part_sidecar(part_sidecar) {
+        println!(
+            "ensure-vmaf-part: reuse {} (score {:.6} frames={})",
+            part_sidecar.display(),
+            sc.score,
+            sc.frames
+        );
+        return Ok(sc.score);
+    }
+    if frame_count == 0 {
+        return Err("ensure-vmaf-part: frame_count must be > 0".into());
+    }
+    if !(fps.is_finite() && fps > 0.0) {
+        return Err(format!("ensure-vmaf-part: bad fps {fps}"));
+    }
+    let (part, parts) = parse_vmaf_part_sidecar_name(part_sidecar).ok_or_else(|| {
+        format!(
+            "ensure-vmaf-part: sidecar name must end with .vmaf.pIIIofNNN.json: {}",
+            part_sidecar.display()
+        )
+    })?;
+    if !reference.is_file() {
+        return Err(format!(
+            "ensure-vmaf-part: reference missing: {}",
+            reference.display()
+        ));
+    }
+    if !distorted.is_file() {
+        return Err(format!(
+            "ensure-vmaf-part: distorted missing: {}",
+            distorted.display()
+        ));
+    }
+    let exe = resolve_ffmpeg_for_vmaf(ffmpeg_exe)?;
+    let trim = VmafBothTrim {
+        start_frame,
+        frame_count,
+        fps,
+    };
+    let score = run_vmaf_pair_exe(&exe, reference, distorted, Some(&trim))?;
+    let in_name = reference
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| reference.display().to_string());
+    let out_name = distorted
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| distorted.display().to_string());
+    write_vmaf_part_sidecar(
+        part_sidecar,
+        &VmafPartSidecar {
+            version: 1,
+            score,
+            frames: frame_count,
+            input: in_name,
+            output: out_name,
+            part,
+            parts,
+        },
+    )?;
+    println!(
+        "ensure-vmaf-part: wrote {} (score {:.6} frames={frame_count} part {part}/{parts})",
+        part_sidecar.display(),
+        score
+    );
+    Ok(score)
+}
+
+/// Frame-weighted mean of part scores → final `{deliver}.vmaf.json`; deletes part sidecars on success.
+pub fn merge_vmaf_parts(final_sidecar: &Path, part_sidecars: &[PathBuf]) -> Result<f64, String> {
+    if part_sidecars.is_empty() {
+        return Err("merge-vmaf: no part sidecars".into());
+    }
+    let mut weighted = 0.0_f64;
+    let mut total_frames = 0_u64;
+    let mut input = String::new();
+    let mut output = String::new();
+    for path in part_sidecars {
+        let sc = read_vmaf_part_sidecar(path).ok_or_else(|| {
+            format!("merge-vmaf: missing/invalid part sidecar: {}", path.display())
+        })?;
+        weighted += sc.score * sc.frames as f64;
+        total_frames = total_frames.saturating_add(sc.frames);
+        if input.is_empty() {
+            input = sc.input;
+        }
+        if output.is_empty() {
+            output = sc.output;
+        }
+    }
+    if total_frames == 0 {
+        return Err("merge-vmaf: total frames is 0".into());
+    }
+    let score = weighted / total_frames as f64;
+    write_vmaf_sidecar(
+        final_sidecar,
+        &VmafSidecar {
+            version: 1,
+            score,
+            input,
+            output,
+        },
+    )?;
+    for path in part_sidecars {
+        let _ = std::fs::remove_file(path);
+    }
+    println!(
+        "merge-vmaf: wrote {} (score {:.6} from {} parts, {total_frames} frames)",
+        final_sidecar.display(),
+        score,
+        part_sidecars.len()
+    );
     Ok(score)
 }
 
@@ -291,45 +567,68 @@ fn vmaf_plane_prep(stream: &str, trim: Option<&VmafRefTrim>, assoc: AlphaAssocia
         AlphaAssociation::Premultiplied => "format=yuva420p,format=yuv420p,setpts=PTS-STARTPTS",
     };
     if let Some(tr) = trim {
-        let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
-        let pre_frame = tr.start_frame.saturating_sub(pad_frames);
-        let rel_start = tr.start_frame - pre_frame;
-        let rel_end = rel_start + tr.frame_count;
+        let (_, rel_start, rel_end) = trim_seek_and_rel(tr);
         format!("{stream}trim=start_frame={rel_start}:end_frame={rel_end},{body}")
     } else {
         format!("{stream}{body}")
     }
 }
 
+/// Pad seek + relative trim window for a VmafRefTrim (same math as encode ChunkTrim).
+fn trim_seek_and_rel(tr: &VmafRefTrim) -> (Option<f64>, u64, u64) {
+    let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
+    let pre_frame = tr.start_frame.saturating_sub(pad_frames);
+    let seek_s = if pre_frame > 0 {
+        Some(pre_frame as f64 / tr.fps)
+    } else {
+        None
+    };
+    let rel_start = tr.start_frame - pre_frame;
+    let rel_end = rel_start + tr.frame_count;
+    (seek_s, rel_start, rel_end)
+}
+
+/// Opaque filter leg: optional frame trim + PTS0.
+fn opaque_vmaf_leg(stream: &str, trim: Option<&VmafRefTrim>, label: &str) -> String {
+    if let Some(tr) = trim {
+        let (_, rel_start, rel_end) = trim_seek_and_rel(tr);
+        format!(
+            "{stream}trim=start_frame={rel_start}:end_frame={rel_end},setpts=PTS-STARTPTS[{label}]"
+        )
+    } else {
+        format!("{stream}setpts=PTS-STARTPTS[{label}]")
+    }
+}
+
 /// Opaque path: PTS align only. Alpha path: per-side association flatten onto black before libvmaf.
+/// `dist_trim` is set for farm temporal parts (symmetric); encode leftover chunks leave it `None`.
 fn vmaf_filter_complex(
     threads: &str,
     alpha: bool,
     ref_trim: Option<&VmafRefTrim>,
+    dist_trim: Option<&VmafRefTrim>,
     ref_assoc: AlphaAssociation,
     dist_assoc: AlphaAssociation,
 ) -> String {
     if alpha {
         let ref_prep = vmaf_plane_prep("[0:v]", ref_trim, ref_assoc);
-        let dist_prep = vmaf_plane_prep("[1:v]", None, dist_assoc);
+        let dist_prep = vmaf_plane_prep("[1:v]", dist_trim, dist_assoc);
         format!("{ref_prep}[ref];{dist_prep}[dist];[ref][dist]libvmaf=n_threads={threads}")
-    } else if let Some(tr) = ref_trim {
-        let pad_frames = ((tr.fps * CHUNK_SEEK_PAD_S).round() as u64).max(1);
-        let pre_frame = tr.start_frame.saturating_sub(pad_frames);
-        let rel_start = tr.start_frame - pre_frame;
-        let rel_end = rel_start + tr.frame_count;
-        format!(
-            "[0:v]trim=start_frame={rel_start}:end_frame={rel_end},setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
-        )
     } else {
-        format!(
-            "[0:v]setpts=PTS-STARTPTS[ref];[1:v]setpts=PTS-STARTPTS[dist];[ref][dist]libvmaf=n_threads={threads}"
-        )
+        let ref_leg = opaque_vmaf_leg("[0:v]", ref_trim, "ref");
+        let dist_leg = opaque_vmaf_leg("[1:v]", dist_trim, "dist");
+        format!("{ref_leg};{dist_leg};[ref][dist]libvmaf=n_threads={threads}")
     }
 }
 
 /// Blocking libvmaf with a specific ffmpeg binary (no cancel / UI progress).
-fn run_vmaf_pair_exe(ffmpeg_exe: &str, reference: &Path, distorted: &Path) -> Result<f64, String> {
+/// `both_trim` applies the same frame range to reference and distorted (farm temporal parts).
+fn run_vmaf_pair_exe(
+    ffmpeg_exe: &str,
+    reference: &Path,
+    distorted: &Path,
+    both_trim: Option<&VmafBothTrim>,
+) -> Result<f64, String> {
     let ref_info = file_info(reference)?;
     let dist_info = file_info(distorted)?;
     let alpha = video_has_alpha(&ref_info) || video_has_alpha(&dist_info);
@@ -345,20 +644,42 @@ fn run_vmaf_pair_exe(ffmpeg_exe: &str, reference: &Path, distorted: &Path) -> Re
             AlphaAssociation::Premultiplied,
         )
     };
-    let filter = vmaf_filter_complex(&threads, alpha, None, ref_assoc, dist_assoc);
+    let side_trim = both_trim.map(|t| t.as_ref_trim());
+    let filter = vmaf_filter_complex(
+        &threads,
+        alpha,
+        side_trim.as_ref(),
+        side_trim.as_ref(),
+        ref_assoc,
+        dist_assoc,
+    );
+    let (seek_s, frames_v) = if let Some(tr) = side_trim.as_ref() {
+        let (ss, _, _) = trim_seek_and_rel(tr);
+        (ss, Some(tr.frame_count))
+    } else {
+        (None, None)
+    };
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
+    // Symmetric -ss before each input when temporal-chunking both sides.
+    if let Some(ss) = seek_s {
+        args.extend(["-ss".into(), format!("{ss:.6}")]);
+    }
     args.extend(vmaf_alpha_decoder_prefix(&ref_info));
     args.extend(["-i".into(), reference.to_string_lossy().into_owned()]);
+    if let Some(ss) = seek_s {
+        args.extend(["-ss".into(), format!("{ss:.6}")]);
+    }
     args.extend(vmaf_alpha_decoder_prefix(&dist_info));
     args.extend([
         "-i".into(),
         distorted.to_string_lossy().into_owned(),
         "-filter_complex".into(),
         filter,
-        "-f".into(),
-        "null".into(),
-        "-".into(),
     ]);
+    if let Some(n) = frames_v {
+        args.extend(["-frames:v".into(), n.to_string()]);
+    }
+    args.extend(["-f".into(), "null".into(), "-".into()]);
     let out = Command::new(ffmpeg_exe)
         .args(&args)
         .stdin(Stdio::null())
@@ -542,7 +863,8 @@ pub fn run_vmaf_pair(
             None,
         );
     }
-    let filter = vmaf_filter_complex(&threads, alpha, ref_trim, ref_assoc, dist_assoc);
+    // Encode leftover chunks: trim reference only (distorted is already the short clip).
+    let filter = vmaf_filter_complex(&threads, alpha, ref_trim, None, ref_assoc, dist_assoc);
 
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),

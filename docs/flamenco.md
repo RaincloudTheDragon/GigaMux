@@ -32,6 +32,8 @@ Freshness still waits on worker log batching (~10 KB or ~30 s). GigaMux cannot m
 
 `frames-to-video` uses that finder when `exe` is literally `ffmpeg` / `ffmpeg.exe`. GigaMux uses `exec`, so the submitter can pass an explicit worker ffmpeg path or leave `ffmpeg` for PATH/`tools`.
 
+**Farm VMAF:** `gigamux-check ensure-vmaf` / `ensure-vmaf-part` call `resolve_ffmpeg_for_vmaf`: if the job’s `ffmpeg` has no `libvmaf`, they fall back to Deploy siblings next to the helper (`tools/ffmpeg-linux-amd64`, `tools/ffmpeg-windows-amd64.exe`). PATH ffmpeg on many Linux distros lacks libvmaf; keep those full builds in Manager `tools/`.
+
 ## Probe workers before HW / VMAF jobs
 
 Capabilities differ per worker (PATH vs Flamenco `tools/ffmpeg`, NVENC gen, QSV, `libvmaf`). On each worker class you care about:
@@ -107,7 +109,7 @@ Script: [GigaMux.js](../flamenco/GigaMux.js) (bundled for Deploy). Redeploy afte
 - **Single:** `encode` → `final-check` (`cpu`) → optional `vmaf`
 - **Chunked:** `encode-c*` (`ensure-chunk`) → `mux` / `remux` (`cpu`) → `final-check` → `cleanup` → optional `vmaf`
 - **Hybrid:** `encode-color` (`qsv`) + `encode-alpha` (`cpu`) → `remux-alpha` → `audio` → `final-check` → `cleanup` → optional `vmaf`
-- **VMAF-only:** `vmaf` / `vmaf-i` from `vmaf_pairs_json` (no encode); tagless job, task_type `vmaf`
+- **VMAF-only:** `vmaf` / `vmaf-p*` + `vmaf-merge` from `vmaf_pairs_json` (no encode); tagless job, task_type `vmaf`
 - **Farm-probe:** `misc` + `gm-…` pin tag
 
 Flamenco soft-fail retries only that task, so `mux` and `remux` stay separate (a remux retry must not re-join chunks). Chunk healthcheck runs in the same task as the encode; `final-check` is separate and may fail the job. Helpers: [flamenco/helpers/README.md](../flamenco/helpers/README.md).
@@ -119,14 +121,16 @@ Flamenco soft-fail retries only that task, so `mux` and `remux` stay separate (a
 | Mode | Behavior |
 | --- | --- |
 | Off | No farm VMAF tasks |
-| Attached | Trailing `ensure-vmaf` on the encode job (task_type `vmaf` — those workers need `libvmaf`) |
+| Attached | Trailing VMAF on the encode job (task_type `vmaf` — those workers need `libvmaf`) |
 | Separate | After encode **completed**, submit a VMAF-only job (task_type `vmaf`) |
 
 If the deliver **already exists**, encode is skipped; with Attached or Separate, GigaMux submits a **VMAF-only** job for that pair instead (unless `{deliver}.vmaf.json` already has a score).
 
 Right-click the main **VMAF** button to submit a VMAF-only job for unscored completed finals (`vmaf`).
 
-`gigamux-check ensure-vmaf` writes `{deliver}.vmaf.json` next to the output and **skips** ffmpeg when that sidecar already has a score (soft-fail/retry never redoes heavy scoring). Local VMAF writes the same sidecar and skips pairs that already have one (manual / idle / single-file); farm **Attached** omits the trailing task when the sidecar exists, and Separate / right-click batch already skip scored finals. Alpha WebMs decode via libvpx; before `libvmaf`, each side is probed for **straight vs premultiplied** association (short YAVG sample: if `premultiply` removes ≥15% mean luma → straight) and flattened onto black accordingly. Straight gets `premultiply`, already-premul only drops A (no double-darken). Native VP9 without libvpx drops α and compares transparent-region YUV trash. GigaMux imports sidecars into the preview cache on list refresh / farm poll. Redeploy `GigaMux.js` and update worker `gigamux-check` after this change.
+**Temporal parts:** long delivers are split into N parallel time slices using **Settings → Files → Flamenco chunks** (`2..=32`), even when encode chunking is off. Each part trims the **same** frame range on reference and distorted (`ensure-vmaf-part` → `{deliver}.vmaf.pIIIofNNN.json`), then `merge-vmaf` writes a frame-weighted mean into `{deliver}.vmaf.json` and deletes the part sidecars. Clips too short for ~3s/part stay a single `ensure-vmaf` (unchanged). Soft-fail retry of one `vmaf-p*` does not redo other parts. Local leftover encode-chunk VMAF (`*.cNNNofMMM.*`) is unchanged (reference-only trim) and is **not** farm-scored.
+
+`gigamux-check ensure-vmaf` / `ensure-vmaf-part` write sidecars and **skip** ffmpeg when that sidecar already has a score (soft-fail/retry never redoes heavy scoring). Local VMAF writes the same final sidecar and skips pairs that already have one (manual / idle / single-file); farm **Attached** omits the trailing task when the sidecar exists, and Separate / right-click batch already skip scored finals. Alpha WebMs decode via libvpx; before `libvmaf`, each side is probed for **straight vs premultiplied** association (short YAVG sample: if `premultiply` removes ≥15% mean luma → straight) and flattened onto black accordingly. Straight gets `premultiply`, already-premul only drops A (no double-darken). Native VP9 without libvpx drops α and compares transparent-region YUV trash. GigaMux imports sidecars into the preview cache on list refresh / farm poll. Redeploy `GigaMux.js` and update worker `gigamux-check` after this change.
 
 **Hybrid α / OBS association:** OBS Spout/α WebM captures (Custom FFmpeg → `webm` + `libvpx-vp9`, e.g. `n-frames=0 deadline=realtime tile-columns=2 tile-rows=1 auto-alt-ref=0 error-resilient=1`, `libopus`) often store **straight** RGB under low alpha, so the file can look brighter than the live Spout source; QSV+libvpx hybrid delivers are often already premul-like and closer to Spout. Per-side association flatten makes VMAF compare the same black composite instead of punishing that mismatch. α still needs a BGRA / full-range canvas (`yuva420p`); `auto-alt-ref=0` is the usual alpha-safe flag.
 

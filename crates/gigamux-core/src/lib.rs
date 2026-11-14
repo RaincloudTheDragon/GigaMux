@@ -51,7 +51,8 @@ pub use flamenco::{
     scripts_dir_from_manager_install, set_worker_tags, submit_job, worker_status_probeable,
     write_farm_probe_report, CancelExecMode, DeployReport, FarmChunkCheck, FarmCleanup,
     FarmFinalCheck, FarmProbeHostReport, FarmProbeInventory, FarmProbeTaskTypeReport, FarmVmafMode,
-    FarmVmafSpec, FlamencoIntegrity, FlamencoJobStatus, FlamencoTaskSummary, FlamencoTwoway,
+    FarmVmafPart, FarmVmafSpec, FlamencoIntegrity, FlamencoJobStatus, FlamencoTaskSummary,
+    FlamencoTwoway,
     FlamencoWorkerSummary, ProbeWorkerPin, SubmittedJob, WorkerTaskTypeRecommendation,
     CAPABILITY_TASK_TYPES, DEFAULT_CHECK_EXE, GIGAMUX_JS,
 };
@@ -80,7 +81,8 @@ pub use targets::{
     TestBatch,
 };
 pub use vmaf::{
-    ensure_vmaf, libvmaf_available, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path,
-    write_vmaf_sidecar, VmafEvent, VmafReport, VmafResult, VmafSidecar,
+    ensure_vmaf, ensure_vmaf_part, libvmaf_available, libvmaf_available_exe, merge_vmaf_parts,
+    read_vmaf_sidecar, resolve_ffmpeg_for_vmaf, run_vmaf, vmaf_part_sidecar_path, vmaf_sidecar_path,
+    write_vmaf_sidecar, VmafEvent, VmafPartSidecar, VmafReport, VmafResult, VmafSidecar,
 };
 pub use webm_alpha::wants_qsv_alpha_hybrid;

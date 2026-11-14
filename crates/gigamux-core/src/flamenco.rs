@@ -211,12 +211,24 @@ pub enum FarmVmafMode {
     Separate,
 }
 
+/// One temporal slice inside a farm VMAF pair (`ensure-vmaf-part`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FarmVmafPart {
+    pub sidecar: String,
+    pub start_frame: u64,
+    pub frame_count: u64,
+    pub fps: f64,
+}
+
 /// One farm VMAF pair for `gigamux-check ensure-vmaf` (attached or VMAF-only job).
+/// When `parts` is non-empty, workers score each slice then `merge-vmaf` into `sidecar`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FarmVmafSpec {
     pub input: String,
     pub output: String,
     pub sidecar: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<FarmVmafPart>,
 }
 
 /// Integrity settings embedded in a GigaMux Flamenco job (hybrid model).
@@ -262,6 +274,9 @@ fn rewrite_integrity_paths(mut integ: FlamencoIntegrity, tw: Option<FlamencoTwow
         v.input = rewrite_path_arg(&v.input, tw);
         v.output = rewrite_path_arg(&v.output, tw);
         v.sidecar = rewrite_path_arg(&v.sidecar, tw);
+        for p in &mut v.parts {
+            p.sidecar = rewrite_path_arg(&p.sidecar, tw);
+        }
     }
     integ
 }
@@ -690,6 +705,16 @@ pub fn make_gigamux_vmaf_job(
             input: rewrite_path_arg(&p.input, twoway),
             output: rewrite_path_arg(&p.output, twoway),
             sidecar: rewrite_path_arg(&p.sidecar, twoway),
+            parts: p
+                .parts
+                .iter()
+                .map(|part| FarmVmafPart {
+                    sidecar: rewrite_path_arg(&part.sidecar, twoway),
+                    start_frame: part.start_frame,
+                    frame_count: part.frame_count,
+                    fps: part.fps,
+                })
+                .collect(),
         });
     }
     let pairs_json =
@@ -1188,15 +1213,28 @@ fn helper_search_roots() -> Vec<PathBuf> {
 }
 
 fn find_helper_file(file_name: &str) -> Result<PathBuf, String> {
+    // Prefer the newest mtime among all hits; a fresh `cargo build --release` must beat a stale
+    // `flamenco/helpers/` copy that would otherwise win first-match search order.
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
     for root in helper_search_roots() {
         let p = root.join(file_name);
-        if p.is_file() {
-            return Ok(p);
+        let Ok(meta) = fs::metadata(&p) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &best {
+            Some((_, best_t)) if mtime <= *best_t => {}
+            _ => best = Some((p, mtime)),
         }
     }
-    Err(format!(
-        "missing helper `{file_name}` — expected next to the app under helpers/ (release) or flamenco/helpers/ (dev; see flamenco/helpers/README.md)"
-    ))
+    best.map(|(p, _)| p).ok_or_else(|| {
+        format!(
+            "missing helper `{file_name}`; expected next to the app under helpers/ (release) or flamenco/helpers/ (dev; see flamenco/helpers/README.md)"
+        )
+    })
 }
 
 /// Copy bundled `GigaMux.js` into `scripts_dir` (legacy; prefer [`deploy_gigamux_manager`]).

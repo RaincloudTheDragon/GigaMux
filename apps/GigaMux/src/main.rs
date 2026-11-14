@@ -220,6 +220,15 @@ enum ExistingDeliverOutcome {
     Failed,
 }
 
+/// Session-log suffix when farm VMAF is split into temporal parts.
+fn farm_vmaf_parts_suffix(spec: &FarmVmafSpec) -> String {
+    if spec.parts.is_empty() {
+        String::new()
+    } else {
+        format!("; VMAF ×{} parts", spec.parts.len())
+    }
+}
+
 /// Skip encode when the deliver exists; if farm VMAF ≠ Off, submit a VMAF-only job instead.
 fn farm_submit_existing_deliver(
     farm_vmaf: FarmVmafMode,
@@ -231,6 +240,7 @@ fn farm_submit_existing_deliver(
     exe: Option<&str>,
     check_exe: &str,
     twoway: Option<FlamencoTwoway<'_>>,
+    vmaf_parts: u32,
     tx: &mpsc::Sender<AppEvent>,
 ) -> ExistingDeliverOutcome {
     if farm_vmaf == FarmVmafMode::Off {
@@ -245,7 +255,8 @@ fn farm_submit_existing_deliver(
         ))));
         return ExistingDeliverOutcome::Skipped;
     }
-    let spec = farm_vmaf_spec(input, output);
+    let spec = farm_vmaf_spec(input, output, vmaf_parts);
+    let parts_note = farm_vmaf_parts_suffix(&spec);
     let job = match make_gigamux_vmaf_job(
         format!("GigaMux VMAF {out_name}"),
         exe,
@@ -264,7 +275,7 @@ fn farm_submit_existing_deliver(
     match submit_job(url, &job) {
         Ok(id) => {
             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                "Flamenco VMAF-only (exists): job {id}; {item_label} → {out_name}"
+                "Flamenco VMAF-only (exists): job {id}; {item_label} → {out_name}{parts_note}"
             ))));
             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
                 job_id: id,
@@ -2821,6 +2832,7 @@ impl GigaMuxApp {
                             exe,
                             &check,
                             twoway,
+                            chunk_n,
                             &tx,
                         ) {
                             ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -2848,8 +2860,14 @@ impl GigaMuxApp {
                                 "Flamenco VMAF skip (already scored): {out_name}"
                             ))));
                         } else {
-                            integrity.vmaf =
-                                Some(farm_vmaf_spec(&req.input, &job_built.final_output));
+                            let vmaf = farm_vmaf_spec(&req.input, &job_built.final_output, chunk_n);
+                            let note = farm_vmaf_parts_suffix(&vmaf);
+                            if !note.is_empty() {
+                                let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(
+                                    format!("Flamenco attached VMAF{note}: {out_name}"),
+                                )));
+                            }
+                            integrity.vmaf = Some(vmaf);
                         }
                     }
                     let job = match make_gigamux_hybrid_job(
@@ -2931,6 +2949,7 @@ impl GigaMuxApp {
                             exe,
                             &check,
                             twoway,
+                            chunk_n,
                             &tx,
                         ) {
                             ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -2958,8 +2977,14 @@ impl GigaMuxApp {
                                 "Flamenco VMAF skip (already scored): {out_name}"
                             ))));
                         } else {
-                            integrity.vmaf =
-                                Some(farm_vmaf_spec(&req.input, &job_built.final_output));
+                            let vmaf = farm_vmaf_spec(&req.input, &job_built.final_output, chunk_n);
+                            let note = farm_vmaf_parts_suffix(&vmaf);
+                            if !note.is_empty() {
+                                let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(
+                                    format!("Flamenco attached VMAF{note}: {out_name}"),
+                                )));
+                            }
+                            integrity.vmaf = Some(vmaf);
                         }
                     }
                     let job = match make_gigamux_chunked_job(
@@ -3048,6 +3073,7 @@ impl GigaMuxApp {
                         exe,
                         &check,
                         twoway,
+                        chunk_n,
                         &tx,
                     ) {
                         ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3065,7 +3091,14 @@ impl GigaMuxApp {
                             "Flamenco VMAF skip (already scored): {out_name}"
                         ))));
                     } else {
-                        integrity.vmaf = Some(farm_vmaf_spec(&req.input, &cmd.output));
+                        let vmaf = farm_vmaf_spec(&req.input, &cmd.output, chunk_n);
+                        let note = farm_vmaf_parts_suffix(&vmaf);
+                        if !note.is_empty() {
+                            let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
+                                "Flamenco attached VMAF{note}: {out_name}"
+                            ))));
+                        }
+                        integrity.vmaf = Some(vmaf);
                     }
                 }
                 let job = match make_gigamux_encode_job(
@@ -3445,7 +3478,8 @@ impl GigaMuxApp {
             self.push_session(format!("Farm VMAF skip (missing output): {out_name}"));
             return;
         }
-        let spec = farm_vmaf_spec(&in_path, &out_path);
+        let parts = self.prefs.flamenco_chunks.clamp(2, 32);
+        let spec = farm_vmaf_spec(&in_path, &out_path, parts);
         self.submit_farm_vmaf_job(format!("GigaMux VMAF {out_name}"), &[spec], out_name);
     }
 
@@ -3461,6 +3495,7 @@ impl GigaMuxApp {
         }
         self.import_vmaf_sidecars_from_output();
         let unscored = self.unscored_output_names();
+        let vmaf_parts = self.prefs.flamenco_chunks.clamp(2, 32);
         let mut pairs: Vec<FarmVmafSpec> = Vec::new();
         for out_name in &unscored {
             if is_chunk_filename(out_name) {
@@ -3480,7 +3515,7 @@ impl GigaMuxApp {
             if !in_path.is_file() {
                 continue;
             }
-            pairs.push(farm_vmaf_spec(&in_path, &out_path));
+            pairs.push(farm_vmaf_spec(&in_path, &out_path, vmaf_parts));
         }
         if pairs.is_empty() {
             self.push_session("Farm VMAF batch: nothing unscored to submit");
@@ -3544,7 +3579,19 @@ impl GigaMuxApp {
         };
         match submit_job(&url, &job) {
             Ok(id) => {
-                self.push_session(format!("Farm VMAF submitted: job {id}; {track_label}"));
+                let parts_note = if pairs.len() == 1 {
+                    farm_vmaf_parts_suffix(&pairs[0])
+                } else {
+                    let sliced = pairs.iter().filter(|p| !p.parts.is_empty()).count();
+                    if sliced == 0 {
+                        String::new()
+                    } else {
+                        format!("; {sliced}/{n} with temporal parts", n = pairs.len())
+                    }
+                };
+                self.push_session(format!(
+                    "Farm VMAF submitted: job {id}; {track_label}{parts_note}"
+                ));
                 self.track_farm_job(
                     id,
                     track_label.to_string(),
