@@ -2835,7 +2835,8 @@ impl GigaMuxApp {
                     None => format!("GigaMux {name}"),
                 };
                 let hw_opaque = farm_path_is_hw_opaque(&input, &slot);
-                let use_chunks = want_chunk && !(only_soft && hw_opaque);
+                // Auto N=1 (short inputs): stay on single-file farm path; do not enter chunked builder.
+                let use_chunks = want_chunk && chunk_n > 1 && !(only_soft && hw_opaque);
                 let is_hybrid = wants_qsv_alpha_hybrid(
                     slot.use_hardware,
                     has_alpha,

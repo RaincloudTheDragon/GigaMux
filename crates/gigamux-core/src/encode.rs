@@ -1607,8 +1607,14 @@ fn probe_nb_frames(info: &serde_json::Value) -> Option<u64> {
 }
 
 /// Build N video-only chunk encodes + concat + mux for Flamenco (vod_chunkutil model).
+/// Caller must pass `chunks >= 2` (auto N=1 uses the single-file farm path).
 pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob, String> {
-    let chunks = req.chunks.max(2);
+    let chunks = req.chunks;
+    if chunks < 2 {
+        return Err(format!(
+            "chunked farm job needs chunks >= 2 (got {chunks}; use single-file path when auto N=1)"
+        ));
+    }
     if !req.input.is_file() {
         return Err(format!("input not found: {}", req.input.display()));
     }

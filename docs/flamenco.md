@@ -154,7 +154,7 @@ Farm `.ffconcat` lists use **basenames** (chunks next to the list) so Linux work
 
 | Control | Default | Behavior |
 | --- | --- | --- |
-| Chunk encode | off | N equal frame ranges (`2`–`32`), then mux/remux |
+| Chunk encode | off | Auto `ceil(dur/3min)` up to Max chunks (`2`–`128`); N=1 stays single-file (no forced 2-way split) |
 | Only chunk software | on | HW opaque paths stay single-task; software/alpha still chunk |
 | Chunk QSV color (multi-QSV) | off | Hybrid only: also split QSV color IVF when Chunk encode is on |
 
