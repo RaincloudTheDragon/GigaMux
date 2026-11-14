@@ -1564,6 +1564,51 @@ impl GigaMuxApp {
         let _ = preview_cache::clear();
     }
 
+    /// Drop chips/thumb for `names` on `side` and re-probe (keeps VMAF while the file fingerprint matches).
+    fn reindex_names(&mut self, side: FileSide, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        for name in names {
+            let key = Self::preview_key(side, name);
+            let entry = self
+                .preview_cache
+                .entry(key)
+                .or_insert_with(PreviewCacheEntry::pending);
+            // Keep fingerprint + VMAF so Fast re-apply does not clear the score.
+            entry.summary = None;
+            entry.thumb = None;
+            entry.texture = None;
+            entry.pending = true;
+            entry.bitrates_ready = false;
+        }
+        self.start_preview_cache();
+        self.push_session(format!(
+            "re-indexing {} {} file{}",
+            names.len(),
+            match side {
+                FileSide::Input => "input",
+                FileSide::Output => "output",
+            },
+            if names.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Right-click: re-index the clicked row, or the whole multi-select when it is part of it.
+    fn reindex_context_selection(&mut self, side: FileSide, clicked: &str) {
+        if !self.is_selected(side, clicked) {
+            self.select_file(side, clicked.to_string());
+            self.reindex_names(side, &[clicked.to_string()]);
+            return;
+        }
+        if self.selected.len() > 1 {
+            let names = self.selected_names_ordered();
+            self.reindex_names(side, &names);
+        } else {
+            self.reindex_names(side, &[clicked.to_string()]);
+        }
+    }
+
     /// Build egui textures for disk-loaded thumbs that have none yet.
     fn hydrate_preview_textures(&mut self, ctx: &egui::Context) {
         for (key, entry) in self.preview_cache.iter_mut() {
@@ -1685,9 +1730,14 @@ impl GigaMuxApp {
                     }
                     continue;
                 }
+                // Stale / re-index: re-probe without wiping VMAF (Fast keeps score if fingerprint matches).
+                if let Some(e) = self.preview_cache.get_mut(&key) {
+                    e.pending = true;
+                }
+            } else {
+                self.preview_cache
+                    .insert(key.clone(), PreviewCacheEntry::pending());
             }
-            self.preview_cache
-                .insert(key.clone(), PreviewCacheEntry::pending());
             to_fast.push_back((key, path));
         }
         if to_fast.is_empty() && to_enrich.is_empty() && to_mtime.is_empty() {
@@ -7136,6 +7186,24 @@ impl GigaMuxApp {
                                         self.select_file(FileSide::Input, name.clone());
                                     }
                                     self.open_flamenco_submit(None);
+                                    ui.close();
+                                }
+                            }
+                            {
+                                let multi = self.is_selected(side, &name) && self.selected.len() > 1;
+                                let reindex_label = if multi {
+                                    format!("Re-index selection ({})", self.selected.len())
+                                } else {
+                                    "Re-index this file".into()
+                                };
+                                if ui
+                                    .button(reindex_label)
+                                    .on_hover_text(
+                                        "Re-probe chips, rates, and thumbnail for this selection. F5 reloads whole folders; Ctrl+F5 clears the preview cache.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.reindex_context_selection(side, &name);
                                     ui.close();
                                 }
                             }
