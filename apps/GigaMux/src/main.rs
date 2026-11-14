@@ -320,13 +320,21 @@ struct ListsScanResult {
     output_files: Vec<PathBuf>,
     input_bytes: u64,
     output_bytes: u64,
+    /// Basename → size from the same metadata pass as bulk totals (footer uses this; no UI-thread share I/O).
+    input_sizes: HashMap<String, u64>,
+    output_sizes: HashMap<String, u64>,
     /// `(out_name, input_name, score)` from `{deliver}.vmaf.json` beside outputs.
     vmaf_sidecars: Vec<(String, String, f64)>,
     /// Orphan VMAF sidecars removed when purge-on-open / Alt purge ran with this scan.
     vmaf_purged: usize,
     /// Sidecars marked Hidden on this scan (Windows); 0 on Unix / when not requested.
     vmaf_hidden: usize,
+    /// Idle cadence scan: chips only (skip bitrate enrich + thumbs).
+    idle_chips_only: bool,
 }
+
+/// Folder DnD: resolved on a worker so share `is_dir` never blocks the UI.
+type DndFolderResult = (bool, Result<PathBuf, String>);
 
 /// Incremental preview worker messages (fast chips first, then peeks + thumb).
 enum PreviewMsg {
@@ -439,6 +447,9 @@ struct GigaMuxApp {
     input_listed_bytes: u64,
     /// Sum of listed Output file sizes (updated in `refresh_lists`).
     output_listed_bytes: u64,
+    /// Per-basename sizes from last list scan (footer selection totals; no live share metadata).
+    input_file_sizes: HashMap<String, u64>,
+    output_file_sizes: HashMap<String, u64>,
     /// Primary selection (preview / log focus): side + basename.
     active: Option<(FileSide, String)>,
     /// Multi-select set on the same side as `active` (always includes the primary name).
@@ -512,6 +523,8 @@ struct GigaMuxApp {
     output_rect: Option<egui::Rect>,
     /// Pane under the cursor during an OS file drag (Windows often has no reliable pointer on the drop frame).
     dnd_hover_side: Option<FileSide>,
+    /// In-flight folder drop resolve (`is_input`, folder path or error).
+    dnd_folder_rx: Option<Receiver<DndFolderResult>>,
     /// Visible row count for PgUp/PgDn (updated while painting the active folder list).
     folder_page_rows: usize,
     /// After keyboard nav, scroll the primary row into view once.
@@ -520,6 +533,11 @@ struct GigaMuxApp {
     cache_gen: Arc<AtomicU64>,
     preview_cache: HashMap<String, PreviewCacheEntry>,
     cache_rx: Option<Receiver<PreviewMsg>>,
+    /// Persist preview cache after probe batches (debounced; write runs off UI thread).
+    preview_cache_dirty: bool,
+    preview_cache_save_at: Option<Instant>,
+    preview_cache_save_rx: Option<Receiver<()>>,
+    preview_cache_save_inflight: bool,
     /// Dual progress bars while an encode batch is running.
     encode_progress: Option<EncodeProgress>,
     /// Taskbar overlay is currently showing (Windows); used to clear once when the job ends.
@@ -539,6 +557,8 @@ struct GigaMuxApp {
     mtime_refresh_on_next_lists: bool,
     /// Next lists scan should purge orphan VMAF sidecars in output (startup pref / Alt purge).
     vmaf_purge_on_next_lists: bool,
+    /// Next spawned list scan should ask `start_preview_cache` for chips-only enrich (idle cadence).
+    lists_idle_pending: bool,
     /// Reachability from the last completed scan (never call share `is_dir` on the UI thread).
     input_dir_ok: bool,
     output_dir_ok: bool,
@@ -927,6 +947,8 @@ impl GigaMuxApp {
             output_files: Vec::new(),
             input_listed_bytes: 0,
             output_listed_bytes: 0,
+            input_file_sizes: HashMap::new(),
+            output_file_sizes: HashMap::new(),
             active: None,
             selected: HashSet::new(),
             selection_anchor: None,
@@ -972,11 +994,16 @@ impl GigaMuxApp {
             input_rect: None,
             output_rect: None,
             dnd_hover_side: None,
+            dnd_folder_rx: None,
             folder_page_rows: 10,
             scroll_sel_into_view: false,
             cache_gen: Arc::new(AtomicU64::new(0)),
             preview_cache: HashMap::new(),
             cache_rx: None,
+            preview_cache_dirty: false,
+            preview_cache_save_at: None,
+            preview_cache_save_rx: None,
+            preview_cache_save_inflight: false,
             encode_progress: None,
             #[cfg(windows)]
             taskbar_showing: false,
@@ -988,6 +1015,7 @@ impl GigaMuxApp {
             lists_queued: false,
             mtime_refresh_on_next_lists: false,
             vmaf_purge_on_next_lists,
+            lists_idle_pending: false,
             input_dir_ok,
             output_dir_ok,
         };
@@ -1510,9 +1538,30 @@ impl GigaMuxApp {
         }
     }
 
-    /// Write RAM cache to AppData (meta JSON + thumb files).
-    fn save_preview_cache_to_disk(&self) {
-        let mut entries = HashMap::new();
+    /// Debounce window so burst probe completions coalesce into one AppData write.
+    const PREVIEW_CACHE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+    /// Mark preview cache dirty and schedule a background persist (no UI-thread JSON/thumb I/O).
+    fn schedule_preview_cache_save(&mut self) {
+        self.preview_cache_dirty = true;
+        self.preview_cache_save_at =
+            Some(Instant::now() + Self::PREVIEW_CACHE_SAVE_DEBOUNCE);
+    }
+
+    /// Snapshot ready entries (incl. thumb RGBA) for an off-thread persist.
+    fn snapshot_preview_cache_for_save(
+        &self,
+    ) -> Vec<(
+        String,
+        PathBuf,
+        u64,
+        i64,
+        Result<MediaSummary, String>,
+        Option<Result<RgbaThumb, String>>,
+        bool,
+        Option<f64>,
+    )> {
+        let mut out = Vec::new();
         for (key, e) in &self.preview_cache {
             if !e.ready() {
                 continue;
@@ -1523,9 +1572,38 @@ impl GigaMuxApp {
             let Some(summary) = e.summary.clone() else {
                 continue;
             };
-            let (thumb_file, thumb_width, thumb_height, thumb_err, thumb_fmt) = match &e.thumb {
-                Some(Ok(thumb)) => match preview_cache::write_thumb(key, thumb) {
-                    Ok(name) => (Some(name), thumb.width, thumb.height, None, THUMB_FMT),
+            out.push((
+                key.clone(),
+                path,
+                e.file_size,
+                e.mtime_secs,
+                summary,
+                e.thumb.clone(),
+                e.bitrates_ready,
+                e.vmaf_score,
+            ));
+        }
+        out
+    }
+
+    /// Write thumbs + JSON (safe on a worker or during `on_exit`).
+    fn persist_preview_cache_snapshot(
+        snap: Vec<(
+            String,
+            PathBuf,
+            u64,
+            i64,
+            Result<MediaSummary, String>,
+            Option<Result<RgbaThumb, String>>,
+            bool,
+            Option<f64>,
+        )>,
+    ) {
+        let mut entries = HashMap::new();
+        for (key, path, size, mtime_secs, summary, thumb, bitrates_ready, vmaf_score) in snap {
+            let (thumb_file, thumb_width, thumb_height, thumb_err, thumb_fmt) = match &thumb {
+                Some(Ok(t)) => match preview_cache::write_thumb(&key, t) {
+                    Ok(name) => (Some(name), t.width, t.height, None, THUMB_FMT),
                     Err(err) => (None, 0, 0, Some(truncate_cli_err(&err, 800)), 0),
                 },
                 // Don't persist multi‑k‑line ffmpeg dumps into preview_cache.json.
@@ -1533,19 +1611,19 @@ impl GigaMuxApp {
                 None => (None, 0, 0, None, 0),
             };
             entries.insert(
-                key.clone(),
+                key,
                 PersistedPreviewEntry {
                     path,
-                    size: e.file_size,
-                    mtime_secs: e.mtime_secs,
+                    size,
+                    mtime_secs,
                     summary,
                     thumb_file,
                     thumb_width,
                     thumb_height,
                     thumb_err,
                     thumb_fmt,
-                    bitrates_ready: e.bitrates_ready,
-                    vmaf_score: e.vmaf_score,
+                    bitrates_ready,
+                    vmaf_score,
                 },
             );
         }
@@ -1554,6 +1632,56 @@ impl GigaMuxApp {
             entries,
         };
         let _ = preview_cache::save(&disk);
+    }
+
+    /// Spawn a background persist of the current RAM cache snapshot.
+    fn spawn_preview_cache_save(&mut self) {
+        let snap = self.snapshot_preview_cache_for_save();
+        self.preview_cache_dirty = false;
+        self.preview_cache_save_at = None;
+        self.preview_cache_save_inflight = true;
+        let (tx, rx) = mpsc::channel();
+        self.preview_cache_save_rx = Some(rx);
+        thread::spawn(move || {
+            Self::persist_preview_cache_snapshot(snap);
+            let _ = tx.send(());
+        });
+    }
+
+    /// Drain save completion; start a debounced write when due (UI thread never blocks on JSON/thumbs).
+    fn poll_preview_cache_save(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.preview_cache_save_rx.take() {
+            match rx.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.preview_cache_save_inflight = false;
+                    // Another dirty while we were writing; short follow-up debounce.
+                    if self.preview_cache_dirty && self.preview_cache_save_at.is_none() {
+                        self.preview_cache_save_at =
+                            Some(Instant::now() + Duration::from_millis(100));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.preview_cache_save_rx = Some(rx);
+                }
+            }
+        }
+        if self.preview_cache_save_inflight || !self.preview_cache_dirty {
+            return;
+        }
+        let Some(at) = self.preview_cache_save_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now < at {
+            ctx.request_repaint_after(at.saturating_duration_since(now));
+            return;
+        }
+        self.spawn_preview_cache_save();
+    }
+
+    /// Blocking persist (exit path only; AppData write is fine once the window is closing).
+    fn save_preview_cache_to_disk(&self) {
+        Self::persist_preview_cache_snapshot(self.snapshot_preview_cache_for_save());
     }
 
     /// Wipe RAM + AppData preview cache (Ctrl+F5).
@@ -1712,7 +1840,9 @@ impl GigaMuxApp {
             .retain(|k, _| key_set.contains(k) || parked.contains(k));
 
         // Full probe vs enrich-only (disk hit with chips but missing peeks/thumb).
-        let defer_enrich = self.vmaf_job_active();
+        // Idle list cadence: chips for new/stale only; skip bitrate enrich + thumbs this pass.
+        let defer_enrich =
+            self.vmaf_job_active() || std::mem::take(&mut self.lists_idle_pending);
         let mut to_fast = VecDeque::new();
         let mut to_enrich = VecDeque::new();
         let mut to_mtime = VecDeque::new();
@@ -1985,38 +2115,60 @@ impl GigaMuxApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         } else {
             // All workers done — persist whatever we have (chips + peeks + thumbs).
-            self.save_preview_cache_to_disk();
+            self.schedule_preview_cache_save();
         }
         if got_any {
             ctx.request_repaint();
         }
     }
 
-    /// Set input or output folder from a dropped path (folder, or parent of a file).
+    /// Queue folder-or-parent resolve off the UI thread (share `is_dir` can hitch).
     fn set_folder_from_path(&mut self, is_input: bool, path: PathBuf) {
-        let dir = if path.is_dir() {
-            path
-        } else if let Some(parent) = path.parent().filter(|p| p.is_dir()) {
-            parent.to_path_buf()
-        } else {
-            self.alert_error(
-                "Drop",
-                format!("drop ignored (not a folder): {}", path.display()),
-            );
+        let (tx, rx) = mpsc::channel();
+        self.dnd_folder_rx = Some(rx);
+        thread::spawn(move || {
+            let dir = if path.is_dir() {
+                Ok(path)
+            } else if let Some(parent) = path.parent().filter(|p| p.is_dir()) {
+                Ok(parent.to_path_buf())
+            } else {
+                Err(format!(
+                    "drop ignored (not a folder): {}",
+                    path.display()
+                ))
+            };
+            let _ = tx.send((is_input, dir));
+        });
+    }
+
+    /// Apply a completed folder-drop resolve (prefs + list refresh, or error alert).
+    fn poll_dnd_folder(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.dnd_folder_rx.take() else {
             return;
         };
-        if is_input {
-            self.prefs.input_dir = dir;
-        } else {
-            self.prefs.output_dir = dir;
+        match rx.try_recv() {
+            Ok((is_input, Ok(dir))) => {
+                if is_input {
+                    self.prefs.input_dir = dir;
+                    self.input_dir_ok = true;
+                } else {
+                    self.prefs.output_dir = dir;
+                    self.output_dir_ok = true;
+                }
+                let _ = prefs::save(&self.prefs);
+                self.request_refresh_lists();
+                ctx.request_repaint();
+            }
+            Ok((_, Err(msg))) => {
+                self.alert_error("Drop", msg);
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.dnd_folder_rx = Some(rx);
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {}
         }
-        let _ = prefs::save(&self.prefs);
-        if is_input {
-            self.input_dir_ok = true;
-        } else {
-            self.output_dir_ok = true;
-        }
-        self.request_refresh_lists();
     }
 
     /// Pointer for folder DnD: egui often has none during an OS drag on Windows.
@@ -2138,10 +2290,14 @@ impl GigaMuxApp {
         let in_dir = self.prefs.input_dir.clone();
         let out_dir = self.prefs.output_dir.clone();
         let purge_vmaf = std::mem::take(&mut self.vmaf_purge_on_next_lists);
+        // Taken here so a coalesced idle+manual request still chips-only only when idle armed this spawn.
+        let idle_chips_only = std::mem::take(&mut self.lists_idle_pending);
         let (tx, rx) = mpsc::channel();
         self.lists_rx = Some(rx);
         thread::spawn(move || {
-            let _ = tx.send(scan_media_lists(gen, &in_dir, &out_dir, purge_vmaf));
+            let mut result = scan_media_lists(gen, &in_dir, &out_dir, purge_vmaf);
+            result.idle_chips_only = idle_chips_only;
+            let _ = tx.send(result);
         });
     }
 
@@ -2185,6 +2341,8 @@ impl GigaMuxApp {
         self.output_files = result.output_files;
         self.input_listed_bytes = result.input_bytes;
         self.output_listed_bytes = result.output_bytes;
+        self.input_file_sizes = result.input_sizes;
+        self.output_file_sizes = result.output_sizes;
         // Prune multi-select / primary if files vanished from disk.
         if let Some((side, name)) = self.active.clone() {
             let alive: HashSet<String> = self.names_for(side).into_iter().collect();
@@ -2212,6 +2370,8 @@ impl GigaMuxApp {
             let parked = self.parked_preview_keys();
             self.preview_cache.retain(|k, _| parked.contains(k));
         } else {
+            // Idle scan: start_preview_cache takes this for chips-only defer.
+            self.lists_idle_pending = result.idle_chips_only;
             self.start_preview_cache();
         }
         // Sidecars gathered off-thread; apply into preview_cache (no share read_dir here).
@@ -2245,16 +2405,25 @@ impl GigaMuxApp {
         }
         // Output deleted/renamed → drop orphaned input (and vice versa) VMAF so meta stays live.
         if self.scrub_stale_vmaf() {
-            self.save_preview_cache_to_disk();
+            self.schedule_preview_cache_save();
         }
     }
 
-    fn sum_file_bytes(files: &[PathBuf]) -> u64 {
-        files
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .sum()
+    /// Metadata pass: bulk total + per-basename sizes (one share hit per file).
+    fn file_size_map(files: &[PathBuf]) -> (u64, HashMap<String, u64>) {
+        let mut map = HashMap::new();
+        let mut total = 0u64;
+        for p in files {
+            let Ok(meta) = std::fs::metadata(p) else {
+                continue;
+            };
+            let len = meta.len();
+            total = total.saturating_add(len);
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                map.insert(name.to_string(), len);
+            }
+        }
+        (total, map)
     }
 
     /// Pane footer: listed count + total size (e.g. `15 items · 129.83 GB`).
@@ -2275,31 +2444,36 @@ impl GigaMuxApp {
             .map(|i| i + 1)
     }
 
-    /// Sum on-disk sizes for basenames on `side` (missing files contribute 0).
-    fn sum_named_bytes(&self, side: FileSide, names: &[String]) -> u64 {
-        let dir = match side {
-            FileSide::Input => &self.prefs.input_dir,
-            FileSide::Output => &self.prefs.output_dir,
+    /// Size for one basename from the last list scan, else preview_cache fingerprint (no share I/O).
+    fn cached_file_bytes(&self, side: FileSide, name: &str) -> u64 {
+        let map = match side {
+            FileSide::Input => &self.input_file_sizes,
+            FileSide::Output => &self.output_file_sizes,
         };
+        if let Some(&n) = map.get(name) {
+            return n;
+        }
+        self.preview_cache
+            .get(&Self::preview_key(side, name))
+            .map(|e| e.file_size)
+            .unwrap_or(0)
+    }
+
+    /// Sum sizes for basenames on `side` from scan maps / preview_cache (missing → 0).
+    fn sum_named_bytes(&self, side: FileSide, names: &[String]) -> u64 {
         names
             .iter()
-            .filter_map(|n| std::fs::metadata(dir.join(n)).ok())
-            .map(|m| m.len())
+            .map(|n| self.cached_file_bytes(side, n))
             .sum()
     }
 
     /// Bytes of each selected name's counterpart on the other side (skips unpaired).
     fn sum_counterpart_bytes(&self, side: FileSide, names: &[String]) -> u64 {
         let other = Self::other_side(side);
-        let dir = match other {
-            FileSide::Input => &self.prefs.input_dir,
-            FileSide::Output => &self.prefs.output_dir,
-        };
         names
             .iter()
             .filter_map(|n| self.counterpart_name(side, n))
-            .filter_map(|c| std::fs::metadata(dir.join(c)).ok())
-            .map(|m| m.len())
+            .map(|c| self.cached_file_bytes(other, &c))
             .sum()
     }
 
@@ -2401,6 +2575,8 @@ impl GigaMuxApp {
         let due = self.lists_refreshed_at + Self::LISTS_IDLE_REFRESH;
         let now = Instant::now();
         if now >= due {
+            // Chips-only enrich on this pass (manual F5 / folder change keep full enrich).
+            self.lists_idle_pending = true;
             self.request_refresh_lists();
             // Don't spin until the scan finishes; cadence is from request time.
             self.lists_refreshed_at = Instant::now();
@@ -2664,20 +2840,21 @@ impl GigaMuxApp {
             self.alert_error("Flamenco", "no input files to send");
             return;
         }
+        // Prefer preview_cache duration (no sync ffprobe on dialog open); 0 → “duration unknown”.
         let (estimate_name, estimate_duration_s) = names
             .first()
             .map(|n| {
-                let p = self.prefs.input_dir.join(n);
-                let dur = file_info(&p)
-                    .ok()
-                    .map(|info| {
-                        info.pointer("/format/duration")
-                            .and_then(|v| {
-                                v.as_f64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0.0)
+                let dur = self
+                    .preview_cache
+                    .get(&Self::preview_key(FileSide::Input, n))
+                    .or_else(|| {
+                        self.preview_cache
+                            .get(&Self::preview_key(FileSide::Output, n))
                     })
+                    .and_then(|e| e.summary.as_ref())
+                    .and_then(|s| s.as_ref().ok())
+                    .map(|s| s.duration_s)
+                    .filter(|&d| d > 0.0)
                     .unwrap_or(0.0);
                 (n.clone(), dur)
             })
@@ -4635,7 +4812,7 @@ impl GigaMuxApp {
         } else {
             self.push_session(format!("renamed {} files", done.len()));
         }
-        self.save_preview_cache_to_disk();
+        self.schedule_preview_cache_save();
     }
 
     /// Delete all selected files (Del). Refuses while a job / delete cascade is running.
@@ -4974,7 +5151,7 @@ impl GigaMuxApp {
                         if !names.is_empty() {
                             self.select_restored(side, &names);
                         }
-                        self.save_preview_cache_to_disk();
+                        self.schedule_preview_cache_save();
                         if done.len() == 1 {
                             let (o, n) = &done[0];
                             self.push_session(format!("renamed: {o} → {n}"));
@@ -6070,7 +6247,7 @@ impl GigaMuxApp {
         if !already {
             self.push_file_log(input, &format!("VMAF {input} → {output}: {score:.4}"));
         }
-        self.save_preview_cache_to_disk();
+        self.schedule_preview_cache_save();
     }
 
     /// End-of-batch safety net: any scored pairs not yet cached (should be rare after live FileDone).
@@ -10469,8 +10646,8 @@ fn scan_media_lists(
     } else {
         Vec::new()
     };
-    let input_bytes = GigaMuxApp::sum_file_bytes(&input_files);
-    let output_bytes = GigaMuxApp::sum_file_bytes(&output_files);
+    let (input_bytes, input_sizes) = GigaMuxApp::file_size_map(&input_files);
+    let (output_bytes, output_sizes) = GigaMuxApp::file_size_map(&output_files);
     let mut vmaf_sidecars = Vec::new();
     if output_ok {
         if let Ok(entries) = std::fs::read_dir(output_dir) {
@@ -10502,9 +10679,13 @@ fn scan_media_lists(
         output_files,
         input_bytes,
         output_bytes,
+        input_sizes,
+        output_sizes,
         vmaf_sidecars,
         vmaf_purged,
         vmaf_hidden,
+        // Overwritten by spawn_lists_scan when idle cadence requested this pass.
+        idle_chips_only: false,
     }
 }
 
@@ -10798,8 +10979,10 @@ impl eframe::App for GigaMuxApp {
         let _ = frame;
         self.tick_delete_queue(ctx);
         self.tick_history_nav(ctx);
+        self.poll_dnd_folder(ctx);
         self.poll_lists_refresh(ctx);
         self.poll_preview_cache(ctx);
+        self.poll_preview_cache_save(ctx);
         // Pref-armed idle pass: silent Check → filtered VMAF (no purge window).
         // Wake when the next due Instant arrives even if the UI is otherwise idle.
         if self.prefs.auto_vmaf_when_idle && self.auto_vmaf_armed {
