@@ -8013,7 +8013,14 @@ impl GigaMuxApp {
                     "Encoder",
                     s.encoder.as_deref().unwrap_or("—"),
                 );
-                row(ui, "OBS", yes_no(s.from_obs));
+                // Skip when Encoder already names OBS Studio; tags row would only repeat that.
+                let encoder_names_obs = s
+                    .encoder
+                    .as_deref()
+                    .is_some_and(|e| e.to_ascii_lowercase().contains("obs studio"));
+                if !encoder_names_obs {
+                    row(ui, "OBS tags", yes_no(s.from_obs));
+                }
                 row(
                     ui,
                     "OBS chapt",
