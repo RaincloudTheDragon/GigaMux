@@ -128,7 +128,7 @@ pub struct MediaSummary {
 
 impl MediaSummary {
     /// Bump when summary fields change so UI preview cache re-fetches.
-    pub const SCHEMA: u32 = 6;
+    pub const SCHEMA: u32 = 7;
 }
 
 /// RGBA thumbnail extracted via ffmpeg (fixed canvas for easy UI upload; alpha preserved when the source has it).
@@ -602,31 +602,27 @@ fn tag_strings(info: &Value) -> Vec<String> {
     out
 }
 
+/// Format tag value by key, case-insensitive (Matroska/WebM stores `ENCODER` / `GIGAMUX_*`).
+fn tag_get_ci<'a>(tags: Option<&'a Value>, key: &str) -> Option<&'a str> {
+    let obj = tags?.as_object()?;
+    obj.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .and_then(|(_, v)| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 /// True when any format/stream/chapter tag key or value mentions OBS.
 /// Encoder display prefers GigaMux stamps over Lavf when present (OBS-style `GigaMux (0.1.0+…)` / farm `GigaMux[flam]`).
 fn detect_obs_origin(info: &Value) -> (bool, Option<String>) {
     let tags = info.pointer("/format/tags");
-    let gigamux_ver = tags
-        .and_then(|t| t.get("GigaMux_version"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let gigamux_enc = tags
-        .and_then(|t| t.get("GigaMux_encoder"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let farm = tags
-        .and_then(|t| t.get("GigaMux_farm"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| {
-            let t = s.trim();
-            !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
-        })
-        || tags
-            .and_then(|t| t.get("encoder"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s.contains("[flam]"));
+    // WebM/Matroska uppercases keys; MP4 keeps lowercase; match both.
+    let gigamux_ver = tag_get_ci(tags, "GigaMux_version");
+    let gigamux_enc = tag_get_ci(tags, "GigaMux_encoder");
+    let farm = tag_get_ci(tags, "GigaMux_farm").is_some_and(|s| {
+        let t = s.trim();
+        !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+    }) || tag_get_ci(tags, "encoder").is_some_and(|s| s.contains("[flam]"));
     let encoder = if let Some(ver) = gigamux_ver {
         Some(if farm {
             format!("GigaMux[flam] ({ver})")
@@ -641,9 +637,7 @@ fn detect_obs_origin(info: &Value) -> (bool, Option<String>) {
             "GigaMux".into()
         })
     } else {
-        tags.and_then(|t| t.get("encoder"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        tag_get_ci(tags, "encoder").map(|s| s.to_string())
     };
     let from_obs = tag_strings(info)
         .iter()
@@ -1380,4 +1374,42 @@ pub fn require_tools() -> Result<(), String> {
             .map_err(|_| format!("{tool} not found on PATH"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn detect_obs_origin_reads_webm_uppercase_tags() {
+        // Input WebM: only Lavf under ENCODER (Matroska uppercases).
+        let input = json!({ "format": { "tags": { "ENCODER": "Lavf60.3.100" } } });
+        let (_, enc) = detect_obs_origin(&input);
+        assert_eq!(enc.as_deref(), Some("Lavf60.3.100"));
+
+        // Output WebM: GIGAMUX_* + ENCODER; prefer GigaMux stamp.
+        let output = json!({
+            "format": {
+                "tags": {
+                    "ENCODER": "Lavf62.3.100",
+                    "GIGAMUX_VERSION": "0.1.0+393c6fc6",
+                    "GIGAMUX_ENCODER": "vp9_qsvlibvpx",
+                    "GIGAMUX_HW": "QSV"
+                }
+            }
+        });
+        let (_, enc) = detect_obs_origin(&output);
+        assert_eq!(enc.as_deref(), Some("GigaMux (0.1.0+393c6fc6)"));
+    }
+
+    #[test]
+    fn detect_obs_origin_mp4_lowercase_unchanged() {
+        let info = json!({
+            "format": { "tags": { "encoder": "OBS Studio (33.0.1)" } }
+        });
+        let (from_obs, enc) = detect_obs_origin(&info);
+        assert!(from_obs);
+        assert_eq!(enc.as_deref(), Some("OBS Studio (33.0.1)"));
+    }
 }
