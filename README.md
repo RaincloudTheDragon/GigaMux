@@ -37,6 +37,7 @@ Your codec choices in GigaMux:
 - Windows desktop app (egui shell in this repo).
 - `ffmpeg` on `PATH`. Encoding works with a normal build; **VMAF** needs a full build that includes the `libvmaf` filter (e.g. [gyan.dev full](https://www.gyan.dev/ffmpeg/builds/)).
 - Hardware encode (NVENC / QSV where available) is optional; software encoders are always selectable. GigaMux probes NVENC Compute SM → generation (and QSV when present). With **multiple** NVENC GPUs, each Targets row (including each test slot) can pick a different device/gen. Optional **Write encoder metadata** (default on) stamps OBS-style `encoder` / `GigaMux_version` (workspace version + short git SHA on pre-release builds), plus `GigaMux_encoder` / `GigaMux_hw`. MP4 needs `-movflags +use_metadata_tags` so custom tags are visible to ffprobe; Lavf may still own the raw `encoder` atom — the UI Encoder row prefers `GigaMux_version` when present.
+- **OBS Replay Buffer vs Hybrid recording:** Full Hybrid MP4/MOV recordings stamp `encoder=OBS Studio (…)` and an `obs1` brand. Replay Buffer still saves through OBS’s FFmpeg remux path, so those files often show only `encoder=Lavf…` with no OBS tags (same encode settings, different mux on save). Chapters can be missing from replays for the same reason. Upstream is moving Replay onto the Hybrid muxer in [obs-studio#12505](https://github.com/obsproject/obs-studio/pull/12505); until that ships, GigaMux’s Encoder / OBS tags rows are reflecting the container, not a probe miss.
 
 ### Quick start
 
