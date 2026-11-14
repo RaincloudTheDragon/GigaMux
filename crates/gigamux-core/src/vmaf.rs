@@ -256,7 +256,10 @@ pub fn write_vmaf_part_sidecar(path: &Path, sc: &VmafPartSidecar) -> Result<(), 
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("vmaf part sidecar rename: {e}")
-    })
+    })?;
+    // Best-effort; write still succeeds if the volume ignores DOS Hidden.
+    let _ = set_file_hidden(path);
+    Ok(())
 }
 
 /// Read a finite-score sidecar, or `None` if missing/invalid.
@@ -322,6 +325,67 @@ pub fn purge_unused_vmaf_sidecars(output_dir: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
+/// Mark remaining VMAF sidecars Hidden (Windows). No-op on Unix. Returns how many were set.
+pub fn hide_vmaf_sidecars(output_dir: &Path) -> Result<usize, String> {
+    if !output_dir.is_dir() {
+        return Ok(0);
+    }
+    let entries = std::fs::read_dir(output_dir)
+        .map_err(|e| format!("vmaf hide read_dir {}: {e}", output_dir.display()))?;
+    let mut n = 0usize;
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        if deliver_path_for_vmaf_sidecar(&path).is_none() {
+            continue;
+        }
+        if set_file_hidden(&path).is_ok_and(|changed| changed) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Best-effort Windows `FILE_ATTRIBUTE_HIDDEN`. `Ok(true)` = newly set; `Ok(false)` = already hidden / Unix no-op.
+fn set_file_hidden(path: &Path) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileAttributesW(lp_file_name: *const u16) -> u32;
+            fn SetFileAttributesW(lp_file_name: *const u16, attrs: u32) -> i32;
+        }
+        const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: null-terminated UTF-16 path; kernel32 attribute APIs.
+        let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        if attrs == INVALID_FILE_ATTRIBUTES {
+            return Err(format!("GetFileAttributesW {}", path.display()));
+        }
+        if attrs & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return Ok(false);
+        }
+        let ok = unsafe { SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_HIDDEN) };
+        if ok == 0 {
+            return Err(format!("SetFileAttributesW {}", path.display()));
+        }
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
 /// Atomic write of a VMAF sidecar (temp + rename).
 pub fn write_vmaf_sidecar(path: &Path, sc: &VmafSidecar) -> Result<(), String> {
     if let Some(parent) = path.parent() {
@@ -338,7 +402,9 @@ pub fn write_vmaf_sidecar(path: &Path, sc: &VmafSidecar) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("vmaf sidecar rename: {e}")
-    })
+    })?;
+    let _ = set_file_hidden(path);
+    Ok(())
 }
 
 /// Farm/worker path: skip if sidecar has a score, else run libvmaf and write sidecar.

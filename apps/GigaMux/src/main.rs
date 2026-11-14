@@ -43,8 +43,8 @@ use gigamux_core::flamenco::{
 use gigamux_core::wants_qsv_alpha_hybrid;
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
 use gigamux_core::vmaf::{
-    libvmaf_available, purge_unused_vmaf_sidecars, read_vmaf_sidecar, run_vmaf, vmaf_sidecar_path,
-    VmafEvent, VmafReport,
+    hide_vmaf_sidecars, libvmaf_available, purge_unused_vmaf_sidecars, read_vmaf_sidecar, run_vmaf,
+    vmaf_sidecar_path, VmafEvent, VmafReport,
 };
 use gigamux_core::gpu::{probe_local_encoders, GpuChoice, HwCatalog, NvencGeneration};
 use gigamux_core::job_log;
@@ -324,6 +324,8 @@ struct ListsScanResult {
     vmaf_sidecars: Vec<(String, String, f64)>,
     /// Orphan VMAF sidecars removed when purge-on-open / Alt purge ran with this scan.
     vmaf_purged: usize,
+    /// Sidecars marked Hidden on this scan (Windows); 0 on Unix / when not requested.
+    vmaf_hidden: usize,
 }
 
 /// Incremental preview worker messages (fast chips first, then peeks + thumb).
@@ -2183,6 +2185,12 @@ impl GigaMuxApp {
             self.push_session(format!(
                 "purged {} unused VMAF sidecar(s)",
                 result.vmaf_purged
+            ));
+        }
+        if result.vmaf_hidden > 0 {
+            self.push_session(format!(
+                "hid {} VMAF sidecar(s)",
+                result.vmaf_hidden
             ));
         }
         // Output deleted/renamed → drop orphaned input (and vice versa) VMAF so meta stays live.
@@ -8274,7 +8282,7 @@ impl GigaMuxApp {
                 "Purge unused VMAF sidecars on open",
             )
             .on_hover_text(
-                "At launch, delete `{deliver}.vmaf.json` / part sidecars in Output whose deliver media is missing. Also offered when holding Alt at start.",
+                "At launch, delete orphan `{deliver}.vmaf.json` / part sidecars and mark remaining ones Hidden (Windows). Also offered when holding Alt at start.",
             )
             .changed()
         {
@@ -10367,6 +10375,15 @@ fn scan_media_lists(
     } else {
         0
     };
+    // Same open/Alt maintain pass: mark remaining sidecars Hidden (Windows DOS attr).
+    let vmaf_hidden = if purge_unused_vmaf && output_ok {
+        hide_vmaf_sidecars(output_dir).unwrap_or_else(|e| {
+            eprintln!("vmaf hide: {e}");
+            0
+        })
+    } else {
+        0
+    };
     let input_files = if input_ok {
         list_media(input_dir, true)
     } else {
@@ -10412,6 +10429,7 @@ fn scan_media_lists(
         output_bytes,
         vmaf_sidecars,
         vmaf_purged,
+        vmaf_hidden,
     }
 }
 
