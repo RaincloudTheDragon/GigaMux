@@ -3168,7 +3168,7 @@ impl GigaMuxApp {
                             exe,
                             &check,
                             twoway,
-                            chunk_max,
+                            farm_vmaf.vmaf_part_ceiling(chunk_max),
                             &tx,
                         ) {
                             ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3189,14 +3189,18 @@ impl GigaMuxApp {
                     let mut integrity = farm_integrity_for_hybrid(&req, &job_built);
                     integrity.check_exe =
                         resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
-                    if farm_vmaf == FarmVmafMode::Attached {
+                    if farm_vmaf.attaches_to_encode() {
                         if read_vmaf_sidecar(&vmaf_sidecar_path(&job_built.final_output)).is_some()
                         {
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
                                 "Flamenco VMAF skip (already scored): {out_name}"
                             ))));
                         } else {
-                            let vmaf = farm_vmaf_spec(&req.input, &job_built.final_output, chunk_max);
+                            let vmaf = farm_vmaf_spec(
+                                &req.input,
+                                &job_built.final_output,
+                                farm_vmaf.vmaf_part_ceiling(chunk_max),
+                            );
                             let note = farm_vmaf_parts_suffix(&vmaf);
                             if !note.is_empty() {
                                 let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(
@@ -3285,7 +3289,7 @@ impl GigaMuxApp {
                             exe,
                             &check,
                             twoway,
-                            chunk_max,
+                            farm_vmaf.vmaf_part_ceiling(chunk_max),
                             &tx,
                         ) {
                             ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3306,14 +3310,18 @@ impl GigaMuxApp {
                     let mut integrity = farm_integrity_for_chunked(&req, &job_built);
                     integrity.check_exe =
                         resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
-                    if farm_vmaf == FarmVmafMode::Attached {
+                    if farm_vmaf.attaches_to_encode() {
                         if read_vmaf_sidecar(&vmaf_sidecar_path(&job_built.final_output)).is_some()
                         {
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
                                 "Flamenco VMAF skip (already scored): {out_name}"
                             ))));
                         } else {
-                            let vmaf = farm_vmaf_spec(&req.input, &job_built.final_output, chunk_max);
+                            let vmaf = farm_vmaf_spec(
+                                &req.input,
+                                &job_built.final_output,
+                                farm_vmaf.vmaf_part_ceiling(chunk_max),
+                            );
                             let note = farm_vmaf_parts_suffix(&vmaf);
                             if !note.is_empty() {
                                 let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(
@@ -3409,7 +3417,7 @@ impl GigaMuxApp {
                         exe,
                         &check,
                         twoway,
-                        chunk_max,
+                        farm_vmaf.vmaf_part_ceiling(chunk_max),
                         &tx,
                     ) {
                         ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3421,13 +3429,17 @@ impl GigaMuxApp {
                 }
                 let mut integrity = farm_integrity_for_single(&req, &cmd);
                 integrity.check_exe = resolve_flamenco_check_exe(&check_exe, &scripts_dir_owned);
-                if farm_vmaf == FarmVmafMode::Attached {
+                if farm_vmaf.attaches_to_encode() {
                     if read_vmaf_sidecar(&vmaf_sidecar_path(&cmd.output)).is_some() {
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
                             "Flamenco VMAF skip (already scored): {out_name}"
                         ))));
                     } else {
-                        let vmaf = farm_vmaf_spec(&req.input, &cmd.output, chunk_max);
+                        let vmaf = farm_vmaf_spec(
+                            &req.input,
+                            &cmd.output,
+                            farm_vmaf.vmaf_part_ceiling(chunk_max),
+                        );
                         let note = farm_vmaf_parts_suffix(&vmaf);
                         if !note.is_empty() {
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
@@ -9442,6 +9454,7 @@ impl GigaMuxApp {
                         .selected_text(match prompt.farm_vmaf {
                             FarmVmafMode::Off => "Off",
                             FarmVmafMode::Attached => "Attached",
+                            FarmVmafMode::AttachedParts => "Attached (chunks)",
                             FarmVmafMode::Separate => "Separate",
                         })
                         .show_ui(ui, |ui| {
@@ -9452,7 +9465,15 @@ impl GigaMuxApp {
                                 "Attached",
                             )
                             .on_hover_text(
-                                "Trailing ensure-vmaf on this encode job (task_type vmaf — those workers need libvmaf).",
+                                "Trailing single ensure-vmaf on this encode job (task_type vmaf; those workers need libvmaf).",
+                            );
+                            ui.selectable_value(
+                                &mut prompt.farm_vmaf,
+                                FarmVmafMode::AttachedParts,
+                                "Attached (chunks)",
+                            )
+                            .on_hover_text(
+                                "Trailing parallel ensure-vmaf-part + merge-vmaf on this encode job (parts from input duration; max = Max chunks).",
                             );
                             ui.selectable_value(
                                 &mut prompt.farm_vmaf,
@@ -9460,13 +9481,13 @@ impl GigaMuxApp {
                                 "Separate",
                             )
                             .on_hover_text(
-                                "After encode completes, submit a VMAF-only job (task_type vmaf).",
+                                "After encode completes, submit a VMAF-only job (task_type vmaf; parts when long).",
                             );
                         });
                 })
                 .response
                 .on_hover_text(
-                    "Per send only (default Off). Attached uses the encode tag; Separate uses `vmaf`. Sidecar skips redo.",
+                    "Per send only (default Off). Attached* trails on the encode job; Separate posts a follow-up. Sidecar skips redo.",
                 );
 
                 if let Some(p) = self.pending_flamenco.as_mut() {

@@ -212,10 +212,29 @@ pub enum FarmVmafMode {
     /// No farm VMAF tasks / follow-up jobs.
     #[default]
     Off,
-    /// Trailing `vmaf` task on the encode job (same worker tag; those workers need libvmaf).
+    /// Trailing single `ensure-vmaf` on the encode job (task_type `vmaf`).
     Attached,
-    /// After encode completes, submit a separate VMAF-only job tagged `vmaf`.
+    /// Trailing parallel `ensure-vmaf-part` + `merge-vmaf` on the encode job (parts from input duration).
+    AttachedParts,
+    /// After encode completes, submit a separate VMAF-only job (task_type `vmaf`).
     Separate,
+}
+
+impl FarmVmafMode {
+    /// Trailing VMAF tasks on the encode job (`Attached` / `AttachedParts`).
+    pub fn attaches_to_encode(self) -> bool {
+        matches!(self, Self::Attached | Self::AttachedParts)
+    }
+
+    /// Max temporal VMAF parts for this mode (`1` = single ensure-vmaf).
+    pub fn vmaf_part_ceiling(self, chunk_max: u32) -> u32 {
+        match self {
+            Self::Off | Self::Attached => 1,
+            Self::AttachedParts | Self::Separate => {
+                chunk_max.clamp(1, crate::chunk::FARM_CHUNK_MAX)
+            }
+        }
+    }
 }
 
 /// One temporal slice inside a farm VMAF pair (`ensure-vmaf-part`).

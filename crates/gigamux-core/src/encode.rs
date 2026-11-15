@@ -2433,7 +2433,8 @@ fn farm_final_check(
 const FARM_VMAF_MIN_PART_S: f64 = 3.0;
 
 /// Paths for trailing / separate farm VMAF (`ensure-vmaf` + sidecar next to deliver).
-/// `max_parts` is prefs max chunks (clamped 1..=[`crate::chunk::FARM_CHUNK_MAX`]); short delivers stay a single part.
+/// `max_parts` is prefs max chunks (clamped 1..=[`crate::chunk::FARM_CHUNK_MAX`]); short clips stay a single part.
+/// Duration/fps: prefer the deliver when it exists; else probe `input` (Attached parts before encode).
 pub fn farm_vmaf_spec(input: &Path, output: &Path, max_parts: u32) -> FarmVmafSpec {
     let mut spec = FarmVmafSpec {
         input: path_string(input),
@@ -2445,8 +2446,8 @@ pub fn farm_vmaf_spec(input: &Path, output: &Path, max_parts: u32) -> FarmVmafSp
     if want <= 1 {
         return spec;
     }
-    // Probe the deliver for duration/fps; fall back to unsplit if probe fails.
-    let Ok(info) = file_info(output) else {
+    // Deliver may be missing at encode submit; fall back to input for temporal split planning.
+    let Ok(info) = file_info(output).or_else(|_| file_info(input)) else {
         return spec;
     };
     let duration_s = info
