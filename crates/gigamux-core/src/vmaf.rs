@@ -38,16 +38,6 @@ pub struct VmafBothTrim {
     pub fps: f64,
 }
 
-impl VmafBothTrim {
-    fn as_ref_trim(self) -> VmafRefTrim {
-        VmafRefTrim {
-            start_frame: self.start_frame,
-            frame_count: self.frame_count,
-            fps: self.fps,
-        }
-    }
-}
-
 /// One file pair’s VMAF outcome.
 #[derive(Debug, Clone)]
 pub struct VmafResult {
@@ -740,6 +730,53 @@ fn vmaf_filter_complex(
     }
 }
 
+/// Accurate timeline seek for farm temporal parts (`start_frame / fps`).
+fn both_trim_accurate_seek_s(tr: &VmafBothTrim) -> Option<f64> {
+    if tr.start_frame == 0 {
+        None
+    } else {
+        Some(tr.start_frame as f64 / tr.fps)
+    }
+}
+
+/// Build ffmpeg argv for [`run_vmaf_pair_exe`] (unit-tested for `-ss` after each `-i`).
+fn build_vmaf_pair_exe_args(
+    reference: &Path,
+    distorted: &Path,
+    ref_info: &Value,
+    dist_info: &Value,
+    alpha: bool,
+    ref_assoc: AlphaAssociation,
+    dist_assoc: AlphaAssociation,
+    both_trim: Option<&VmafBothTrim>,
+    threads: &str,
+) -> Vec<String> {
+    // Farm parts: no frame-index trim in the graph; accurate `-ss` after `-i` + `-frames:v` keeps absolute timelines aligned.
+    // Input `-ss` keyframe-snaps each file independently; relative trim then compared “N frames after wherever each landed” (WebM/hybrid desync → bogus low VMAF).
+    let filter = vmaf_filter_complex(threads, alpha, None, None, ref_assoc, dist_assoc);
+    let (seek_s, frames_v) = match both_trim {
+        Some(tr) => (both_trim_accurate_seek_s(tr), Some(tr.frame_count)),
+        None => (None, None),
+    };
+    let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
+    args.extend(vmaf_alpha_decoder_prefix(ref_info));
+    args.extend(["-i".into(), reference.to_string_lossy().into_owned()]);
+    if let Some(ss) = seek_s {
+        args.extend(["-ss".into(), format!("{ss:.6}")]);
+    }
+    args.extend(vmaf_alpha_decoder_prefix(dist_info));
+    args.extend(["-i".into(), distorted.to_string_lossy().into_owned()]);
+    if let Some(ss) = seek_s {
+        args.extend(["-ss".into(), format!("{ss:.6}")]);
+    }
+    args.extend(["-filter_complex".into(), filter]);
+    if let Some(n) = frames_v {
+        args.extend(["-frames:v".into(), n.to_string()]);
+    }
+    args.extend(["-f".into(), "null".into(), "-".into()]);
+    args
+}
+
 /// Blocking libvmaf with a specific ffmpeg binary (no cancel / UI progress).
 /// `both_trim` applies the same frame range to reference and distorted (farm temporal parts).
 fn run_vmaf_pair_exe(
@@ -763,42 +800,17 @@ fn run_vmaf_pair_exe(
             AlphaAssociation::Premultiplied,
         )
     };
-    let side_trim = both_trim.map(|t| t.as_ref_trim());
-    let filter = vmaf_filter_complex(
-        &threads,
+    let args = build_vmaf_pair_exe_args(
+        reference,
+        distorted,
+        &ref_info,
+        &dist_info,
         alpha,
-        side_trim.as_ref(),
-        side_trim.as_ref(),
         ref_assoc,
         dist_assoc,
+        both_trim,
+        &threads,
     );
-    let (seek_s, frames_v) = if let Some(tr) = side_trim.as_ref() {
-        let (ss, _, _) = trim_seek_and_rel(tr);
-        (ss, Some(tr.frame_count))
-    } else {
-        (None, None)
-    };
-    let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
-    // Symmetric -ss before each input when temporal-chunking both sides.
-    if let Some(ss) = seek_s {
-        args.extend(["-ss".into(), format!("{ss:.6}")]);
-    }
-    args.extend(vmaf_alpha_decoder_prefix(&ref_info));
-    args.extend(["-i".into(), reference.to_string_lossy().into_owned()]);
-    if let Some(ss) = seek_s {
-        args.extend(["-ss".into(), format!("{ss:.6}")]);
-    }
-    args.extend(vmaf_alpha_decoder_prefix(&dist_info));
-    args.extend([
-        "-i".into(),
-        distorted.to_string_lossy().into_owned(),
-        "-filter_complex".into(),
-        filter,
-    ]);
-    if let Some(n) = frames_v {
-        args.extend(["-frames:v".into(), n.to_string()]);
-    }
-    args.extend(["-f".into(), "null".into(), "-".into()]);
     let out = Command::new(ffmpeg_exe)
         .args(&args)
         .stdin(Stdio::null())
@@ -1659,5 +1671,37 @@ mod tests {
         });
         let prefix = vmaf_alpha_decoder_prefix(&info);
         assert_eq!(prefix, vec!["-c:v".to_string(), "libvpx-vp9".to_string()]);
+    }
+
+    #[test]
+    fn farm_both_trim_uses_accurate_ss_after_each_input() {
+        let info = serde_json::json!({
+            "streams": [{ "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p" }]
+        });
+        let trim = VmafBothTrim {
+            start_frame: 255160,
+            frame_count: 25516,
+            fps: 60.0,
+        };
+        let args = build_vmaf_pair_exe_args(
+            Path::new("ref.webm"),
+            Path::new("dist.webm"),
+            &info,
+            &info,
+            false,
+            AlphaAssociation::Premultiplied,
+            AlphaAssociation::Premultiplied,
+            Some(&trim),
+            "4",
+        );
+        // Expect: … -i ref -ss T … -i dist -ss T … -frames:v N (no -ss before either -i).
+        let join = args.join(" ");
+        assert!(join.contains("-i ref.webm -ss 4252.666667"), "{join}");
+        assert!(join.contains("-i dist.webm -ss 4252.666667"), "{join}");
+        assert!(join.contains("-frames:v 25516"), "{join}");
+        assert!(!join.contains("trim=start_frame"), "{join}");
+        let first_ss = args.iter().position(|a| a == "-ss").expect("ss");
+        let first_i = args.iter().position(|a| a == "-i").expect("i");
+        assert!(first_i < first_ss, "accurate -ss must follow first -i: {args:?}");
     }
 }
