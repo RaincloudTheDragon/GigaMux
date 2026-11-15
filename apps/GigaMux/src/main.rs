@@ -243,6 +243,7 @@ fn farm_submit_existing_deliver(
     check_exe: &str,
     twoway: Option<FlamencoTwoway<'_>>,
     vmaf_parts: u32,
+    submit_paused: bool,
     tx: &mpsc::Sender<AppEvent>,
 ) -> ExistingDeliverOutcome {
     if farm_vmaf == FarmVmafMode::Off {
@@ -259,7 +260,7 @@ fn farm_submit_existing_deliver(
     }
     let spec = farm_vmaf_spec(input, output, vmaf_parts);
     let parts_note = farm_vmaf_parts_suffix(&spec);
-    let job = match make_gigamux_vmaf_job(
+    let mut job = match make_gigamux_vmaf_job(
         format!("GigaMux VMAF {out_name}"),
         exe,
         &[spec],
@@ -274,10 +275,12 @@ fn farm_submit_existing_deliver(
             return ExistingDeliverOutcome::Failed;
         }
     };
+    job.set_submit_paused(submit_paused);
     match submit_job(url, &job) {
         Ok(id) => {
+            let paused_note = if submit_paused { " (paused)" } else { "" };
             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                "Flamenco VMAF-only (exists): job {id}; {item_label} → {out_name}{parts_note}"
+                "Flamenco VMAF-only (exists): job {id}{paused_note}; {item_label} → {out_name}{parts_note}"
             ))));
             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
                 job_id: id,
@@ -843,6 +846,8 @@ struct FlamencoSubmitPrompt {
     chunk_qsv_color: bool,
     /// Farm VMAF for this send only (default Off; not persisted).
     farm_vmaf: FarmVmafMode,
+    /// Submit with Manager `initial_status: paused` (Blender “Submit as Paused”).
+    submit_paused: bool,
     /// Duration (s) of the first selected input for the chunk estimate label.
     estimate_duration_s: f64,
     /// Basename used for the estimate label.
@@ -2867,6 +2872,7 @@ impl GigaMuxApp {
             only_chunk_software: self.prefs.flamenco_only_chunk_software,
             chunk_qsv_color: self.prefs.flamenco_chunk_qsv_color,
             farm_vmaf: FarmVmafMode::Off,
+            submit_paused: false,
             estimate_duration_s,
             estimate_name,
         });
@@ -2906,7 +2912,12 @@ impl GigaMuxApp {
 
     /// Submit the given inputs to Flamenco (one job each; stock worker `exec` via `GigaMux.js`).
     /// Validates on the UI thread, then posts jobs from a worker so large batches stay responsive.
-    fn submit_flamenco_encode(&mut self, names: Vec<String>, farm_vmaf: FarmVmafMode) {
+    fn submit_flamenco_encode(
+        &mut self,
+        names: Vec<String>,
+        farm_vmaf: FarmVmafMode,
+        submit_paused: bool,
+    ) {
         if self.busy {
             return;
         }
@@ -3169,6 +3180,7 @@ impl GigaMuxApp {
                             &check,
                             twoway,
                             farm_vmaf.vmaf_part_ceiling(chunk_max),
+                            submit_paused,
                             &tx,
                         ) {
                             ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3210,7 +3222,7 @@ impl GigaMuxApp {
                             integrity.vmaf = Some(vmaf);
                         }
                     }
-                    let job = match make_gigamux_hybrid_job(
+                    let mut job = match make_gigamux_hybrid_job(
                         job_name.clone(),
                         exe,
                         &job_built,
@@ -3228,12 +3240,14 @@ impl GigaMuxApp {
                             continue;
                         }
                     };
+                    job.set_submit_paused(submit_paused);
                     match submit_job(&url, &job) {
                         Ok(id) => {
                             let color_n = job_built.color_tasks.len();
                             let alpha_n = job_built.alpha_tasks.len();
+                            let paused_note = if submit_paused { " (paused)" } else { "" };
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                                "Flamenco submitted: job {id}; {item_label} → {out_name} (hybrid qsv×{color_n} + cpu×{alpha_n}, {}k / {})",
+                                "Flamenco submitted: job {id}{paused_note}; {item_label} → {out_name} (hybrid qsv×{color_n} + cpu×{alpha_n}, {}k / {})",
                                 job_built.bitrate_k, job_built.bitrate_label
                             ))));
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
@@ -3290,6 +3304,7 @@ impl GigaMuxApp {
                             &check,
                             twoway,
                             farm_vmaf.vmaf_part_ceiling(chunk_max),
+                            submit_paused,
                             &tx,
                         ) {
                             ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3331,7 +3346,7 @@ impl GigaMuxApp {
                             integrity.vmaf = Some(vmaf);
                         }
                     }
-                    let job = match make_gigamux_chunked_job(
+                    let mut job = match make_gigamux_chunked_job(
                         job_name.clone(),
                         exe,
                         &job_built.encode_argvs,
@@ -3353,10 +3368,12 @@ impl GigaMuxApp {
                             continue;
                         }
                     };
+                    job.set_submit_paused(submit_paused);
                     match submit_job(&url, &job) {
                         Ok(id) => {
+                            let paused_note = if submit_paused { " (paused)" } else { "" };
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                                "Flamenco submitted: job {id}; {item_label} → {out_name} (type {task_type}, {} chunks, {}k / {})",
+                                "Flamenco submitted: job {id}{paused_note}; {item_label} → {out_name} (type {task_type}, {} chunks, {}k / {})",
                                 chunk_n, job_built.bitrate_k, job_built.bitrate_label
                             ))));
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
@@ -3418,6 +3435,7 @@ impl GigaMuxApp {
                         &check,
                         twoway,
                         farm_vmaf.vmaf_part_ceiling(chunk_max),
+                        submit_paused,
                         &tx,
                     ) {
                         ExistingDeliverOutcome::Skipped => skipped += 1,
@@ -3449,7 +3467,7 @@ impl GigaMuxApp {
                         integrity.vmaf = Some(vmaf);
                     }
                 }
-                let job = match make_gigamux_encode_job(
+                let mut job = match make_gigamux_encode_job(
                     job_name,
                     exe,
                     &cmd.argv,
@@ -3469,10 +3487,12 @@ impl GigaMuxApp {
                         continue;
                     }
                 };
+                job.set_submit_paused(submit_paused);
                 match submit_job(&url, &job) {
                     Ok(id) => {
+                        let paused_note = if submit_paused { " (paused)" } else { "" };
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                            "Flamenco submitted: job {id}; {item_label} → {out_name} (type {task_type}, {}k / {})",
+                            "Flamenco submitted: job {id}{paused_note}; {item_label} → {out_name} (type {task_type}, {}k / {})",
                             cmd.bitrate_k, cmd.bitrate_label
                         ))));
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
@@ -9489,6 +9509,10 @@ impl GigaMuxApp {
                 .on_hover_text(
                     "Per send only (default Off). Attached* trails on the encode job; Separate posts a follow-up. Sidecar skips redo.",
                 );
+                ui.checkbox(&mut prompt.submit_paused, "Submit as paused")
+                    .on_hover_text(
+                        "Manager initial_status=paused (same as Blender Flamenco). Resume from the Manager / farm panel when ready.",
+                    );
 
                 if let Some(p) = self.pending_flamenco.as_mut() {
                     p.ffmpeg_exe = prompt.ffmpeg_exe.clone();
@@ -9497,6 +9521,7 @@ impl GigaMuxApp {
                     p.only_chunk_software = prompt.only_chunk_software;
                     p.chunk_qsv_color = prompt.chunk_qsv_color;
                     p.farm_vmaf = prompt.farm_vmaf;
+                    p.submit_paused = prompt.submit_paused;
                 }
 
                 ui.add_space(10.0);
@@ -9521,8 +9546,9 @@ impl GigaMuxApp {
                         let _ = prefs::save(&self.prefs);
                         let names = prompt.names;
                         let farm_vmaf = prompt.farm_vmaf;
+                        let submit_paused = prompt.submit_paused;
                         self.pending_flamenco = None;
-                        self.submit_flamenco_encode(names, farm_vmaf);
+                        self.submit_flamenco_encode(names, farm_vmaf, submit_paused);
                     }
                 });
             });

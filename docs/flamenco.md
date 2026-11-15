@@ -116,7 +116,7 @@ Flamenco soft-fail retries only that task, so `mux` and `remux` stay separate (a
 
 ### Farm VMAF
 
-**Send to Flamenco** dialog → **Farm VMAF** (default Off; not persisted):
+**Send to Flamenco** dialog → **Submit as paused** (default off; same as Blender Flamenco; Manager `initial_status: paused`) and **Farm VMAF** (default Off; not persisted):
 
 | Mode | Behavior |
 | --- | --- |

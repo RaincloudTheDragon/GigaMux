@@ -96,6 +96,20 @@ pub struct SubmittedJob {
     pub settings: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_tag: Option<String>,
+    /// Manager initial job status (`queued` default when omitted; `paused` = submit as paused).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_status: Option<String>,
+}
+
+impl SubmittedJob {
+    /// Match Blender add-on “Submit as Paused” (`initial_status: paused`).
+    pub fn set_submit_paused(&mut self, paused: bool) {
+        self.initial_status = if paused {
+            Some("paused".into())
+        } else {
+            None
+        };
+    }
 }
 
 fn flamenco_exe(ffmpeg_exe: Option<&str>) -> String {
@@ -512,6 +526,7 @@ pub fn make_gigamux_encode_job(
         priority: 50,
         settings,
         worker_tag: optional_worker_tag(worker_tag),
+        initial_status: None,
     })
 }
 
@@ -588,6 +603,7 @@ pub fn make_gigamux_chunked_job(
         settings,
         // Encode jobs are tagless; routing is via task_type.
         worker_tag: None,
+        initial_status: None,
     })
 }
 
@@ -710,6 +726,7 @@ pub fn make_gigamux_hybrid_job(
         priority: 50,
         settings,
         worker_tag: None,
+        initial_status: None,
     })
 }
 
@@ -777,6 +794,7 @@ pub fn make_gigamux_vmaf_job(
         priority: 50,
         settings,
         worker_tag: None,
+        initial_status: None,
     })
 }
 
@@ -936,11 +954,11 @@ pub struct FlamencoTaskSummary {
     pub worker: String,
 }
 
-/// True when Manager considers the job finished (no more status polling needed).
+/// True when the job will not run again without a new submit (keep polling `paused` jobs).
 pub fn flamenco_job_terminal(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "canceled" | "cancelled" | "failed" | "paused"
+        "completed" | "canceled" | "cancelled" | "failed"
     )
 }
 
