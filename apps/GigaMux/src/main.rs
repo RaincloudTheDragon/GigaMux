@@ -10,10 +10,33 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, WindowHandle,
+};
 
 #[cfg(windows)]
 mod taskbar_progress;
 mod ffmpeg_idle_pause;
+
+/// Cached eframe window/display handles so rfd can `set_parent` from any UI path.
+struct NativeDialogParent {
+    window: RawWindowHandle,
+    display: RawDisplayHandle,
+}
+
+// Safety: handles are only used on the UI thread while the eframe window still exists.
+impl HasWindowHandle for NativeDialogParent {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        unsafe { Ok(WindowHandle::borrow_raw(self.window)) }
+    }
+}
+
+impl HasDisplayHandle for NativeDialogParent {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        unsafe { Ok(DisplayHandle::borrow_raw(self.display)) }
+    }
+}
 
 use gigamux_core::check::{
     check_issue_category, check_issue_severity, delete_issue_outputs, integrity_blocked_outputs,
@@ -567,6 +590,8 @@ struct GigaMuxApp {
     /// Reachability from the last completed scan (never call share `is_dir` on the UI thread).
     input_dir_ok: bool,
     output_dir_ok: bool,
+    /// Main viewport native parent for rfd (refreshed each frame from `eframe::Frame`).
+    dialog_parent: Option<NativeDialogParent>,
 }
 
 /// How to commit an inline F2 rename.
@@ -1027,6 +1052,7 @@ impl GigaMuxApp {
             lists_idle_pending: false,
             input_dir_ok,
             output_dir_ok,
+            dialog_parent: None,
         };
         app.load_preview_cache_from_disk();
         // Never block startup on share list_media / metadata; scan on a worker.
@@ -2646,8 +2672,27 @@ impl GigaMuxApp {
         trim_log(lines);
     }
 
+    /// Refresh rfd parent handles from the live eframe window (call each frame).
+    fn cache_dialog_parent(&mut self, frame: &eframe::Frame) {
+        if let (Ok(w), Ok(d)) = (frame.window_handle(), frame.display_handle()) {
+            self.dialog_parent = Some(NativeDialogParent {
+                window: w.as_raw(),
+                display: d.as_raw(),
+            });
+        }
+    }
+
+    /// File/folder picker parented to the main window; shows hidden files (e.g. `.vmaf.json`).
+    fn file_dialog(&self) -> rfd::FileDialog {
+        let mut d = rfd::FileDialog::new().set_show_hidden_files(true);
+        if let Some(parent) = &self.dialog_parent {
+            d = d.set_parent(parent);
+        }
+        d
+    }
+
     fn pick_input_folder(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+        if let Some(path) = self.file_dialog().pick_folder() {
             self.prefs.input_dir = path;
             self.input_dir_ok = true;
             let _ = prefs::save(&self.prefs);
@@ -2656,7 +2701,7 @@ impl GigaMuxApp {
     }
 
     fn pick_output_folder(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+        if let Some(path) = self.file_dialog().pick_folder() {
             self.prefs.output_dir = path;
             self.output_dir_ok = true;
             let _ = prefs::save(&self.prefs);
@@ -2665,7 +2710,8 @@ impl GigaMuxApp {
     }
 
     fn export_profile(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
+        if let Some(path) = self
+            .file_dialog()
             .add_filter("GigaMux profile", &["json"])
             .set_file_name("gigamux-profile.json")
             .save_file()
@@ -2678,7 +2724,8 @@ impl GigaMuxApp {
     }
 
     fn import_profile(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
+        if let Some(path) = self
+            .file_dialog()
             .add_filter("GigaMux profile", &["json"])
             .pick_file()
         {
@@ -8658,7 +8705,8 @@ impl GigaMuxApp {
                 )
                 .clicked()
             {
-                if let Some(path) = rfd::FileDialog::new()
+                if let Some(path) = self
+                    .file_dialog()
                     .set_title("Flamenco Manager install folder")
                     .pick_folder()
                 {
@@ -8774,7 +8822,8 @@ impl GigaMuxApp {
                 .on_hover_text("Pick gigamux-check or gigamux-check.exe on shared storage.")
                 .clicked()
             {
-                if let Some(path) = rfd::FileDialog::new()
+                if let Some(path) = self
+                    .file_dialog()
                     .set_title("gigamux-check (worker-reachable)")
                     .add_filter("gigamux-check", &["exe", ""])
                     .pick_file()
@@ -8938,7 +8987,8 @@ impl GigaMuxApp {
                 });
             });
         if do_export {
-            if let Some(dir) = rfd::FileDialog::new()
+            if let Some(dir) = self
+                .file_dialog()
                 .set_title("Export flamenco-worker YAML files")
                 .pick_folder()
             {
@@ -11031,6 +11081,8 @@ fn reveal_many_in_os_windows(folder: &Path, files: &[PathBuf]) -> Result<(), Str
 
 impl eframe::App for GigaMuxApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Keep rfd parent in sync with the live eframe window before any picker runs this frame.
+        self.cache_dialog_parent(frame);
         self.poll_events(ctx);
         // Keep elapsed / ETA labels ticking while encode bars are visible.
         if self.encode_progress.is_some() {
@@ -11048,7 +11100,6 @@ impl eframe::App for GigaMuxApp {
                 self.taskbar_showing = false;
             }
         }
-        let _ = frame;
         self.tick_delete_queue(ctx);
         self.tick_history_nav(ctx);
         self.poll_dnd_folder(ctx);
