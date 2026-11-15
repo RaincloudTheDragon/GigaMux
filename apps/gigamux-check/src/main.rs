@@ -2,7 +2,8 @@
 //!
 //! Commands (exit 0 = ok, non-zero = fail task):
 //! - `gigamux-check ensure-chunk <path> <expect_dur> <ffmpeg_exe> -- <ffmpeg argv…>` (argv includes leading program name; do **not** nest paths in JSON: Flamenco two-way expands `{var}` to `W:\…` and breaks JSON escapes)
-//! - `gigamux-check ensure-out <path> <expect_dur> <ffmpeg_exe> -- <ffmpeg argv…>` (same for mux stage vmux / remux final; rebuilds incomplete leftovers)
+//! - `gigamux-check ensure-out <path> <expect_dur> <ffmpeg_exe> -- <ffmpeg argv…>` (mux stage vmux / ffmpeg remux; rebuilds incomplete leftovers)
+//! - `gigamux-check promote-out <src> <dst> <expect_dur>` (same-container remux: healthcheck + rename, no bitstream rewrite)
 //! - `gigamux-check ensure-vmaf <ref> <dist> <sidecar> [ffmpeg_exe]` (reuse sidecar score; else libvmaf + write)
 //! - `gigamux-check ensure-vmaf-part <ref> <dist> <part_sidecar> <start_frame> <frame_count> <fps> [ffmpeg_exe]` (temporal slice; sidecar name `*.vmaf.pIIIofNNN.json`)
 //! - `gigamux-check merge-vmaf <final_sidecar> <part_sidecar…>` (frame-weighted mean → final; deletes parts)
@@ -18,7 +19,7 @@ use std::process::ExitCode;
 
 use gigamux_core::check::{
     check_chunk_file, check_output_pair, cleanup_farm_intermediates, ensure_chunk_file,
-    ensure_out_file,
+    ensure_out_file, promote_out_file,
 };
 use gigamux_core::flamenco::{write_farm_probe_report, FarmFinalCheck};
 use gigamux_core::probe::VideoColorMeta;
@@ -58,7 +59,7 @@ fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let Some(cmd) = args.next() else {
         eprintln!(
-            "usage: gigamux-check ensure-chunk|ensure-out|ensure-vmaf|ensure-vmaf-part|merge-vmaf|chunk|final|cleanup|mux-alpha-webm|farm-probe …"
+            "usage: gigamux-check ensure-chunk|ensure-out|promote-out|ensure-vmaf|ensure-vmaf-part|merge-vmaf|chunk|final|cleanup|mux-alpha-webm|farm-probe …"
         );
         return ExitCode::from(2);
     };
@@ -114,6 +115,23 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+        }
+        "promote-out" => {
+            let src = PathBuf::from(args.next().unwrap_or_default());
+            let dst = PathBuf::from(args.next().unwrap_or_default());
+            let dur_s = args.next().unwrap_or_default();
+            let expect: f64 = match dur_s.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("promote-out: bad expect_dur {dur_s:?}");
+                    return ExitCode::from(2);
+                }
+            };
+            if src.as_os_str().is_empty() || dst.as_os_str().is_empty() {
+                eprintln!("promote-out: need <src> <dst> <expect_dur>");
+                return ExitCode::from(2);
+            }
+            promote_out_file(&src, &dst, expect)
         }
         "ensure-vmaf" => {
             let reference = PathBuf::from(args.next().unwrap_or_default());

@@ -146,17 +146,17 @@ pub struct FarmFfmpegCommand {
     pub bitrate_label: String,
 }
 
-/// Chunked Flamenco job: N video-only encodes + stage mux (ffconcat+audio) + remux.
+/// Chunked Flamenco job: N video-only encodes + stage mux (ffconcat+audio) + remux/promote.
 #[derive(Debug, Clone)]
 pub struct FarmChunkedJob {
     pub final_output: PathBuf,
     pub chunk_paths: Vec<PathBuf>,
     pub encode_argvs: Vec<Vec<String>>,
-    /// Stage: ffconcat video + source audio/subs → `{stem}.vmux.mkv` (no `.vcat` intermediate).
+    /// Stage: ffconcat video + source audio/subs → `{stem}.vmux.{ext}` (deliver container, or `.mkv` bridge).
     pub mux_argv: Vec<String>,
-    /// Remux: `.vmux.mkv` → final deliver (`-c copy`, all streams); separate Flamenco task.
+    /// Remux: either `["promote-out", vmux, final]` (same-container rename) or ffmpeg `-c copy` MKV→deliver.
     pub mux_remux_argv: Vec<String>,
-    /// Sum of chunk durations (ensure-out expect for vmux / final).
+    /// Sum of chunk durations (ensure-out / promote-out expect for vmux / final).
     pub out_expect_dur_s: f64,
     /// Written by the submitter onto shared storage before POST.
     pub ffconcat_path: PathBuf,
@@ -1689,10 +1689,21 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
     }
 
     let ffconcat_path = req.output_dir.join(format!("{stem}.ffconcat"));
-    let vmux_path = req.output_dir.join(format!("{stem}.vmux.mkv"));
+    // Multi-audio MP4 concat demuxer can fail mid-file (-22); stage Matroska then remux.
+    // Otherwise stage in the deliver container and remux is a same-volume promote (one array write).
+    let audio_n = audio_stream_count(&info);
+    let needs_mkv_bridge = container == OutContainer::Mp4 && audio_n >= 2;
+    let stage_container = if needs_mkv_bridge {
+        OutContainer::Mkv
+    } else {
+        container
+    };
+    let vmux_path = req
+        .output_dir
+        .join(format!("{stem}.vmux.{}", stage_container.ext()));
     let out_expect_dur_s: f64 = chunk_durations_s.iter().sum();
 
-    // Encoder tags for stage mux + remux (remux alone would leave only Lavf encoder=).
+    // Encoder tags for stage mux (+ remux when bridging); promote keeps stage tags.
     let gigamux_meta_tags: Vec<(String, String)> = if req.write_encoder_metadata {
         let use_nvenc = req.slot.use_hardware && req.slot.opaque_video.is_nvenc() && !has_alpha;
         let use_qsv = req.slot.use_hardware && req.slot.opaque_video.is_qsv() && !has_alpha;
@@ -1800,31 +1811,40 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
             "1".into(),
         ]);
     }
-    // Intermediate Matroska — no movflags needed; remux re-stamps for MP4 visibility.
-    append_gigamux_metadata(&mut mux_argv, OutContainer::Mkv, &gigamux_meta_tags);
+    // Stage container = deliver when safe (MP4 gets movflags here); MKV bridge otherwise.
+    append_gigamux_metadata(&mut mux_argv, stage_container, &gigamux_meta_tags);
     mux_argv.push(vmux_path.to_string_lossy().into_owned());
 
-    // Remux → final container (bitstream copy; separate Flamenco task so soft-fail never re-joins).
-    // setts on remux heals an already-skewed `.vmux.mkv` without re-joining chunks.
-    let mut mux_remux_argv = vec![
-        "ffmpeg".into(),
-        "-v".into(),
-        "info".into(),
-        "-y".into(),
-        "-i".into(),
-        vmux_path.to_string_lossy().into_owned(),
-        "-map".into(),
-        "0".into(),
-        "-c".into(),
-        "copy".into(),
-        "-bsf:v".into(),
-        "setts=ts=TS-STARTPTS".into(),
-    ];
-    if !raw.is_empty() {
-        mux_remux_argv.extend(["-bsf:a".into(), "setts=ts=TS-STARTPTS".into()]);
-    }
-    append_gigamux_metadata(&mut mux_remux_argv, container, &gigamux_meta_tags);
-    mux_remux_argv.push(final_output.to_string_lossy().into_owned());
+    // Separate Flamenco remux task: promote (rename) when stage==deliver, else `-c copy` bridge.
+    let mux_remux_argv = if needs_mkv_bridge {
+        // setts on remux heals an already-skewed `.vmux.mkv` without re-joining chunks.
+        let mut remux = vec![
+            "ffmpeg".into(),
+            "-v".into(),
+            "info".into(),
+            "-y".into(),
+            "-i".into(),
+            vmux_path.to_string_lossy().into_owned(),
+            "-map".into(),
+            "0".into(),
+            "-c".into(),
+            "copy".into(),
+            "-bsf:v".into(),
+            "setts=ts=TS-STARTPTS".into(),
+        ];
+        if !raw.is_empty() {
+            remux.extend(["-bsf:a".into(), "setts=ts=TS-STARTPTS".into()]);
+        }
+        append_gigamux_metadata(&mut remux, container, &gigamux_meta_tags);
+        remux.push(final_output.to_string_lossy().into_owned());
+        remux
+    } else {
+        vec![
+            "promote-out".into(),
+            vmux_path.to_string_lossy().into_owned(),
+            final_output.to_string_lossy().into_owned(),
+        ]
+    };
 
     Ok(FarmChunkedJob {
         final_output,
@@ -1838,6 +1858,18 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
         bitrate_k,
         bitrate_label,
     })
+}
+
+/// Count audio streams in ffprobe JSON (multi-audio MP4 stage needs a Matroska bridge).
+fn audio_stream_count(info: &serde_json::Value) -> usize {
+    info.get("streams")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// First audio stream `start_time` from ffprobe JSON (seconds), if present.

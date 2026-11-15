@@ -107,7 +107,7 @@ Probe still uses temporary Manager **`gm-…` pin tags** so each worker gets exa
 Script: [GigaMux.js](../flamenco/GigaMux.js) (bundled for Deploy). Redeploy after GigaMux updates; the Manager keeps its own copy until you do. Fleet workers must install exported `task_types` before encode routing works.
 
 - **Single:** `encode` → `final-check` (`cpu`) → optional `vmaf`
-- **Chunked:** `encode-c*` (`ensure-chunk`) → `mux` / `remux` (`cpu`) → `final-check` → `cleanup` → optional `vmaf`
+- **Chunked:** `encode-c*` (`ensure-chunk`) → `mux` / `remux` (`cpu`; remux is `promote-out` or ffmpeg `-c copy`) → `final-check` → `cleanup` → optional `vmaf`
 - **Hybrid:** `encode-color` (`qsv`) + `encode-alpha` (`cpu`) → `remux-alpha` → `audio` → `final-check` → `cleanup` → optional `vmaf`
 - **VMAF-only:** `vmaf` / `vmaf-p*` + `vmaf-merge` from `vmaf_pairs_json` (no encode); tagless job, task_type `vmaf`
 - **Farm-probe:** `misc` + `gm-…` pin tag
@@ -140,7 +140,7 @@ Right-click the main **VMAF** button to submit a VMAF-only job for unscored comp
 
 Flamenco (not GigaMux) soft-fails a task across ~3 workers before marking the task `failed`. The **job** only goes `failed` when enough tasks have failed (Manager percentage threshold) or no worker can finish it; one failed `final-check` among dozens of chunk tasks can leave the job `active`.
 
-`mux` stages through Matroska so multi-audio MP4 copy does not hit mid-file `-22`; there is no `.vcat` intermediate (join+audio is one pass). On a bad final, requeue `remux` + `final-check` (and `mux` only if `.vmux.mkv` is missing/bad).
+`mux` joins chunks + source audio/subs into `{stem}.vmux.{ext}` in one pass (no `.vcat`). When the stage container already matches the deliver (typical single-audio MP4/WebM, or MKV), `remux` is `gigamux-check promote-out` — healthcheck + same-volume rename (one array write). Multi-audio MP4 still stages Matroska then ffmpeg `-c copy` remux (avoids mid-file `-22`). On a bad final, requeue `remux` + `final-check` (and `mux` only if `.vmux.*` is missing/bad). Redeploy Manager `GigaMux.js` and worker `gigamux-check` after this change.
 
 Jobs expect `gigamux-check` beside the Manager on shared storage; otherwise set **Worker check helper** to a path with both Win + Linux binaries.
 

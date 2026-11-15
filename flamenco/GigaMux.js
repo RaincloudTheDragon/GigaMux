@@ -7,6 +7,7 @@
 // Temporal parts: same frame range on ref+dist; merge writes final .vmaf.json and deletes part sidecars.
 // Farm-probe stays misc + gm-… pin tag (Probe Farm isolation only).
 // mux and remux are separate Flamenco tasks so remux soft-fail never re-runs the stage join.
+// remux is promote-out (rename) when stage container == deliver, else ffmpeg -c copy (MKV bridge).
 // Deploy via Settings → Files → Deploy GigaMux… (Manager install → scripts/ + tools/ helpers).
 
 const JOB_TYPE = {
@@ -39,21 +40,21 @@ const JOB_TYPE = {
             type: "string",
             required: false,
             default: "",
-            description: "JSON argv: stage mux ffconcat+audio/subs → {stem}.vmux.mkv",
+            description: "JSON argv: stage mux ffconcat+audio/subs → {stem}.vmux.{ext}",
         },
         {
             key: "mux_remux_argv_json",
             type: "string",
             required: false,
             default: "",
-            description: "JSON argv: remux .vmux.mkv → final deliver (-c copy); separate task",
+            description: "JSON argv: remux; [\"promote-out\",vmux,final] or ffmpeg -c copy MKV→deliver",
         },
         {
             key: "out_expect_dur",
             type: "float",
             required: false,
             default: 0,
-            description: "Expected duration (seconds) for ensure-out on vmux / final",
+            description: "Expected duration (seconds) for ensure-out / promote-out on vmux / final",
         },
         {
             key: "ffmpeg_argv_json",
@@ -241,6 +242,20 @@ function addEnsureOut(task, checkExe, exe, outPath, expectDur, argv) {
         exe,
         "--",
     ].concat(argv));
+}
+
+// Same-container remux: healthcheck + rename (one array write on the stage mux).
+function addPromoteOut(task, checkExe, srcPath, dstPath, expectDur) {
+    addCheckExec(task, checkExe, [
+        "promote-out",
+        srcPath,
+        dstPath,
+        String(expectDur),
+    ]);
+}
+
+function isPromoteRemuxArgv(argv) {
+    return Array.isArray(argv) && argv.length >= 3 && argv[0] === "promote-out";
 }
 
 function normalizeVmafParts(spec, label) {
@@ -604,7 +619,7 @@ function compileJob(job) {
     // Chunked when stage mux + remux are both present (concat_argv_json is unused / empty).
     const chunked = muxArgv !== null && muxRemuxArgv !== null;
     if (muxArgv !== null && muxRemuxArgv === null) {
-        throw "GigaMux: mux_remux_argv_json required when mux_argv_json is set (MKV stage → final remux)";
+        throw "GigaMux: mux_remux_argv_json required when mux_argv_json is set (stage → promote or remux)";
     }
     const chunkChecks = parseChunkChecks(settings.chunk_checks_json);
     if (chunkChecks !== null && chunkChecks.length !== encodeArgvs.length) {
@@ -677,9 +692,14 @@ function compileJob(job) {
     if (chunked) {
         const expectDur = outExpectDur(settings, chunkChecks);
         const vmuxPath = argvOutputPath(muxArgv);
-        const finalPath = argvOutputPath(muxRemuxArgv);
+        const promote = isPromoteRemuxArgv(muxRemuxArgv);
+        const finalPath = promote ? muxRemuxArgv[2] : argvOutputPath(muxRemuxArgv);
+        const promoteSrc = promote ? muxRemuxArgv[1] : null;
         if (!vmuxPath || !finalPath) {
             throw "GigaMux: mux/remux argv missing output path";
+        }
+        if (promote && (!promoteSrc || promoteSrc !== vmuxPath)) {
+            throw "GigaMux: promote-out src must match mux stage output path";
         }
 
         // Separate mux vs remux so remux soft-fail does not re-run the stage join (ffconcat+audio → vmux).
@@ -691,7 +711,11 @@ function compileJob(job) {
         job.addTask(muxTask);
 
         const remuxTask = author.Task("remux", "cpu");
-        addEnsureOut(remuxTask, checkExe, exe, finalPath, expectDur, muxRemuxArgv);
+        if (promote) {
+            addPromoteOut(remuxTask, checkExe, promoteSrc, finalPath, expectDur);
+        } else {
+            addEnsureOut(remuxTask, checkExe, exe, finalPath, expectDur, muxRemuxArgv);
+        }
         remuxTask.addDependency(muxTask);
         job.addTask(remuxTask);
         gateTask = remuxTask;

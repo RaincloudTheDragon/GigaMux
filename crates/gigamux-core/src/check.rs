@@ -54,13 +54,15 @@ pub fn is_chunk_filename(name: &str) -> bool {
     crate::chunk::parse_chunk_filename(name).is_some()
 }
 
-/// Flat hybrid plane temps next to delivers (`{stem}.color.ivf`, `{stem}.alpha.ivf`, `{stem}.vmux.webm`).
-/// Not chunk-tagged; excluded from orphan Check / output pairing.
+/// Flat farm temps next to delivers (`{stem}.color.ivf`, `{stem}.alpha.ivf`, `{stem}.vmux.*`).
+/// Not chunk-tagged; excluded from orphan Check / output pairing / list_media.
 pub fn is_hybrid_plane_filename(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.ends_with(".color.ivf")
         || lower.ends_with(".alpha.ivf")
         || lower.ends_with(".vmux.webm")
+        || lower.ends_with(".vmux.mp4")
+        || lower.ends_with(".vmux.mkv")
 }
 
 /// Absolute duration slack for farm chunk expects (frame-split rounding).
@@ -140,6 +142,44 @@ pub fn ensure_chunk_file(
         ));
     }
     check_chunk_file(path, expect_dur_s)
+}
+
+/// Same-volume promote: healthcheck `src`, rename to `dst` (no bitstream rewrite).
+///
+/// Idempotent when `dst` already passes the duration check (soft-fail / retry). Removes a healthy leftover `src` after a prior successful promote.
+pub fn promote_out_file(src: &Path, dst: &Path, expect_dur_s: f64) -> Result<(), String> {
+    if dst.is_file() {
+        match check_chunk_file(dst, expect_dur_s) {
+            Ok(()) => {
+                if src != dst && src.is_file() {
+                    let _ = std::fs::remove_file(src);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                std::fs::remove_file(dst).map_err(|re| {
+                    format!(
+                        "promote-out: cannot remove bad {}: {re} (check was: {e})",
+                        dst.display()
+                    )
+                })?;
+                eprintln!("promote-out: re-run after failed dst check: {e}");
+            }
+        }
+    }
+    check_chunk_file(src, expect_dur_s).map_err(|e| format!("promote-out src: {e}"))?;
+    if src == dst {
+        return Ok(());
+    }
+    // Same share volume; rename is metadata-only (no second full write).
+    std::fs::rename(src, dst).map_err(|e| {
+        format!(
+            "promote-out: rename {} → {}: {e}",
+            src.display(),
+            dst.display()
+        )
+    })?;
+    check_chunk_file(dst, expect_dur_s)
 }
 
 /// Reuse a good existing concat/mux output, otherwise run ffmpeg with `-y` then healthcheck.
@@ -335,8 +375,9 @@ pub fn cleanup_farm_intermediates(
     remove(output_dir.join(format!("{stem}.ffconcat")));
     remove(output_dir.join(format!("{stem}.color.ffconcat")));
     remove(output_dir.join(format!("{stem}.vcat.{ext}")));
-    // Opaque multi-audio staging + hybrid video-only remux before audio mux.
+    // Opaque stage (deliver-container or MKV bridge) + hybrid video-only remux before audio mux.
     remove(output_dir.join(format!("{stem}.vmux.mkv")));
+    remove(output_dir.join(format!("{stem}.vmux.mp4")));
     remove(output_dir.join(format!("{stem}.vmux.webm")));
     // Flat hybrid color/alpha planes (concat targets or single-encode outputs).
     remove(output_dir.join(format!("{stem}.color.ivf")));
@@ -1273,6 +1314,17 @@ mod tests {
     }
 
     #[test]
+    fn promote_out_missing_src() {
+        let err = promote_out_file(
+            Path::new("definitely-missing-vmux.mp4"),
+            Path::new("definitely-missing-final.mp4"),
+            1.0,
+        )
+        .unwrap_err();
+        assert!(err.contains("promote-out src"), "{err}");
+    }
+
+    #[test]
     fn cleanup_removes_known_intermediates() {
         let dir = std::env::temp_dir().join(format!(
             "gigamux_cleanup_{}",
@@ -1287,6 +1339,7 @@ mod tests {
         fs::write(dir.join("clip.ffconcat"), b"x").unwrap();
         fs::write(dir.join("clip.vcat.mp4"), b"x").unwrap();
         fs::write(dir.join("clip.vmux.mkv"), b"x").unwrap();
+        fs::write(dir.join("clip.vmux.mp4"), b"x").unwrap();
         fs::write(dir.join("clip.mp4"), b"keep").unwrap();
         fs::write(dir.join("clip.c000of002.ivf"), b"x").unwrap();
         fs::write(dir.join("clip.color.c001of002.ivf"), b"x").unwrap();
@@ -1305,6 +1358,7 @@ mod tests {
         assert!(!dir.join("clip.color.ffconcat").exists());
         assert!(!dir.join("clip.vcat.mp4").exists());
         assert!(!dir.join("clip.vmux.mkv").exists());
+        assert!(!dir.join("clip.vmux.mp4").exists());
         assert!(!dir.join("clip.vmux.webm").exists());
         assert!(!dir.join("clip.color.ivf").exists());
         assert!(!dir.join("clip.alpha.ivf").exists());
@@ -1322,6 +1376,8 @@ mod tests {
         assert!(is_hybrid_plane_filename("clip.color.ivf"));
         assert!(is_hybrid_plane_filename("clip.alpha.ivf"));
         assert!(is_hybrid_plane_filename("clip.vmux.webm"));
+        assert!(is_hybrid_plane_filename("clip.vmux.mp4"));
+        assert!(is_hybrid_plane_filename("clip.vmux.mkv"));
         assert!(!is_hybrid_plane_filename("clip.c000of002.ivf"));
     }
 
