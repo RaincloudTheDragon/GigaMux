@@ -53,6 +53,7 @@ pub use flamenco::{
     scripts_dir_from_manager_install, set_worker_tags, submit_job, worker_status_probeable,
     write_farm_probe_report, CancelExecMode, DeployReport, FarmChunkCheck, FarmCleanup,
     FarmFinalCheck, FarmProbeHostReport, FarmProbeInventory, FarmProbeTaskTypeReport, FarmVmafMode,
+    FARM_JOB_PRIORITY_DEFAULT, FARM_JOB_PRIORITY_MAX, FARM_JOB_PRIORITY_MIN, FARM_VMAF_JOB_PRIORITY,
     FarmVmafPart, FarmVmafSpec, FlamencoIntegrity, FlamencoJobStatus, FlamencoTaskSummary,
     FlamencoTwoway,
     FlamencoWorkerSummary, ProbeWorkerPin, SubmittedJob, WorkerTaskTypeRecommendation,

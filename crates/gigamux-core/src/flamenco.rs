@@ -85,6 +85,14 @@ pub fn farm_slot_use_hardware(slot: &EncodeSlot) -> bool {
     }
 }
 
+/// Flamenco job priority range (OpenAPI `JobPriorityChange` / Blender add-on). Higher runs first.
+pub const FARM_JOB_PRIORITY_MIN: i32 = 0;
+pub const FARM_JOB_PRIORITY_MAX: i32 = 100;
+/// Default encode / hybrid / chunked submit priority.
+pub const FARM_JOB_PRIORITY_DEFAULT: i32 = 50;
+/// VMAF-only / Separate follow-up jobs; lowest priority so scoring yields to new encodes.
+pub const FARM_VMAF_JOB_PRIORITY: i32 = 0;
+
 /// Body for `POST /api/v3/jobs` (Flamenco `SubmittedJob`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmittedJob {
@@ -109,6 +117,11 @@ impl SubmittedJob {
         } else {
             None
         };
+    }
+
+    /// Clamp to Manager-accepted 0..=100 (same as Blender `flamenco_job_priority`).
+    pub fn set_priority(&mut self, priority: i32) {
+        self.priority = priority.clamp(FARM_JOB_PRIORITY_MIN, FARM_JOB_PRIORITY_MAX);
     }
 }
 

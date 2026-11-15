@@ -39,6 +39,7 @@ use gigamux_core::flamenco::{
     worker_status_probeable, CancelExecMode,
     FarmProbeInventory, FarmProbeTaskTypeReport, FarmVmafMode, FarmVmafSpec, FlamencoTwoway,
     ProbeWorkerPin, WorkerTaskTypeRecommendation, CAPABILITY_TASK_TYPES,
+    FARM_JOB_PRIORITY_DEFAULT, FARM_JOB_PRIORITY_MAX, FARM_JOB_PRIORITY_MIN, FARM_VMAF_JOB_PRIORITY,
 };
 use gigamux_core::wants_qsv_alpha_hybrid;
 use gigamux_core::ffmpeg_active::{active_ffmpeg_pid, kill_process_tree};
@@ -276,11 +277,12 @@ fn farm_submit_existing_deliver(
         }
     };
     job.set_submit_paused(submit_paused);
+    job.set_priority(FARM_VMAF_JOB_PRIORITY);
     match submit_job(url, &job) {
         Ok(id) => {
             let paused_note = if submit_paused { " (paused)" } else { "" };
             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                "Flamenco VMAF-only (exists): job {id}{paused_note}; {item_label} → {out_name}{parts_note}"
+                "Flamenco VMAF-only (exists): job {id}{paused_note} prio {FARM_VMAF_JOB_PRIORITY}; {item_label} → {out_name}{parts_note}"
             ))));
             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
                 job_id: id,
@@ -848,6 +850,8 @@ struct FlamencoSubmitPrompt {
     farm_vmaf: FarmVmafMode,
     /// Submit with Manager `initial_status: paused` (Blender “Submit as Paused”).
     submit_paused: bool,
+    /// Job priority 0..=100 (Blender / Flamenco; higher runs first). Default 50.
+    priority: i32,
     /// Duration (s) of the first selected input for the chunk estimate label.
     estimate_duration_s: f64,
     /// Basename used for the estimate label.
@@ -2873,6 +2877,7 @@ impl GigaMuxApp {
             chunk_qsv_color: self.prefs.flamenco_chunk_qsv_color,
             farm_vmaf: FarmVmafMode::Off,
             submit_paused: false,
+            priority: FARM_JOB_PRIORITY_DEFAULT,
             estimate_duration_s,
             estimate_name,
         });
@@ -2917,7 +2922,9 @@ impl GigaMuxApp {
         names: Vec<String>,
         farm_vmaf: FarmVmafMode,
         submit_paused: bool,
+        priority: i32,
     ) {
+        let priority = priority.clamp(FARM_JOB_PRIORITY_MIN, FARM_JOB_PRIORITY_MAX);
         if self.busy {
             return;
         }
@@ -3241,13 +3248,14 @@ impl GigaMuxApp {
                         }
                     };
                     job.set_submit_paused(submit_paused);
+                    job.set_priority(priority);
                     match submit_job(&url, &job) {
                         Ok(id) => {
                             let color_n = job_built.color_tasks.len();
                             let alpha_n = job_built.alpha_tasks.len();
                             let paused_note = if submit_paused { " (paused)" } else { "" };
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                                "Flamenco submitted: job {id}{paused_note}; {item_label} → {out_name} (hybrid qsv×{color_n} + cpu×{alpha_n}, {}k / {})",
+                                "Flamenco submitted: job {id}{paused_note} prio {priority}; {item_label} → {out_name} (hybrid qsv×{color_n} + cpu×{alpha_n}, {}k / {})",
                                 job_built.bitrate_k, job_built.bitrate_label
                             ))));
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
@@ -3369,11 +3377,12 @@ impl GigaMuxApp {
                         }
                     };
                     job.set_submit_paused(submit_paused);
+                    job.set_priority(priority);
                     match submit_job(&url, &job) {
                         Ok(id) => {
                             let paused_note = if submit_paused { " (paused)" } else { "" };
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                                "Flamenco submitted: job {id}{paused_note}; {item_label} → {out_name} (type {task_type}, {} chunks, {}k / {})",
+                                "Flamenco submitted: job {id}{paused_note} prio {priority}; {item_label} → {out_name} (type {task_type}, {} chunks, {}k / {})",
                                 chunk_n, job_built.bitrate_k, job_built.bitrate_label
                             ))));
                             let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
@@ -3488,11 +3497,12 @@ impl GigaMuxApp {
                     }
                 };
                 job.set_submit_paused(submit_paused);
+                job.set_priority(priority);
                 match submit_job(&url, &job) {
                     Ok(id) => {
                         let paused_note = if submit_paused { " (paused)" } else { "" };
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Log(format!(
-                            "Flamenco submitted: job {id}{paused_note}; {item_label} → {out_name} (type {task_type}, {}k / {})",
+                            "Flamenco submitted: job {id}{paused_note} prio {priority}; {item_label} → {out_name} (type {task_type}, {}k / {})",
                             cmd.bitrate_k, cmd.bitrate_label
                         ))));
                         let _ = tx.send(AppEvent::FarmSubmit(FarmSubmitEvent::Tracked {
@@ -3938,13 +3948,15 @@ impl GigaMuxApp {
                 })
             }
         };
-        let job = match make_gigamux_vmaf_job(job_name, exe, pairs, twoway, &check_exe) {
+        let mut job = match make_gigamux_vmaf_job(job_name, exe, pairs, twoway, &check_exe) {
             Ok(j) => j,
             Err(e) => {
                 self.push_session(format!("Farm VMAF job: {e}"));
                 return;
             }
         };
+        // Separate / batch / follow-up VMAF stay below default encode priority (0..=100).
+        job.set_priority(FARM_VMAF_JOB_PRIORITY);
         match submit_job(&url, &job) {
             Ok(id) => {
                 let parts_note = if pairs.len() == 1 {
@@ -3958,7 +3970,7 @@ impl GigaMuxApp {
                     }
                 };
                 self.push_session(format!(
-                    "Farm VMAF submitted: job {id}; {track_label}{parts_note}"
+                    "Farm VMAF submitted: job {id} prio {FARM_VMAF_JOB_PRIORITY}; {track_label}{parts_note}"
                 ));
                 self.track_farm_job(
                     id,
@@ -9513,6 +9525,17 @@ impl GigaMuxApp {
                     .on_hover_text(
                         "Manager initial_status=paused (same as Blender Flamenco). Resume from the Manager / farm panel when ready.",
                     );
+                ui.horizontal(|ui| {
+                    ui.label("Priority");
+                    ui.add(egui::Slider::new(
+                        &mut prompt.priority,
+                        FARM_JOB_PRIORITY_MIN..=FARM_JOB_PRIORITY_MAX,
+                    ));
+                })
+                .response
+                .on_hover_text(
+                    "Flamenco job priority 0–100 (higher first; Blender default 50). Separate VMAF follow-ups always submit at 0.",
+                );
 
                 if let Some(p) = self.pending_flamenco.as_mut() {
                     p.ffmpeg_exe = prompt.ffmpeg_exe.clone();
@@ -9522,6 +9545,7 @@ impl GigaMuxApp {
                     p.chunk_qsv_color = prompt.chunk_qsv_color;
                     p.farm_vmaf = prompt.farm_vmaf;
                     p.submit_paused = prompt.submit_paused;
+                    p.priority = prompt.priority.clamp(FARM_JOB_PRIORITY_MIN, FARM_JOB_PRIORITY_MAX);
                 }
 
                 ui.add_space(10.0);
@@ -9547,8 +9571,9 @@ impl GigaMuxApp {
                         let names = prompt.names;
                         let farm_vmaf = prompt.farm_vmaf;
                         let submit_paused = prompt.submit_paused;
+                        let priority = prompt.priority;
                         self.pending_flamenco = None;
-                        self.submit_flamenco_encode(names, farm_vmaf, submit_paused);
+                        self.submit_flamenco_encode(names, farm_vmaf, submit_paused, priority);
                     }
                 });
             });
