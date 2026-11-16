@@ -10992,6 +10992,7 @@ fn windows_path_for_shell(path: &Path) -> PathBuf {
 }
 
 /// `\\?\C:\…` → `C:\…`, `\\?\UNC\server\share` → `\\server\share`.
+#[cfg(any(test, target_os = "windows"))]
 fn strip_win_extended_prefix(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")

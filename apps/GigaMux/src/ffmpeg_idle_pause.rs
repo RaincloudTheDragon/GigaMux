@@ -1,6 +1,8 @@
 //! Shutter-style ffmpeg pause: suspend on user input; resume after 1 second idle.
 
+#[cfg(windows)]
 use std::collections::HashMap;
+#[cfg(windows)]
 use std::mem::size_of;
 use std::time::Duration;
 
