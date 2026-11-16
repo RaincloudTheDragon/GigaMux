@@ -148,6 +148,7 @@ impl EncodeProgress {
 fn main() -> eframe::Result<()> {
     // Adobe-style: Alt held while launching → ask to purge prefs (before the window eats focus).
     let ask_purge_prefs = alt_held_at_launch();
+    prefer_x11_for_file_dnd();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 700.0])
@@ -162,6 +163,20 @@ fn main() -> eframe::Result<()> {
         Box::new(move |_cc| Ok(Box::new(GigaMuxApp::new(ask_purge_prefs)))),
     )
 }
+
+/// winit 0.30 (via eframe 0.37) has no Wayland file DnD, so Dolphin drops never reach egui. Prefer XWayland when DISPLAY is set; opt out with `GIGAMUX_WAYLAND=1`. Drop this once egui moves to winit 0.31+.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn prefer_x11_for_file_dnd() {
+    if std::env::var_os("GIGAMUX_WAYLAND").is_some() {
+        return;
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn prefer_x11_for_file_dnd() {}
 
 /// True when Alt/Option is down at process start (prefs-purge offer).
 fn alt_held_at_launch() -> bool {
