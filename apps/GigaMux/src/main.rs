@@ -6839,6 +6839,7 @@ impl GigaMuxApp {
                     return;
                 }
                 let id = format!("slot_nvenc_gen_{}", batch.index());
+                // Combo stays generation-only; card name lives in the weak/small line below (QSV-style).
                 let preview = match slot.nvenc_gen {
                     None => {
                         if let Some(d) = self.hw.nvenc.first() {
@@ -6848,8 +6849,8 @@ impl GigaMuxApp {
                         }
                     }
                     Some(g) => {
-                        if let Some(d) = self.hw.first_nvenc_of_gen(g) {
-                            d.ui_label()
+                        if self.hw.first_nvenc_of_gen(g).is_some() {
+                            g.label().to_string()
                         } else {
                             format!("{} (farm)", g.label())
                         }
@@ -6888,15 +6889,14 @@ impl GigaMuxApp {
                     slot.nvenc_gen = selected;
                     slot.gpu = gpu;
                     self.save_targets();
-                } else if gens.is_empty() {
-                    // Single local GPU, no farm gens yet — keep a quiet device label.
-                    if self.hw.nvenc.len() == 1 {
-                        ui.label(
-                            egui::RichText::new(self.hw.nvenc[0].ui_label())
-                                .weak()
-                                .small(),
-                        );
-                    }
+                }
+                // Same quiet device subtitle as opaque VP9 QSV; always when a local GPU resolves.
+                let local = match selected {
+                    None => self.hw.nvenc.first(),
+                    Some(g) => self.hw.first_nvenc_of_gen(g),
+                };
+                if let Some(d) = local {
+                    ui.label(egui::RichText::new(d.ui_label()).weak().small());
                 }
             }
             OpaqueVideo::Vp8 => {}
