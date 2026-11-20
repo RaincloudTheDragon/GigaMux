@@ -5678,13 +5678,14 @@ impl GigaMuxApp {
     }
 
     /// Output basenames to score for the current selection (Input → all paired delivers).
+    /// No selection → every output; already-scored pairs are dropped later when not forcing.
     fn vmaf_outputs_for_selection(&self) -> HashSet<String> {
         let Some((side, _)) = self.active else {
-            return HashSet::new();
+            return self.names_for(FileSide::Output).into_iter().collect();
         };
         let names = self.selected_names_ordered();
         if names.is_empty() {
-            return HashSet::new();
+            return self.names_for(FileSide::Output).into_iter().collect();
         }
         match side {
             FileSide::Output => names.into_iter().collect(),
@@ -5704,11 +5705,11 @@ impl GigaMuxApp {
         }
     }
 
-    /// Local VMAF for the current selection (`force` re-scores and overwrites sidecars).
+    /// Local VMAF for the current selection, or all outputs when none selected (`force` re-scores).
     fn start_vmaf_selection(&mut self, force: bool) {
         let outs = self.vmaf_outputs_for_selection();
         if outs.is_empty() {
-            self.alert_error("VMAF", "select input or output file(s) to score");
+            self.alert_error("VMAF", "no output files to score");
             return;
         }
         self.start_vmaf(outs, force);
@@ -5770,13 +5771,19 @@ impl GigaMuxApp {
                 let _ = std::fs::remove_file(&side);
             }
         } else {
+            let candidates = only_outputs.clone();
             only_outputs.retain(|n| {
                 self.live_vmaf_score(FileSide::Output, n).is_none()
                     && read_vmaf_sidecar(&vmaf_sidecar_path(&self.prefs.output_dir.join(n)))
                         .is_none()
             });
             if only_outputs.is_empty() {
-                self.push_session("VMAF skip; selected outputs already scored (right-click → Re-VMAF)");
+                let mut names: Vec<_> = candidates.into_iter().collect();
+                names.sort();
+                self.push_session(format!(
+                    "VMAF skip; already scored: {} (right-click → Re-VMAF)",
+                    names.join(", ")
+                ));
                 return;
             }
         }
@@ -5902,12 +5909,12 @@ impl GigaMuxApp {
         }
         if !self.folders_configured() {
             self.clear_auto_vmaf_schedule();
-            self.push_session("auto VMAF: skipped — set input and output folders");
+            self.push_session("auto VMAF: skipped; set input and output folders");
             return;
         }
         if !self.vmaf_available {
             self.clear_auto_vmaf_schedule();
-            self.push_session("auto VMAF: skipped — libvmaf unavailable");
+            self.push_session("auto VMAF: skipped; libvmaf unavailable");
             return;
         }
         let total_out = self.names_for(FileSide::Output).len();
@@ -5916,10 +5923,17 @@ impl GigaMuxApp {
         if unscored.is_empty() {
             // Caught up: keep watching hourly for new / still-writing outputs.
             if total_out == 0 {
-                self.push_session("auto VMAF: nothing to score — next check in 1 h");
+                self.push_session("auto VMAF: nothing to score; next check in 1 h");
             } else {
+                let mut scored: Vec<_> = self
+                    .names_for(FileSide::Output)
+                    .into_iter()
+                    .filter(|n| !unscored.contains(n))
+                    .collect();
+                scored.sort();
                 self.push_session(format!(
-                    "auto VMAF: skipped — {already} already scored, 0 unscored — next check in 1 h"
+                    "auto VMAF: skipped; {already} already scored ({}); next check in 1 h",
+                    scored.join(", ")
                 ));
             }
             self.schedule_auto_vmaf(AUTO_VMAF_RETRY_CAUGHT_UP);
@@ -7845,7 +7859,7 @@ impl GigaMuxApp {
                             egui::Button::new("VMAF").min_size(egui::vec2(120.0, 28.0)),
                         )
                         .on_hover_text(
-                            "libvmaf for the current selection only (skips already-scored). Right-click a file → Re-VMAF to force; right-click this button to farm-VMAF unscored finals. Esc cancels.",
+                            "libvmaf for the current selection, or all outputs when none selected (skips already-scored). Right-click a file → Re-VMAF to force; right-click this button to farm-VMAF unscored finals. Esc cancels.",
                         )
                         .on_disabled_hover_text(disabled_hint);
                     if vmaf.clicked() {
