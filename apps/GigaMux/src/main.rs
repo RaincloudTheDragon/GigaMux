@@ -2221,11 +2221,19 @@ impl GigaMuxApp {
         }
     }
 
-    /// Pointer for folder DnD: egui often has none during an OS drag on Windows.
+    /// Pointer for folder DnD: egui often has none (or a stale pos) during an OS file drag.
     fn dnd_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
-        ctx.pointer_interact_pos()
-            .or_else(|| ctx.pointer_latest_pos())
-            .or_else(|| win32_cursor_egui_pos(ctx))
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        // During an OS file drag, prefer the real cursor; egui's last pos is often stale.
+        if hovering {
+            os_cursor_egui_pos(ctx)
+                .or_else(|| ctx.pointer_interact_pos())
+                .or_else(|| ctx.pointer_latest_pos())
+        } else {
+            ctx.pointer_interact_pos()
+                .or_else(|| ctx.pointer_latest_pos())
+                .or_else(|| os_cursor_egui_pos(ctx))
+        }
     }
 
     /// Which pane contains `p`, if either.
@@ -2250,10 +2258,13 @@ impl GigaMuxApp {
                 .collect()
         });
 
-        // Live hit-test every drag frame (Win32 cursor) so outline works even if egui pointer is dead.
+        // Live hit-test every drag frame (OS cursor) so outline works even if egui pointer is dead.
+        // Only update when we hit a pane; never clear sticky on a miss (egui often reports a stale pos outside the window during OS file drags).
         if hovering {
             if let Some(p) = Self::dnd_pointer(ctx) {
-                self.dnd_hover_side = self.pane_at(p);
+                if let Some(side) = self.pane_at(p) {
+                    self.dnd_hover_side = Some(side);
+                }
             }
             let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255));
             let painter = ctx.layer_painter(egui::LayerId::new(
@@ -2274,6 +2285,8 @@ impl GigaMuxApp {
                 None => {}
             }
             ctx.request_repaint();
+        } else if dropped.is_empty() {
+            self.dnd_hover_side = None;
         }
 
         if dropped.is_empty() {
@@ -7074,6 +7087,42 @@ impl GigaMuxApp {
             });
     }
 
+    /// Full-pane click/drop target to choose an Input or Output folder.
+    fn ui_folder_pick_cta(&mut self, ui: &mut egui::Ui, is_input: bool) {
+        let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let label = if hovering {
+            if is_input {
+                "Drop to set input folder"
+            } else {
+                "Drop to set output folder"
+            }
+        } else if is_input {
+            "Select input folder\n(or drop a folder here)"
+        } else {
+            "Select output folder\n(or drop a folder here)"
+        };
+        // `add_sized` claims the rest of the pane so clicks land on empty space, not just the text.
+        let response = ui.add_sized(
+            ui.available_size(),
+            egui::Button::new(egui::RichText::new(label).heading()),
+        );
+        // Stick the drop target while the OS drag is over this CTA (pointer may be dead/stale).
+        if hovering && (response.hovered() || response.contains_pointer()) {
+            self.dnd_hover_side = Some(if is_input {
+                FileSide::Input
+            } else {
+                FileSide::Output
+            });
+        }
+        if response.clicked() {
+            if is_input {
+                self.pick_input_folder();
+            } else {
+                self.pick_output_folder();
+            }
+        }
+    }
+
     fn ui_folder_pane(
         &mut self,
         ui: &mut egui::Ui,
@@ -7112,38 +7161,25 @@ impl GigaMuxApp {
                     self.ui_output_targets(ui);
                     ui.separator();
                 }
-                let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
-                let label = if hovering {
-                    if is_input {
-                        "Drop to set input folder"
-                    } else {
-                        "Drop to set output folder"
-                    }
-                } else if is_input {
-                    "Select input folder\n(or drop a folder here)"
-                } else {
-                    "Select output folder\n(or drop a folder here)"
-                };
-                let size = ui.available_size();
-                let btn = egui::Button::new(egui::RichText::new(label).heading()).min_size(size);
-                if ui.add(btn).clicked() {
-                    if is_input {
-                        self.pick_input_folder();
-                    } else {
-                        self.pick_output_folder();
-                    }
-                }
+                self.ui_folder_pick_cta(ui, is_input);
                 return;
             }
-            // Configured but last scan said unreachable (or still waiting).
+            // Configured but last scan said unreachable; still allow click/drop to pick a new folder.
             if !self.folder_ok_cached(is_input) && !self.lists_inflight {
-                ui.label(
-                    egui::RichText::new("Folder unreachable (share offline?). Change… or retry.")
-                        .weak(),
-                );
-                if ui.small_button("Retry scan").clicked() {
-                    self.request_refresh_lists();
+                if !is_input && !self.prefs.test_mode {
+                    self.ui_output_targets(ui);
+                    ui.separator();
                 }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Folder unreachable (share offline?).")
+                            .weak(),
+                    );
+                    if ui.small_button("Retry scan").clicked() {
+                        self.request_refresh_lists();
+                    }
+                });
+                self.ui_folder_pick_cta(ui, is_input);
                 return;
             }
 
@@ -10719,22 +10755,86 @@ fn play_job_done_chime() {
     }
 }
 
-/// Screen cursor → egui viewport coordinates. Used when egui's pointer is dead during OS DnD.
+/// Screen cursor → egui viewport coordinates when egui's pointer is dead during OS DnD.
+fn os_cursor_egui_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    let (sx, sy) = os_cursor_screen_px()?;
+    let ppp = ctx.pixels_per_point();
+    let inner = ctx.input(|i| i.viewport().inner_rect)?;
+    let screen = egui::pos2(sx as f32 / ppp, sy as f32 / ppp);
+    Some(egui::pos2(screen.x - inner.min.x, screen.y - inner.min.y))
+}
+
 #[cfg(windows)]
-fn win32_cursor_egui_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+fn os_cursor_screen_px() -> Option<(i32, i32)> {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
     let mut pt = POINT::default();
     unsafe { GetCursorPos(&mut pt) }.ok()?;
-    let ppp = ctx.pixels_per_point();
-    let inner = ctx.input(|i| i.viewport().inner_rect)?;
-    let screen = egui::pos2(pt.x as f32 / ppp, pt.y as f32 / ppp);
-    Some(egui::pos2(screen.x - inner.min.x, screen.y - inner.min.y))
+    Some((pt.x, pt.y))
 }
 
-#[cfg(not(windows))]
-fn win32_cursor_egui_pos(_ctx: &egui::Context) -> Option<egui::Pos2> {
+/// XQueryPointer; same role as Win32 GetCursorPos. Session may be Wayland; GigaMux runs XWayland for file DnD (`prefer_x11_for_file_dnd`).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn os_cursor_screen_px() -> Option<(i32, i32)> {
+    use std::os::raw::{c_int, c_uint, c_ulong, c_void};
+    use std::sync::OnceLock;
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XOpenDisplay(name: *const i8) -> *mut c_void;
+        fn XDefaultRootWindow(dpy: *mut c_void) -> c_ulong;
+        fn XQueryPointer(
+            dpy: *mut c_void,
+            w: c_ulong,
+            root_ret: *mut c_ulong,
+            child_ret: *mut c_ulong,
+            root_x: *mut c_int,
+            root_y: *mut c_int,
+            win_x: *mut c_int,
+            win_y: *mut c_int,
+            mask: *mut c_uint,
+        ) -> c_int;
+    }
+
+    static DPY: OnceLock<usize> = OnceLock::new();
+    let dpy = *DPY.get_or_init(|| {
+        let p = unsafe { XOpenDisplay(std::ptr::null()) };
+        p as usize
+    });
+    if dpy == 0 {
+        return None;
+    }
+    let dpy = dpy as *mut c_void;
+    unsafe {
+        let root = XDefaultRootWindow(dpy);
+        let mut root_ret = 0;
+        let mut child_ret = 0;
+        let mut root_x = 0;
+        let mut root_y = 0;
+        let mut win_x = 0;
+        let mut win_y = 0;
+        let mut mask = 0;
+        if XQueryPointer(
+            dpy,
+            root,
+            &mut root_ret,
+            &mut child_ret,
+            &mut root_x,
+            &mut root_y,
+            &mut win_x,
+            &mut win_y,
+            &mut mask,
+        ) == 0
+        {
+            return None;
+        }
+        Some((root_x, root_y))
+    }
+}
+
+#[cfg(all(not(windows), not(all(unix, not(target_os = "macos")))))]
+fn os_cursor_screen_px() -> Option<(i32, i32)> {
     None
 }
 
