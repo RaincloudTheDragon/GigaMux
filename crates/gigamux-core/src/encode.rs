@@ -241,22 +241,41 @@ fn deliver_path(
     output_dir.join(format!("{file_stem}.{}", container.ext()))
 }
 
-fn append_audio_args(cmd: &mut Vec<String>, input: &Path, info: &serde_json::Value, out: OutContainer) {
+/// OBS Hybrid (`obs1`) or fragmented ISOBMFF (`iso6`); A+V on one demuxer often truncates video.
+fn source_needs_dual_open(info: &serde_json::Value) -> bool {
+    let tags = info.pointer("/format/tags");
+    let major = tags
+        .and_then(|t| t.get("major_brand"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let compat = tags
+        .and_then(|t| t.get("compatible_brands"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let brands = format!("{major}{compat}").to_ascii_lowercase();
+    brands.contains("obs1") || brands.contains("iso6")
+}
+
+/// Append `-c:a` + maps. When `dual_open`, audio/subs come from input #1 (video already mapped from #0).
+fn append_audio_args(
+    cmd: &mut Vec<String>,
+    input: &Path,
+    info: &serde_json::Value,
+    out: OutContainer,
+    dual_open: bool,
+) {
     let raw = audio_codec_name(info);
+    if raw.is_empty() {
+        cmd.push("-an".into());
+        return;
+    }
     match audio_encode_for(&raw, out) {
         AudioEncode::Copy => {
-            cmd.extend(["-c:a".into(), "copy".into(), "-map".into(), "0".into()]);
+            cmd.extend(["-c:a".into(), "copy".into()]);
         }
         AudioEncode::Aac => {
             let a_k = audio_bitrate_k(input);
-            cmd.extend([
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                format!("{a_k}k"),
-                "-map".into(),
-                "0".into(),
-            ]);
+            cmd.extend(["-c:a".into(), "aac".into(), "-b:a".into(), format!("{a_k}k")]);
         }
         AudioEncode::Opus => {
             let a_k = audio_bitrate_k(input);
@@ -265,10 +284,13 @@ fn append_audio_args(cmd: &mut Vec<String>, input: &Path, info: &serde_json::Val
                 "libopus".into(),
                 "-b:a".into(),
                 format!("{a_k}k"),
-                "-map".into(),
-                "0".into(),
             ]);
         }
+    }
+    if dual_open {
+        cmd.extend(["-map".into(), "1:a?".into(), "-map".into(), "1:s?".into()]);
+    } else {
+        cmd.extend(["-map".into(), "0".into()]);
     }
 }
 
@@ -696,6 +718,15 @@ fn build_cmd(
         cmd.push("-i".into());
         cmd.push(input.to_string_lossy().into_owned());
     }
+    // Cheap brand-tag gate: OBS Hybrid / frag ISOBMFF. Dual-open so video demux is not truncated.
+    let dual_open = !video_only
+        && !audio_codec_name(info).is_empty()
+        && source_needs_dual_open(info);
+    if dual_open {
+        cmd.push("-i".into());
+        cmd.push(input.to_string_lossy().into_owned());
+        cmd.extend(["-map".into(), "0:v:0".into()]);
+    }
 
     let src_pix = video_pix_fmt(info);
     let out_pix = delivery_pix_fmt(&src_pix, has_alpha, use_hardware, opaque_video);
@@ -733,14 +764,14 @@ fn build_cmd(
             bufsize,
         ]);
         if !video_only {
-            append_audio_args(&mut cmd, input, info, out_container);
+            append_audio_args(&mut cmd, input, info, out_container, dual_open);
         }
     } else if use_qsv {
         // QSV VP9 is VBR-only — no CQ/CRF knob; cq_override is ignored here.
         append_vp9_qsv_args(&mut cmd, out_pix, &ceiling, &bufsize);
         append_color_meta_args(&mut cmd, &video_color_meta(info));
         if !video_only {
-            append_audio_args(&mut cmd, input, info, out_container);
+            append_audio_args(&mut cmd, input, info, out_container, dual_open);
         }
     } else if opaque_video.is_libvpx() {
         append_libvpx_opaque_args(
@@ -751,7 +782,7 @@ fn build_cmd(
             cq,
         );
         if !video_only {
-            append_audio_args(&mut cmd, input, info, out_container);
+            append_audio_args(&mut cmd, input, info, out_container, dual_open);
         }
     } else if !use_nvenc {
         // CPU HEVC/H.264/AV1 — keep source chroma/bit-depth; CRF capped at source ceiling.
@@ -779,7 +810,7 @@ fn build_cmd(
             append_x264_profile(&mut cmd, out_pix);
         }
         if !video_only {
-            append_audio_args(&mut cmd, input, info, out_container);
+            append_audio_args(&mut cmd, input, info, out_container, dual_open);
         }
     } else {
         // NVENC: match source chroma/depth when the codec allows (no 4:2:2 on GeForce).
@@ -813,7 +844,7 @@ fn build_cmd(
         ]);
         append_nvenc_profile(&mut cmd, opaque_video, out_pix);
         if !video_only {
-            append_audio_args(&mut cmd, input, info, out_container);
+            append_audio_args(&mut cmd, input, info, out_container, dual_open);
         }
     }
 
@@ -2580,6 +2611,82 @@ mod tests {
             }],
             "format": { "duration": "2.0" }
         })
+    }
+
+    fn stub_hevc_aac_info(brands: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "hevc",
+                    "pix_fmt": "yuv420p",
+                    "width": 1920,
+                    "height": 1080,
+                    "r_frame_rate": "60/1",
+                    "bit_rate": "40000000",
+                },
+                { "codec_type": "audio", "codec_name": "aac" }
+            ],
+            "format": { "duration": "5.0", "bit_rate": "40000000", "tags": brands }
+        })
+    }
+
+    fn opaque_hevc_argv(info: &serde_json::Value) -> Vec<String> {
+        build_cmd(
+            Path::new("/tmp/in.mp4"),
+            Path::new("/tmp/out.mp4"),
+            info,
+            false,
+            GpuChoice::Index(0),
+            40000,
+            0,
+            false,
+            false,
+            true,
+            OpaqueVideo::Hevc,
+            OutContainer::Mp4,
+            AlphaVideo::Vp9,
+            OutContainer::Webm,
+            None,
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn opaque_encode_dual_opens_obs_hybrid() {
+        // obs1 / iso6 brand tags → dual-open (video=#0, audio=#1).
+        let info = stub_hevc_aac_info(serde_json::json!({
+            "major_brand": "iso6",
+            "compatible_brands": "iso6isomobs1iso2mp41",
+        }));
+        let argv = opaque_hevc_argv(&info);
+        let inputs: Vec<_> = argv
+            .windows(2)
+            .filter(|w| w[0] == "-i")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(inputs, ["/tmp/in.mp4", "/tmp/in.mp4"]);
+        assert!(argv.windows(2).any(|w| w[0] == "-map" && w[1] == "0:v:0"));
+        assert!(argv.windows(2).any(|w| w[0] == "-map" && w[1] == "1:a?"));
+        assert!(!argv.windows(2).any(|w| w[0] == "-map" && w[1] == "0"));
+    }
+
+    #[test]
+    fn opaque_encode_single_open_without_hybrid_brands() {
+        let info = stub_hevc_aac_info(serde_json::json!({
+            "major_brand": "isom",
+            "compatible_brands": "isomiso2mp41",
+        }));
+        let argv = opaque_hevc_argv(&info);
+        let inputs: Vec<_> = argv
+            .windows(2)
+            .filter(|w| w[0] == "-i")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(inputs, ["/tmp/in.mp4"]);
+        assert!(argv.windows(2).any(|w| w[0] == "-map" && w[1] == "0"));
+        assert!(!argv.windows(2).any(|w| w[0] == "-map" && w[1] == "1:a?"));
     }
 
     #[test]
