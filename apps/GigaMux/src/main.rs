@@ -148,8 +148,8 @@ impl EncodeProgress {
 fn main() -> eframe::Result<()> {
     // Adobe-style: Alt held while launching → ask to purge prefs (before the window eats focus).
     let ask_purge_prefs = alt_held_at_launch();
-    prefer_x11_for_file_dnd();
-    let options = eframe::NativeOptions {
+    let force_x11 = prefer_x11_for_file_dnd();
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 700.0])
             .with_title("GigaMux")
@@ -157,6 +157,14 @@ fn main() -> eframe::Result<()> {
             .with_drag_and_drop(true),
         ..Default::default()
     };
+    // Pin X11 so the patched smb:// → kio-fuse XDnD parser actually runs (Wayland has no DnD in winit 0.30).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if force_x11 {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        options.event_loop_builder = Some(Box::new(|b| {
+            b.with_x11();
+        }));
+    }
     eframe::run_native(
         "GigaMux",
         options,
@@ -164,19 +172,27 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// winit 0.30 (via eframe 0.37) has no Wayland file DnD, so Dolphin drops never reach egui. Prefer XWayland when DISPLAY is set; opt out with `GIGAMUX_WAYLAND=1`. Drop this once egui moves to winit 0.31+.
+/// winit 0.30 has no Wayland file DnD. Clear Wayland env + return true so main pins `with_x11()`. Opt out with `GIGAMUX_WAYLAND=1`.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn prefer_x11_for_file_dnd() {
+fn prefer_x11_for_file_dnd() -> bool {
     if std::env::var_os("GIGAMUX_WAYLAND").is_some() {
-        return;
+        return false;
     }
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some() {
-        std::env::remove_var("WAYLAND_DISPLAY");
+    if std::env::var_os("DISPLAY").is_none() {
+        return false;
     }
+    std::env::remove_var("WAYLAND_DISPLAY");
+    std::env::remove_var("WAYLAND_SOCKET");
+    if std::env::var_os("EGL_PLATFORM").as_deref() == Some(std::ffi::OsStr::new("wayland")) {
+        std::env::remove_var("EGL_PLATFORM");
+    }
+    true
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-fn prefer_x11_for_file_dnd() {}
+fn prefer_x11_for_file_dnd() -> bool {
+    false
+}
 
 /// True when Alt/Option is down at process start (prefs-purge offer).
 fn alt_held_at_launch() -> bool {
@@ -2296,10 +2312,24 @@ impl GigaMuxApp {
         let Some(path) = dropped.into_iter().next() else {
             return;
         };
+        // Confirm the patched winit path delivered something (incl. smb:// → kio-fuse).
+        self.push_session(format!("drop received: {}", path.display()));
         let pointer = Self::dnd_pointer(ctx);
         let side = self
             .dnd_hover_side
-            .or_else(|| pointer.and_then(|p| self.pane_at(p)));
+            .or_else(|| pointer.and_then(|p| self.pane_at(p)))
+            .or_else(|| {
+                // Exactly one pane needs a folder: accept the drop without a reliable pointer.
+                let in_pick = !Self::folder_configured(&self.prefs.input_dir)
+                    || !self.folder_ok_cached(true);
+                let out_pick = !Self::folder_configured(&self.prefs.output_dir)
+                    || !self.folder_ok_cached(false);
+                match (in_pick, out_pick) {
+                    (true, false) => Some(FileSide::Input),
+                    (false, true) => Some(FileSide::Output),
+                    _ => None,
+                }
+            });
         self.dnd_hover_side = None;
         match side {
             Some(FileSide::Input) => self.set_folder_from_path(true, path),

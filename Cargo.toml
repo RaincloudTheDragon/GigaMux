@@ -25,3 +25,8 @@ regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 flate2 = "1"
 trash = "5"
+
+# Dolphin smb:// XDnD: stock winit only allows file://. Commit is patches/winit+VERSION.patch only; run ./scripts/ensure-winit-patch.sh once after clone/clean (CI does this) so target/patch/winit-VERSION exists.
+# Dependabot still bumps winit via the lockfile; refresh the .patch + this path when the version changes.
+[patch.crates-io]
+winit = { path = "target/patch/winit-0.30.13" }

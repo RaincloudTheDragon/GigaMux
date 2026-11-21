@@ -1,0 +1,114 @@
+diff -ruN a/src/platform_impl/linux/x11/dnd.rs b/src/platform_impl/linux/x11/dnd.rs
+--- a/src/platform_impl/linux/x11/dnd.rs
++++ b/src/platform_impl/linux/x11/dnd.rs
+@@ -1,6 +1,6 @@
+ use std::io;
+ use std::os::raw::*;
+-use std::path::{Path, PathBuf};
++use std::path::PathBuf;
+ use std::str::Utf8Error;
+ use std::sync::Arc;
+ 
+@@ -148,22 +148,28 @@
+             let mut path_list = Vec::new();
+             let decoded = percent_decode(data).decode_utf8()?.into_owned();
+             for uri in decoded.split("\r\n").filter(|u| !u.is_empty()) {
+-                // The format is specified as protocol://host/path
+-                // However, it's typically simply protocol:///path
+-                let path_str = if uri.starts_with("file://") {
++                // GigaMux: also accept smb:// (Dolphin KIO) by mapping onto the live kio-fuse tree.
++                let (path, soft_canonicalize) = if uri.starts_with("file://") {
+                     let path_str = uri.replace("file://", "");
+                     if !path_str.starts_with('/') {
+                         // A hostname is specified
+                         // Supporting this case is beyond the scope of my mental health
+                         return Err(DndDataParseError::HostnameSpecified(path_str));
+                     }
+-                    path_str
++                    (PathBuf::from(path_str), false)
++                } else if uri.starts_with("smb://") {
++                    (resolve_smb_uri_to_kio_fuse(uri)?, true)
+                 } else {
+-                    // Only the file protocol is supported
++                    // Only file / smb (via kio-fuse) are supported.
+                     return Err(DndDataParseError::UnexpectedProtocol(uri.to_owned()));
+                 };
+ 
+-                let path = Path::new(&path_str).canonicalize()?;
++                let path = match path.canonicalize() {
++                    Ok(p) => p,
++                    // Soft: keep the kio-fuse path so the app can still assign an offline share path.
++                    Err(_) if soft_canonicalize => path,
++                    Err(e) => return Err(e.into()),
++                };
+                 path_list.push(path);
+             }
+             Ok(path_list)
+@@ -172,3 +178,67 @@
+         }
+     }
+ }
++
++/// Map `smb://[user@]host/share/path` → `/run/user/$UID/kio-fuse-*/smb/host/share/path`.
++///
++/// Plasma Dolphin drags from an SMB view put `smb://` on the XDnD uri-list; stock winit rejected
++/// those and the drop never reached egui. KIO Fuse exposes the same tree under `kio-fuse-*`.
++fn resolve_smb_uri_to_kio_fuse(uri: &str) -> Result<PathBuf, DndDataParseError> {
++    let rest = uri
++        .strip_prefix("smb://")
++        .ok_or_else(|| DndDataParseError::UnexpectedProtocol(uri.to_owned()))?;
++    let rest = percent_decode(rest.as_bytes()).decode_utf8()?.into_owned();
++    // Drop userinfo (`user:pass@host/...`).
++    let hostpath = rest.split_once('@').map(|(_, hp)| hp).unwrap_or(rest.as_str());
++    let (host, rel) = hostpath
++        .split_once('/')
++        .ok_or_else(|| DndDataParseError::UnexpectedProtocol(uri.to_owned()))?;
++    if host.is_empty() {
++        return Err(DndDataParseError::UnexpectedProtocol(uri.to_owned()));
++    }
++    let rel = rel.trim_start_matches('/');
++
++    let uid = unsafe { libc::getuid() };
++    let run_user = PathBuf::from(format!("/run/user/{uid}"));
++    let mut fallback: Option<PathBuf> = None;
++    if let Ok(entries) = std::fs::read_dir(&run_user) {
++        for ent in entries.flatten() {
++            let name = ent.file_name();
++            let Some(name) = name.to_str() else {
++                continue;
++            };
++            if !name.starts_with("kio-fuse-") {
++                continue;
++            }
++            let mut candidate = ent.path();
++            candidate.push("smb");
++            candidate.push(host);
++            for seg in rel.split('/').filter(|s| !s.is_empty()) {
++                candidate.push(seg);
++            }
++            // Prefer a path that already exists (live mount); otherwise keep the first candidate.
++            if candidate.exists() {
++                return Ok(candidate);
++            }
++            if fallback.is_none() {
++                fallback = Some(candidate);
++            }
++        }
++    }
++    fallback.ok_or_else(|| {
++        DndDataParseError::UnresolvablePath(io::Error::new(
++            io::ErrorKind::NotFound,
++            format!("no kio-fuse mount for {uri}"),
++        ))
++    })
++}
++
++#[cfg(test)]
++mod smb_uri_tests {
++    use super::*;
++
++    #[test]
++    fn rejects_non_smb() {
++        assert!(resolve_smb_uri_to_kio_fuse("file:///tmp").is_err());
++    }
++}
