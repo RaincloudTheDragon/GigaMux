@@ -202,7 +202,12 @@ fn alt_held_at_launch() -> bool {
         // High bit set ⇒ key currently down.
         unsafe { GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000 != 0 }
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // XQueryKeymap on DISPLAY (XWayland under Plasma).
+        x11_alt_down()
+    }
+    #[cfg(all(not(windows), not(all(unix, not(target_os = "macos")))))]
     {
         false
     }
@@ -10818,15 +10823,69 @@ fn os_cursor_screen_px() -> Option<(i32, i32)> {
     Some((pt.x, pt.y))
 }
 
-/// XQueryPointer; same role as Win32 GetCursorPos. Session may be Wayland; GigaMux runs XWayland for file DnD (`prefer_x11_for_file_dnd`).
+/// Shared X11 display for launch Alt poll + DnD cursor (XWayland under Plasma).
 #[cfg(all(unix, not(target_os = "macos")))]
-fn os_cursor_screen_px() -> Option<(i32, i32)> {
-    use std::os::raw::{c_int, c_uint, c_ulong, c_void};
+fn x11_display() -> Option<*mut std::ffi::c_void> {
+    use std::os::raw::c_void;
     use std::sync::OnceLock;
 
     #[link(name = "X11")]
     unsafe extern "C" {
         fn XOpenDisplay(name: *const i8) -> *mut c_void;
+    }
+
+    static DPY: OnceLock<usize> = OnceLock::new();
+    let p = *DPY.get_or_init(|| unsafe { XOpenDisplay(std::ptr::null()) as usize });
+    if p == 0 {
+        None
+    } else {
+        Some(p as *mut c_void)
+    }
+}
+
+/// Left/right Alt down via XQueryKeymap (Win32 GetAsyncKeyState equivalent at launch).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn x11_alt_down() -> bool {
+    use std::os::raw::{c_char, c_int, c_uint, c_ulong, c_void};
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XKeysymToKeycode(dpy: *mut c_void, keysym: c_ulong) -> c_uint;
+        fn XQueryKeymap(dpy: *mut c_void, keys_return: *mut c_char);
+    }
+
+    // X11 keysyms: XK_Alt_L / XK_Alt_R.
+    const XK_ALT_L: c_ulong = 0xffe9;
+    const XK_ALT_R: c_ulong = 0xffea;
+
+    let Some(dpy) = x11_display() else {
+        return false;
+    };
+    unsafe {
+        let mut keys = [0i8; 32];
+        XQueryKeymap(dpy, keys.as_mut_ptr());
+        for ks in [XK_ALT_L, XK_ALT_R] {
+            let kc = XKeysymToKeycode(dpy, ks) as c_int;
+            if kc == 0 {
+                continue;
+            }
+            let i = (kc / 8) as usize;
+            let mask = 1i8 << (kc % 8);
+            if i < keys.len() && keys[i] & mask != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// XQueryPointer; same role as Win32 GetCursorPos. Session may be Wayland; GigaMux runs XWayland for file DnD (`prefer_x11_for_file_dnd`).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn os_cursor_screen_px() -> Option<(i32, i32)> {
+    use std::os::raw::{c_int, c_uint, c_ulong, c_void};
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
         fn XDefaultRootWindow(dpy: *mut c_void) -> c_ulong;
         fn XQueryPointer(
             dpy: *mut c_void,
@@ -10841,15 +10900,7 @@ fn os_cursor_screen_px() -> Option<(i32, i32)> {
         ) -> c_int;
     }
 
-    static DPY: OnceLock<usize> = OnceLock::new();
-    let dpy = *DPY.get_or_init(|| {
-        let p = unsafe { XOpenDisplay(std::ptr::null()) };
-        p as usize
-    });
-    if dpy == 0 {
-        return None;
-    }
-    let dpy = dpy as *mut c_void;
+    let dpy = x11_display()?;
     unsafe {
         let root = XDefaultRootWindow(dpy);
         let mut root_ret = 0;
