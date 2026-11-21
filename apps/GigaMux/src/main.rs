@@ -10162,13 +10162,30 @@ impl GigaMuxApp {
                 if !to_delete.is_empty() {
                     let (deleted, failed, trashed, errors) =
                         delete_issue_outputs(&self.prefs.output_dir, &to_delete);
+                    let names: Vec<String> = trashed
+                        .iter()
+                        .map(|p| {
+                            p.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("?")
+                                .to_string()
+                        })
+                        .collect();
                     self.push_undo_step(UndoStep::Delete(DeleteUndoBatch {
                         side: FileSide::Output,
                         paths: trashed,
                     }));
-                    self.push_session(format!(
-                        "Recycle Bin: {deleted} output(s); failed {failed}"
-                    ));
+                    // Name what left disk; count-only lines made re-queues look like no-ops.
+                    if names.is_empty() {
+                        self.push_session(format!(
+                            "Recycle Bin: {deleted} output(s); failed {failed}"
+                        ));
+                    } else {
+                        self.push_session(format!(
+                            "Recycle Bin: {deleted} output(s) [{}]; failed {failed}",
+                            names.join(", ")
+                        ));
+                    }
                     // Same surface as active → delete (locked file / access denied must not be silent).
                     for e in &errors {
                         self.push_session(e.clone());
