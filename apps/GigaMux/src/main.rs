@@ -148,7 +148,8 @@ impl EncodeProgress {
 fn main() -> eframe::Result<()> {
     // Adobe-style: Alt held while launching → ask to purge prefs (before the window eats focus).
     let ask_purge_prefs = alt_held_at_launch();
-    let force_x11 = prefer_x11_for_file_dnd();
+    // Wayland-first. Opt into XWayland (file DnD / smb patch) with GIGAMUX_X11=1 when needed.
+    let force_x11 = prefer_x11_backend();
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 700.0])
@@ -157,7 +158,6 @@ fn main() -> eframe::Result<()> {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    // Pin X11 so the patched smb:// → kio-fuse XDnD parser actually runs (Wayland has no DnD in winit 0.30).
     #[cfg(all(unix, not(target_os = "macos")))]
     if force_x11 {
         use winit::platform::x11::EventLoopBuilderExtX11;
@@ -172,10 +172,10 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// winit 0.30 has no Wayland file DnD. Clear Wayland env + return true so main pins `with_x11()`. Opt out with `GIGAMUX_WAYLAND=1`.
+/// Opt-in X11/XWayland (`GIGAMUX_X11=1`) for stock winit file DnD. Default: native Wayland.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn prefer_x11_for_file_dnd() -> bool {
-    if std::env::var_os("GIGAMUX_WAYLAND").is_some() {
+fn prefer_x11_backend() -> bool {
+    if std::env::var_os("GIGAMUX_X11").is_none() {
         return false;
     }
     if std::env::var_os("DISPLAY").is_none() {
@@ -190,7 +190,7 @@ fn prefer_x11_for_file_dnd() -> bool {
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-fn prefer_x11_for_file_dnd() -> bool {
+fn prefer_x11_backend() -> bool {
     false
 }
 
@@ -10879,7 +10879,7 @@ fn x11_alt_down() -> bool {
     false
 }
 
-/// XQueryPointer; same role as Win32 GetCursorPos. Session may be Wayland; GigaMux runs XWayland for file DnD (`prefer_x11_for_file_dnd`).
+/// XQueryPointer; same role as Win32 GetCursorPos. Used when DISPLAY is available (optional X11 DnD path).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn os_cursor_screen_px() -> Option<(i32, i32)> {
     use std::os::raw::{c_int, c_uint, c_ulong, c_void};

@@ -18,7 +18,7 @@ rfd = { workspace = true }
 chrono = { workspace = true }
 # Parent rfd dialogs to the eframe window (`HasWindowHandle` / `HasDisplayHandle`).
 raw-window-handle = "0.6"
-# Force X11 event loop so the patched smb:// XDnD path runs (winit 0.30 has no Wayland DnD).
+# Optional `GIGAMUX_X11=1` pins the X11 backend (file DnD); Wayland is the default.
 winit = { version = "0.30", default-features = false, features = ["x11"] }
 # Decode bundled Flamenco mark for the Farm toolbar button.
 image = { version = "0.25", default-features = false, features = ["png"] }

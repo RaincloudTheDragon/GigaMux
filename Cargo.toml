@@ -26,7 +26,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 flate2 = "1"
 trash = "5"
 
-# Dolphin smb:// XDnD: stock winit only allows file://. Commit is patches/winit+VERSION.patch only; run ./scripts/ensure-winit-patch.sh once after clone/clean (CI does this) so target/patch/winit-VERSION exists.
-# Dependabot still bumps winit via the lockfile; refresh the .patch + this path when the version changes.
+# Dolphin smb:// XDnD (X11): stock winit only allows file://. patches/winit+VERSION.patch + ensure-winit-patch.sh after clone/clean.
+# App defaults to Wayland; GIGAMUX_X11=1 when you need that DnD path. Refresh .patch + path when winit bumps.
 [patch.crates-io]
 winit = { path = "target/patch/winit-0.30.13" }
