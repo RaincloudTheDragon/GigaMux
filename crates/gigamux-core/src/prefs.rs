@@ -498,7 +498,9 @@ pub fn load_session_log(max_lines: usize) -> Vec<String> {
 }
 
 /// Append one session-log line (creates logs dir / file as needed).
+/// Also mirrors to stderr so `cargo run` / a console host shows the same transcript as the UI pane.
 pub fn append_session_log(line: &str) -> Result<(), String> {
+    eprintln!("{line}");
     let dir = ensure_logs_dir()?;
     let path = dir.join("session.log");
     use std::io::Write;
