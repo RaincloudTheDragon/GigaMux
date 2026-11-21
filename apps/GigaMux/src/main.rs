@@ -957,6 +957,8 @@ struct PurgePrompt {
     job_logs: bool,
     /// One-shot: delete orphan `{deliver}.vmaf.json` / part sidecars in the output folder.
     unused_vmaf: bool,
+    /// Blender-style paint-drag: `Some(on)` while LMB is held after toggling a row.
+    checkbox_paint: Option<bool>,
 }
 
 impl Default for PurgePrompt {
@@ -972,6 +974,7 @@ impl Default for PurgePrompt {
             file_logs: false,
             job_logs: false,
             unused_vmaf: true,
+            checkbox_paint: None,
         }
     }
 }
@@ -9171,21 +9174,68 @@ impl GigaMuxApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label("Alt was held at launch. Choose what to reset:");
+                ui.label(
+                    egui::RichText::new("Click and drag across rows to paint on/off (Blender-style).")
+                        .small()
+                        .weak(),
+                );
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Preferences").strong().small());
-                ui.checkbox(&mut prompt.folders, "Folders (input / output)");
-                ui.checkbox(&mut prompt.targets, "Encode targets (codec / container)");
-                ui.checkbox(&mut prompt.hardware, "Hardware / GPU");
-                ui.checkbox(&mut prompt.bitrate, "Bitrate ceiling options");
-                ui.checkbox(&mut prompt.misc, "OBS metadata + delete warnings");
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
+                    &mut prompt.folders,
+                    "Folders (input / output)",
+                );
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
+                    &mut prompt.targets,
+                    "Encode targets (codec / container)",
+                );
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
+                    &mut prompt.hardware,
+                    "Hardware / GPU",
+                );
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
+                    &mut prompt.bitrate,
+                    "Bitrate ceiling options",
+                );
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
+                    &mut prompt.misc,
+                    "OBS metadata + delete warnings",
+                );
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Logs").strong().small());
-                ui.checkbox(&mut prompt.session_log, "Session log");
-                ui.checkbox(&mut prompt.file_logs, "Per-file logs (this session)");
-                ui.checkbox(&mut prompt.job_logs, "Job logs (encode + VMAF .log.gz)");
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
+                    &mut prompt.session_log,
+                    "Session log",
+                );
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
+                    &mut prompt.file_logs,
+                    "Per-file logs (this session)",
+                );
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
+                    &mut prompt.job_logs,
+                    "Job logs (encode + VMAF .log.gz)",
+                );
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Output").strong().small());
-                ui.checkbox(
+                checkbox_paint_drag(
+                    ui,
+                    &mut prompt.checkbox_paint,
                     &mut prompt.unused_vmaf,
                     "Unused VMAF sidecars (deliver missing)",
                 )
@@ -10802,6 +10852,36 @@ fn play_job_done_chime() {
         // Terminal bell as a light fallback elsewhere.
         eprint!("\x07");
     }
+}
+
+/// Blender-style checkbox: click toggles, then drag across neighbors paints that on/off value.
+fn checkbox_paint_drag(
+    ui: &mut egui::Ui,
+    paint: &mut Option<bool>,
+    checked: &mut bool,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let response = ui.checkbox(checked, text);
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    let over = response.hovered() || response.contains_pointer();
+    // Re-assert paint value before clearing on release (undoes a release-click toggle on the last row).
+    if let Some(to) = *paint {
+        if over {
+            *checked = to;
+        }
+    }
+    if !primary_down {
+        *paint = None;
+        return response;
+    }
+    if over && paint.is_none() && (response.clicked() || response.is_pointer_button_down_on()) {
+        // Stroke starts here; toggle on press if the checkbox hasn't clicked yet this frame.
+        if !response.clicked() {
+            *checked = !*checked;
+        }
+        *paint = Some(*checked);
+    }
+    response
 }
 
 /// Screen cursor → egui viewport coordinates when egui's pointer is dead during OS DnD.
