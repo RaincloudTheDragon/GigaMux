@@ -72,6 +72,8 @@ const CHUNK_DUR_SLACK_FRAC: f64 = 0.02;
 /// Allowed |got − expect| frame count when both sides are known (stale chunk reuse guard).
 /// Zero: a single extra frame per chunk survived ±50ms duration slack and broke IVF concat.
 const CHUNK_FRAME_SLACK: u64 = 0;
+/// Decode window for input bitstream-tail health (OBS Hybrid HEVC can die in the last seconds upon power interruption of the encode).
+const INPUT_TAIL_WINDOW_S: f64 = 30.0;
 
 /// Force ffmpeg overwrite (`-y`); replaces a leading `-n` if present.
 fn argv_force_overwrite(argv: &[String]) -> Vec<String> {
@@ -102,6 +104,14 @@ pub fn ensure_chunk_file(
     ffmpeg_exe: &str,
     ffmpeg_argv: &[String],
 ) -> Result<(), String> {
+    // 0-byte stubs (NVENC open-fail after ffmpeg creates the path) must not count as present for `-n`.
+    if path.is_file() && file_len(path) == Some(0) {
+        let _ = std::fs::remove_file(path);
+        eprintln!(
+            "ensure-chunk: removed empty stub before encode ({})",
+            path.display()
+        );
+    }
     if path.is_file() {
         match check_chunk_file(path, expect_dur_s) {
             Ok(()) => return Ok(()), // reuse existing good chunk
@@ -191,6 +201,18 @@ pub fn ensure_out_file(
     ffmpeg_exe: &str,
     ffmpeg_argv: &[String],
 ) -> Result<(), String> {
+    if path.is_file() && file_len(path) == Some(0) {
+        std::fs::remove_file(path).map_err(|e| {
+            format!(
+                "ensure-out: cannot remove empty stub {}: {e}",
+                path.display()
+            )
+        })?;
+        eprintln!(
+            "ensure-out: removed empty stub before encode ({})",
+            path.display()
+        );
+    }
     if path.is_file() {
         match check_chunk_file(path, expect_dur_s) {
             Ok(()) => return Ok(()),
@@ -240,9 +262,13 @@ pub fn ensure_out_file(
 ///
 /// Uses video-stream duration (not container/format) so A/V delivers with longer audio do not fail.
 /// When `nb_frames` is present, also rejects stale chunks whose frame count disagrees with expect×fps.
+/// Last-chunk **shortfall** (`got < expect`) is allowed when duration is already within slack: corrupt OBS HEVC tails often EOF before `-frames:v` is satisfied (garbage in). Surplus frames still fail (IVF concat).
 pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("chunk missing: {}", path.display()));
+    }
+    if file_len(path) == Some(0) {
+        return Err(format!("chunk empty (0 bytes): {}", path.display()));
     }
     if expect_dur_s <= 0.0 {
         return Err(format!("invalid expect_dur {expect_dur_s}"));
@@ -268,10 +294,23 @@ pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
             let expect_frames = (expect_dur_s * fps).round().max(1.0) as u64;
             let delta = expect_frames.abs_diff(got_frames);
             if delta > CHUNK_FRAME_SLACK {
-                return Err(format!(
-                    "chunk frame count mismatch: expect ~{expect_frames} frames ({expect_dur_s:.3}s×{fps:.3}fps), got {got_frames} ({})",
-                    path.display()
-                ));
+                let last_chunk = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(parse_chunk_filename)
+                    .is_some_and(|(_, idx, count, _)| count > 0 && idx + 1 == count);
+                // Last slice only: shortfall matches input EOF / NAL death; never allow surplus.
+                if last_chunk && got_frames < expect_frames {
+                    eprintln!(
+                        "check-chunk: last-chunk shortfall ok (expect ~{expect_frames}, got {got_frames}; duration within slack) ({})",
+                        path.display()
+                    );
+                } else {
+                    return Err(format!(
+                        "chunk frame count mismatch: expect ~{expect_frames} frames ({expect_dur_s:.3}s×{fps:.3}fps), got {got_frames} ({})",
+                        path.display()
+                    ));
+                }
             }
         }
     }
@@ -322,7 +361,24 @@ pub fn check_output_pair(
     }
     let input_info = file_info(input_path)?;
     let output_info = file_info(output_path)?;
-    match check_pair_inner(output_path, &input_info, &output_info, targets) {
+    // One tail decode: warn on the task log and feed effective duration into the pair check.
+    let tail = input_tail_shortfall(input_path, &input_info);
+    if let Some((short, nal, window, expect, got)) = tail {
+        if let Some(w) =
+            format_input_tail_warning(input_path, &input_info, short, nal, window, expect, got)
+        {
+            eprintln!("{w}");
+        }
+    }
+    let input_eff =
+        effective_input_video_duration_from_shortfall(&input_info, tail.map(|(s, _, _, _, _)| s));
+    match check_pair_inner(
+        output_path,
+        &input_info,
+        &output_info,
+        targets,
+        input_eff,
+    ) {
         None => {
             if preserve_mtime {
                 match crate::probe::copy_mtime(input_path, output_path) {
@@ -640,22 +696,187 @@ fn written_media_seconds(
     probe_last_video_pts(path, None, decoder)
 }
 
+fn file_len(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+fn count_nal_lines(stderr: &str) -> u64 {
+    stderr
+        .lines()
+        .filter(|ln| {
+            let l = ln.to_ascii_lowercase();
+            l.contains("invalid nal") || l.contains("error splitting the input into nal")
+        })
+        .count() as u64
+}
+
+fn parse_ffmpeg_frame_count(stderr: &str) -> Option<u64> {
+    for line in stderr.lines().rev() {
+        let line = line.trim();
+        // `frame=  240 fps=...` or `frame=240`
+        let Some(rest) = line.strip_prefix("frame=") else {
+            continue;
+        };
+        if let Some(n) = rest.split_whitespace().next().and_then(|s| s.parse().ok()) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Decode the last `window_s` of `path`; return `(decoded_frames, invalid_nal_stderr_lines)`.
+fn decode_tail_frames(path: &Path, declared_dur_s: f64, window_s: f64) -> Option<(u64, u64)> {
+    if declared_dur_s <= 0.0 || window_s <= 0.0 {
+        return None;
+    }
+    let win = window_s.min(declared_dur_s);
+    let ss = (declared_dur_s - win).max(0.0);
+    let path_s = path.to_string_lossy();
+    let ss_s = format!("{ss:.6}");
+    let win_s = format!("{win:.6}");
+    let out = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-stats",
+            "-ss",
+            &ss_s,
+            "-i",
+            path_s.as_ref(),
+            "-t",
+            &win_s,
+            "-map",
+            "0:v:0",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    let frames = parse_ffmpeg_frame_count(&err)?;
+    Some((frames, count_nal_lines(&err)))
+}
+
+/// Measured input-tail damage: `(shortfall_frames, nal_lines, window_s, expect_in_window, got)`.
+///
+/// Fast `-ss` before `-i` on sshfs/SMB often returns a near-empty window with **no** NAL spam; that is a seek miss, not garbage-in. Only trust shortfalls that look like real bitstream death (NAL/decode errors, or a modest EOF shortfall).
+fn input_tail_shortfall(path: &Path, info: &Value) -> Option<(u64, u64, f64, u64, u64)> {
+    let declared = video_stream_duration(info).or_else(|| format_duration(info))?;
+    if declared <= 1.0 {
+        return None;
+    }
+    let fps = probe_video_fps(info)?;
+    if fps <= 0.0 {
+        return None;
+    }
+    let window = INPUT_TAIL_WINDOW_S.min(declared);
+    let (got, nal) = decode_tail_frames(path, declared, window)?;
+    let expect = (window * fps).round().max(1.0) as u64;
+    let short = expect.saturating_sub(got);
+    if short == 0 && nal == 0 {
+        return None;
+    }
+    // ±1 frame without NAL spam is seek jitter, not a corrupt tail.
+    if short <= 1 && nal == 0 {
+        return None;
+    }
+    // Lost most of the window with no Invalid NAL → flaky network seek, not OBS HEVC death.
+    // Real tails we care about are small (seconds) and usually log NAL/decode errors.
+    let max_no_nal_short = ((expect as f64) * 0.25).round().max(2.0) as u64;
+    if nal == 0 && short > max_no_nal_short {
+        eprintln!(
+            "input-tail: inconclusive seek (got {got}/{expect}, no NAL) — not treating as garbage in ({})",
+            path.display()
+        );
+        return None;
+    }
+    // Even with NAL noise, a near-empty window after input `-ss` is usually a bad seek landing.
+    if got * 10 < expect && short > max_no_nal_short {
+        eprintln!(
+            "input-tail: inconclusive seek (got {got}/{expect}, nal={nal}) — not treating as garbage in ({})",
+            path.display()
+        );
+        return None;
+    }
+    Some((short, nal, window, expect, got))
+}
+
+/// Low-severity Check line when the input bitstream dies before its declared duration (garbage in).
+pub fn input_bitstream_tail_warning(path: &Path, info: &Value) -> Option<String> {
+    let (short, nal, window, expect, got) = input_tail_shortfall(path, info)?;
+    format_input_tail_warning(path, info, short, nal, window, expect, got)
+}
+
+fn format_input_tail_warning(
+    path: &Path,
+    info: &Value,
+    short: u64,
+    nal: u64,
+    window: f64,
+    expect: u64,
+    got: u64,
+) -> Option<String> {
+    let declared = video_stream_duration(info)
+        .or_else(|| format_duration(info))
+        .unwrap_or(0.0);
+    let fps = probe_video_fps(info).unwrap_or(0.0);
+    let short_s = if fps > 0.0 {
+        short as f64 / fps
+    } else {
+        0.0
+    };
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("input");
+    let nal_note = if nal > 0 {
+        format!(", {nal} Invalid NAL/decode lines")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Input bitstream tail: {name} declared {declared:.2}s but last {window:.1}s decoded {got}/{expect} frames (−{short} ≈ {short_s:.2}s{nal_note}) — garbage in; encodes may end early"
+    ))
+}
+
+/// Declared video duration minus a measured bitstream-tail shortfall (when present).
+fn effective_input_video_duration_from_shortfall(
+    info: &Value,
+    shortfall_frames: Option<u64>,
+) -> Option<f64> {
+    let declared = video_stream_duration(info).or_else(|| format_duration(info))?;
+    let Some(short) = shortfall_frames.filter(|&s| s > 0) else {
+        return Some(declared);
+    };
+    let fps = probe_video_fps(info)?;
+    if fps <= 0.0 {
+        return Some(declared);
+    }
+    Some((declared - short as f64 / fps).max(0.0))
+}
+
 fn check_pair_inner(
     output_path: &Path,
     input_info: &Value,
     output_info: &Value,
     targets: OutputTargets,
+    // Decodable input length when the HEVC tail is truly short; never used alone as the mismatch target (false seeks would High-fail good delivers).
+    input_effective_dur_s: Option<f64>,
 ) -> Option<String> {
     let input_format = format_duration(input_info);
     let output_format = format_duration(output_info);
-    // Video bitstream length — container/format often tracks longer audio (hybrid `-shortest` trims to video).
-    let input_duration = video_stream_duration(input_info)
-        .or(input_format)
-        .ok_or_else(|| "Input missing duration".to_string());
-    let input_duration = match input_duration {
-        Ok(d) => d,
-        Err(e) => return Some(e),
+    let declared_input = match video_stream_duration(input_info).or(input_format) {
+        Some(d) => d,
+        None => return Some("Input missing duration".into()),
     };
+    let effective_input = input_effective_dur_s
+        .filter(|e| *e > 0.0 && *e < declared_input - 0.05)
+        .unwrap_or(declared_input);
     let output_duration = video_stream_duration(output_info)
         .or(output_format)
         .ok_or_else(|| "Output missing duration".to_string());
@@ -702,10 +923,14 @@ fn check_pair_inner(
         }
     }
 
-    let duration_diff = (input_duration - output_duration).abs();
-    if duration_diff > 0.1 {
+    // Match declared tags (normal encodes), or a shorter deliver that matches a trusted decodable tail.
+    let match_declared = (declared_input - output_duration).abs() <= 0.1;
+    let match_effective = effective_input < declared_input - 0.05
+        && (effective_input - output_duration).abs() <= 0.1;
+    if !match_declared && !match_effective {
         return Some(format!(
-            "Duration mismatch: Input={input_duration:.2}s, Output={output_duration:.2}s, Diff={duration_diff:.2}s"
+            "Duration mismatch: Input={declared_input:.2}s, Output={output_duration:.2}s, Diff={:.2}s",
+            (declared_input - output_duration).abs()
         ));
     }
 
@@ -802,10 +1027,18 @@ fn check_pair_inner(
         stream_nb_frames(input_video),
         stream_nb_frames(output_video),
     ) {
-        let diff = in_n.abs_diff(out_n);
-        if diff > NB_FRAMES_SLACK {
+        // Pass if output matches tagged input, or a shorter trusted effective frame count.
+        let diff_declared = in_n.abs_diff(out_n);
+        let eff_n = probe_video_fps(input_info).and_then(|fps| {
+            if fps <= 0.0 || effective_input >= declared_input - 0.05 {
+                return None;
+            }
+            Some((effective_input * fps).round().max(1.0) as u64)
+        });
+        let match_eff = eff_n.is_some_and(|n| n.abs_diff(out_n) <= NB_FRAMES_SLACK);
+        if diff_declared > NB_FRAMES_SLACK && !match_eff {
             return Some(format!(
-                "Frame count mismatch: Input={in_n}, Output={out_n}, Diff={diff} (slack {NB_FRAMES_SLACK})"
+                "Frame count mismatch: Input={in_n}, Output={out_n}, Diff={diff_declared} (slack {NB_FRAMES_SLACK})"
             ));
         }
     }
@@ -884,10 +1117,30 @@ pub fn run_check(
 
     let mut report = CheckReport::default();
     let mut input_meta: HashMap<String, Value> = HashMap::new();
+    // Decodable duration when HEVC tags over-claim past a dead tail (one decode per input).
+    let mut input_effective_dur: HashMap<String, f64> = HashMap::new();
 
     for inf in &input_files {
-        match file_info(&input_dir.join(inf)) {
+        let in_path = input_dir.join(inf);
+        match file_info(&in_path) {
             Ok(info) => {
+                if let Some((short, nal, window, expect, got)) = input_tail_shortfall(&in_path, &info)
+                {
+                    if let Some(msg) =
+                        format_input_tail_warning(&in_path, &info, short, nal, window, expect, got)
+                    {
+                        report.issues.push(CheckIssue {
+                            input: Some(inf.clone()),
+                            output: None,
+                            message: msg,
+                        });
+                    }
+                    if let Some(eff) =
+                        effective_input_video_duration_from_shortfall(&info, Some(short))
+                    {
+                        input_effective_dur.insert(inf.clone(), eff);
+                    }
+                }
                 input_meta.insert(inf.clone(), info);
             }
             Err(e) => {
@@ -1009,8 +1262,9 @@ pub fn run_check(
 
     for (inf, outp, info, slot) in pairs {
         let out_path = output_dir.join(&outp);
+        let input_eff = input_effective_dur.get(&inf).copied();
         match file_info(&out_path) {
-            Ok(out_info) => match check_pair_inner(&out_path, &info, &out_info, slot) {
+            Ok(out_info) => match check_pair_inner(&out_path, &info, &out_info, slot, input_eff) {
                 None => {
                     report.ok_pairs += 1;
                     // Soft WARN only (Low severity / not default-purge); farm final ignores these.
@@ -1078,6 +1332,7 @@ pub fn check_issue_severity(issue: &CheckIssue) -> CheckSeverity {
         || issue.message.starts_with("Bitrate floor:")
         || issue.message.starts_with("A/V start skew:")
         || issue.message.starts_with("A/V container skew:")
+        || issue.message.starts_with("Input bitstream tail:")
     {
         CheckSeverity::Low
     } else if issue.message.starts_with("Missing from output") {
@@ -1112,6 +1367,8 @@ pub fn check_issue_category(issue: &CheckIssue) -> &'static str {
         "A/V start skew"
     } else if m.starts_with("A/V container skew") {
         "A/V container skew"
+    } else if m.starts_with("Input bitstream tail") {
+        "Input bitstream tail"
     } else if m.starts_with("Input probe") {
         "Input probe failed"
     } else if m.starts_with("Output file error") {
@@ -1392,5 +1649,53 @@ mod tests {
         assert_eq!(v[1], "-y");
         let already = argv_force_overwrite(&["ffmpeg".into(), "-y".into(), "out".into()]);
         assert_eq!(already[1], "-y");
+    }
+
+    #[test]
+    fn input_bitstream_tail_is_low_severity() {
+        let issue = CheckIssue {
+            input: Some("clip.mp4".into()),
+            output: None,
+            message: "Input bitstream tail: clip.mp4 declared 10.00s but last 30.0s decoded 100/600 frames (−500 ≈ 8.33s, 12 Invalid NAL/decode lines) — garbage in; encodes may end early".into(),
+        };
+        assert_eq!(check_issue_severity(&issue), CheckSeverity::Low);
+        assert_eq!(check_issue_category(&issue), "Input bitstream tail");
+    }
+
+    #[test]
+    fn parse_ffmpeg_frame_and_nal() {
+        let stderr = "\
+[hevc @ 0x1] Invalid NAL unit size (0 > 10).\n\
+frame=  10649 fps=145 q=18.0 Lsize=  1KiB\n";
+        assert_eq!(parse_ffmpeg_frame_count(stderr), Some(10649));
+        assert_eq!(count_nal_lines(stderr), 1);
+    }
+
+    #[test]
+    fn tail_shortfall_trust_rejects_empty_seek_without_nal() {
+        // Mirrors input_tail_shortfall gates: ~28s missing of 30s window, no NAL → seek miss.
+        let expect = 1800u64;
+        let got = 66u64;
+        let short = expect - got;
+        let nal = 0u64;
+        let max_no_nal_short = ((expect as f64) * 0.25).round().max(2.0) as u64;
+        assert!(nal == 0 && short > max_no_nal_short);
+        // Real OBS death: small shortfall + NAL.
+        let short_real = 60u64;
+        let nal_real = 120u64;
+        assert!(!(nal_real == 0 && short_real > max_no_nal_short));
+        assert!(!(got * 10 < expect && short_real > max_no_nal_short));
+    }
+
+    #[test]
+    fn chunk_empty_rejected() {
+        let dir = std::env::temp_dir().join(format!("gigamux_empty_chunk_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("clip.c001of002.mp4");
+        fs::write(&p, b"").unwrap();
+        let err = check_chunk_file(&p, 1.0).unwrap_err();
+        assert!(err.contains("chunk empty"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

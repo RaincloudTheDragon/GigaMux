@@ -17,10 +17,10 @@ pub mod webm_alpha;
 pub use check::{
     check_chunk_file, check_issue_category, check_issue_severity, check_output_pair,
     cleanup_farm_intermediates, deletable_issues, delete_issue_outputs, ensure_chunk_file,
-    ensure_out_file, promote_out_file, integrity_blocked_outputs, is_codec_mismatch_issue,
-    is_orphan_output_issue,
-    issue_has_deletable_output, list_media, permanent_delete_file, restore_trashed_file, run_check,
-    trash_file, CheckIssue, CheckReport, CheckSeverity,
+    ensure_out_file, input_bitstream_tail_warning, promote_out_file, integrity_blocked_outputs,
+    is_codec_mismatch_issue, is_orphan_output_issue, issue_has_deletable_output, list_media,
+    permanent_delete_file, restore_trashed_file, run_check, trash_file, CheckIssue, CheckReport,
+    CheckSeverity,
 };
 pub use chunk::{
     chunk_time_range, estimate_total_frames, farm_auto_chunks, hybrid_plane_mate,
