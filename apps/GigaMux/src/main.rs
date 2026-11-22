@@ -148,9 +148,16 @@ impl EncodeProgress {
 fn main() -> eframe::Result<()> {
     // Adobe-style: Alt held while launching → ask to purge prefs (before the window eats focus).
     let ask_purge_prefs = alt_held_at_launch();
-    // Wayland-first. Opt into XWayland (file DnD / smb patch) with GIGAMUX_X11=1 when needed.
-    let force_x11 = prefer_x11_backend();
-    let mut options = eframe::NativeOptions {
+    eframe::run_native(
+        "GigaMux",
+        native_options(),
+        Box::new(move |_cc| Ok(Box::new(GigaMuxApp::new(ask_purge_prefs)))),
+    )
+}
+
+/// Viewport + DnD defaults; Unix may force X11 when `GIGAMUX_X11=1` (Wayland-first otherwise).
+fn native_options() -> eframe::NativeOptions {
+    let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 700.0])
             .with_title("GigaMux")
@@ -158,18 +165,22 @@ fn main() -> eframe::Result<()> {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if force_x11 {
-        use winit::platform::x11::EventLoopBuilderExtX11;
-        options.event_loop_builder = Some(Box::new(|b| {
-            b.with_x11();
-        }));
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        options
     }
-    eframe::run_native(
-        "GigaMux",
-        options,
-        Box::new(move |_cc| Ok(Box::new(GigaMuxApp::new(ask_purge_prefs)))),
-    )
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Wayland-first. Opt into XWayland (file DnD / smb patch) with GIGAMUX_X11=1 when needed.
+        let mut options = options;
+        if prefer_x11_backend() {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            options.event_loop_builder = Some(Box::new(|b| {
+                b.with_x11();
+            }));
+        }
+        options
+    }
 }
 
 /// Opt-in X11/XWayland (`GIGAMUX_X11=1`) for stock winit file DnD. Default: native Wayland.
@@ -187,11 +198,6 @@ fn prefer_x11_backend() -> bool {
         std::env::remove_var("EGL_PLATFORM");
     }
     true
-}
-
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn prefer_x11_backend() -> bool {
-    false
 }
 
 /// True when Alt/Option is down at process start (prefs-purge offer).
