@@ -629,6 +629,8 @@ struct GigaMuxApp {
     vmaf_purge_on_next_lists: bool,
     /// Next spawned list scan should ask `start_preview_cache` for chips-only enrich (idle cadence).
     lists_idle_pending: bool,
+    /// Esc while idle: chips only until F5 / Ctrl+F5 clears this (peeks/thumbs deferred).
+    preview_enrich_deferred: bool,
     /// Reachability from the last completed scan (never call share `is_dir` on the UI thread).
     input_dir_ok: bool,
     output_dir_ok: bool,
@@ -1095,6 +1097,7 @@ impl GigaMuxApp {
             mtime_refresh_on_next_lists: false,
             vmaf_purge_on_next_lists,
             lists_idle_pending: false,
+            preview_enrich_deferred: false,
             input_dir_ok,
             output_dir_ok,
             dialog_parent: None,
@@ -1897,10 +1900,24 @@ impl GigaMuxApp {
         }
     }
 
+    /// Farm chunk intermediates: chips only when `skip_chunk_preview_enrich`; peek/thumb over sshfs starves delivers.
+    fn preview_key_is_farm_chunk(key: &str) -> bool {
+        key.strip_prefix("o:")
+            .is_some_and(|name| is_chunk_filename(name))
+    }
+
+    /// Esc while idle: stop peek/thumb workers; chips stay; F5 resumes.
+    fn defer_preview_enrich(&mut self) {
+        self.preview_enrich_deferred = true;
+        self.cache_gen.fetch_add(1, Ordering::Relaxed);
+        self.push_session("preview enrich deferred (Esc); F5 to resume peeks/thumbs");
+    }
+
     /// Drop stale cache entries; fast-probe chips in parallel, then enrich peeks + thumbs.
     /// During local VMAF, only chip-index new/changed files (defer peeks/thumbs until the job ends).
     fn start_preview_cache(&mut self) {
         let refresh_mtime = std::mem::take(&mut self.mtime_refresh_on_next_lists);
+        // Inputs first so list selection / Flamenco targets get peeks before chunk leftovers.
         let mut jobs: Vec<(String, PathBuf)> = Vec::new();
         for (side, files, dir) in [
             (FileSide::Input, &self.input_files, &self.prefs.input_dir),
@@ -1920,23 +1937,41 @@ impl GigaMuxApp {
             .retain(|k, _| key_set.contains(k) || parked.contains(k));
 
         // Full probe vs enrich-only (disk hit with chips but missing peeks/thumb).
-        // Idle list cadence: chips for new/stale only; skip bitrate enrich + thumbs this pass.
-        let defer_enrich =
-            self.vmaf_job_active() || std::mem::take(&mut self.lists_idle_pending);
+        // Idle list cadence / Esc / VMAF: chips for new/stale only; skip bitrate enrich + thumbs this pass.
+        let defer_enrich = self.vmaf_job_active()
+            || std::mem::take(&mut self.lists_idle_pending)
+            || self.preview_enrich_deferred;
+        let skip_chunk_enrich = self.prefs.skip_chunk_preview_enrich;
         let mut to_fast = VecDeque::new();
-        let mut to_enrich = VecDeque::new();
+        let mut to_enrich_in = VecDeque::new();
+        let mut to_enrich_out = VecDeque::new();
         let mut to_mtime = VecDeque::new();
         for (key, path) in jobs {
+            let skip_chunk =
+                skip_chunk_enrich && Self::preview_key_is_farm_chunk(&key);
             if let Some(e) = self.preview_cache.get(&key) {
                 if e.fresh_for_ui(&path) {
                     // Manual F5: cheap fingerprint so center-column mtime isn't sticky after farm preserve.
                     if refresh_mtime {
                         to_mtime.push_back((key.clone(), path.clone()));
                     }
+                    // Chunks (pref): clear the rate-chip spinner without share I/O (tagged avg is enough).
+                    if skip_chunk {
+                        if !e.bitrates_ready {
+                            if let Some(e) = self.preview_cache.get_mut(&key) {
+                                e.bitrates_ready = true;
+                            }
+                        }
+                        continue;
+                    }
                     let need_rates = !e.bitrates_ready;
                     let need_thumb = e.thumb.is_none();
                     if !defer_enrich && (need_rates || need_thumb) {
-                        to_enrich.push_back((key, path, need_rates, need_thumb));
+                        if key.starts_with("i:") {
+                            to_enrich_in.push_back((key, path, need_rates, need_thumb));
+                        } else {
+                            to_enrich_out.push_back((key, path, need_rates, need_thumb));
+                        }
                     }
                     continue;
                 }
@@ -1950,6 +1985,8 @@ impl GigaMuxApp {
             }
             to_fast.push_back((key, path));
         }
+        let mut to_enrich = to_enrich_in;
+        to_enrich.append(&mut to_enrich_out);
         if to_fast.is_empty() && to_enrich.is_empty() && to_mtime.is_empty() {
             return;
         }
@@ -1988,19 +2025,34 @@ impl GigaMuxApp {
                         {
                             break;
                         }
-                        // During VMAF: chips only; peeks/thumbs wait so libvmaf keeps ffmpeg.
+                        let skip_chunk = skip_chunk_enrich
+                            && name
+                                .strip_prefix("o:")
+                                .is_some_and(|n| is_chunk_filename(n));
+                        // During VMAF / Esc defer: chips only; peeks/thumbs wait.
+                        // Chunks (pref): accept tagged avg as "ready"; no packet walk / thumb on the share.
                         if !defer_enrich {
                             if let Ok(mut s) = summary {
-                                enrich_summary_bitrates(&path, &mut s);
-                                let _ = tx.send(PreviewMsg::Bitrates {
-                                    gen,
-                                    name: name.clone(),
-                                    peak_video_kbps: s.peak_video_kbps,
-                                    avg_video_kbps: s.avg_video_kbps,
-                                    peak_audio_kbps: s.peak_audio_kbps,
-                                });
-                                let thumb = thumbnail_rgba(&path, s.duration_s);
-                                let _ = tx.send(PreviewMsg::Thumb { gen, name, thumb });
+                                if skip_chunk {
+                                    let _ = tx.send(PreviewMsg::Bitrates {
+                                        gen,
+                                        name,
+                                        peak_video_kbps: s.peak_video_kbps,
+                                        avg_video_kbps: s.avg_video_kbps,
+                                        peak_audio_kbps: s.peak_audio_kbps,
+                                    });
+                                } else {
+                                    enrich_summary_bitrates(&path, &mut s);
+                                    let _ = tx.send(PreviewMsg::Bitrates {
+                                        gen,
+                                        name: name.clone(),
+                                        peak_video_kbps: s.peak_video_kbps,
+                                        avg_video_kbps: s.avg_video_kbps,
+                                        peak_audio_kbps: s.peak_audio_kbps,
+                                    });
+                                    let thumb = thumbnail_rgba(&path, s.duration_s);
+                                    let _ = tx.send(PreviewMsg::Thumb { gen, name, thumb });
+                                }
                             }
                         }
                         continue;
@@ -5564,12 +5616,14 @@ impl GigaMuxApp {
         // F5 = re-index files (keep meta/thumb cache) + refresh filesystem mtimes; Ctrl+F5 = wipe cache then re-index.
         // Safe during local VMAF: lists + chip index only (peeks deferred); don't Shutter-pause ffmpeg.
         if ctrl_f5 {
+            self.preview_enrich_deferred = false;
             self.mtime_refresh_on_next_lists = false;
             self.clear_preview_cache();
             self.request_refresh_lists();
             self.last_system_idle_ms = 0;
             self.push_session("cleared preview cache; reloaded file lists");
         } else if f5 {
+            self.preview_enrich_deferred = false;
             self.mtime_refresh_on_next_lists = true;
             self.request_refresh_lists();
             self.last_system_idle_ms = 0;
@@ -5614,6 +5668,14 @@ impl GigaMuxApp {
                 self.commit_all_slot_edits();
                 let _ = prefs::save(&self.prefs);
                 self.show_settings = false;
+            } else if !self.busy
+                && self.delete_queue.is_none()
+                && self.history_nav.is_none()
+                && !self.preview_enrich_deferred
+                && self.cache_rx.is_some()
+            {
+                // Idle Esc: stop peek/thumb enrich (chips keep); F5 resumes.
+                self.defer_preview_enrich();
             } else {
                 self.cancel_encode();
             }
@@ -8699,6 +8761,20 @@ impl GigaMuxApp {
             .changed()
         {
             let _ = prefs::save(&self.prefs);
+        }
+        if ui
+            .checkbox(
+                &mut self.prefs.skip_chunk_preview_enrich,
+                "Skip thumb/bitrate enrich for farm chunks",
+            )
+            .on_hover_text(
+                "Default on: chip farm `.cNNNofMMM` leftovers from tags only (no peek/thumb I/O). Off = enrich chunks like delivers - Esc defers peeks while idle; F5 resumes.",
+            )
+            .changed()
+        {
+            let _ = prefs::save(&self.prefs);
+            // Pref flip: re-queue so chunks start/stop enrich without a full F5 wipe.
+            self.start_preview_cache();
         }
         {
             let was = self.prefs.auto_vmaf_when_idle;
