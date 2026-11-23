@@ -262,7 +262,7 @@ pub fn ensure_out_file(
 ///
 /// Uses video-stream duration (not container/format) so A/V delivers with longer audio do not fail.
 /// When `nb_frames` is present, also rejects stale chunks whose frame count disagrees with expect×fps.
-/// Last-chunk **shortfall** (`got < expect`) is allowed when duration is already within slack: corrupt OBS HEVC tails often EOF before `-frames:v` is satisfied (garbage in). Surplus frames still fail (IVF concat).
+/// **Shortfall** (`got < expect`) for duration (last chunk) and frames (any ensure-out): corrupt OBS HEVC tails (`Invalid NAL unit size` / decode errors) often EOF early, e.g. expect 94s got 90.3s. Surplus still fails.
 pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("chunk missing: {}", path.display()));
@@ -282,11 +282,24 @@ pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
         .or_else(|| format_duration(&info))
         .ok_or_else(|| format!("chunk missing duration: {}", path.display()))?;
     let slack = CHUNK_DUR_SLACK_S.max(expect_dur_s * CHUNK_DUR_SLACK_FRAC);
+    let last_chunk = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(parse_chunk_filename)
+        .is_some_and(|(_, idx, count, _)| count > 0 && idx + 1 == count);
     if (measured - expect_dur_s).abs() > slack {
-        return Err(format!(
-            "chunk duration mismatch: expect {expect_dur_s:.3}s, got {measured:.3}s ({})",
-            path.display()
-        ));
+        // Last slice only: NAL/EOF can end seconds early; mid-chunks must stay tight.
+        if last_chunk && duration_shortfall_ok(measured, expect_dur_s, slack) {
+            eprintln!(
+                "check-chunk: last-chunk duration shortfall ok (expect {expect_dur_s:.3}s, got {measured:.3}s; likely NAL/EOF tail) ({})",
+                path.display()
+            );
+        } else {
+            return Err(format!(
+                "chunk duration mismatch: expect {expect_dur_s:.3}s, got {measured:.3}s ({})",
+                path.display()
+            ));
+        }
     }
     // Frame-accurate guard: one-frame stale IVFs pass a 50ms duration slack but break concat/remux.
     if let (Some(fps), Some(got_frames)) = (probe_video_fps(&info), stream_nb_frames(video)) {
@@ -294,15 +307,10 @@ pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
             let expect_frames = (expect_dur_s * fps).round().max(1.0) as u64;
             let delta = expect_frames.abs_diff(got_frames);
             if delta > CHUNK_FRAME_SLACK {
-                let last_chunk = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(parse_chunk_filename)
-                    .is_some_and(|(_, idx, count, _)| count > 0 && idx + 1 == count);
-                // Last slice only: shortfall matches input EOF / NAL death; never allow surplus.
-                if last_chunk && got_frames < expect_frames {
+                // Shortfall after duration OK (or last-chunk duration shortfall above) → NAL/EOF tail.
+                if frame_shortfall_ok(got_frames, expect_frames) {
                     eprintln!(
-                        "check-chunk: last-chunk shortfall ok (expect ~{expect_frames}, got {got_frames}; duration within slack) ({})",
+                        "check-chunk: frame shortfall ok (expect ~{expect_frames}, got {got_frames}; likely NAL/EOF tail) ({})",
                         path.display()
                     );
                 } else {
@@ -343,6 +351,23 @@ pub fn check_chunk_file(path: &Path, expect_dur_s: f64) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Frame shortfall: corrupt HEVC tail EOF, not surplus/wrong slice.
+fn frame_shortfall_ok(got_frames: u64, expect_frames: u64) -> bool {
+    got_frames < expect_frames
+}
+
+/// Last-chunk duration shortfall within the input-tail window (NAL death), not a truncated mid-encode.
+fn duration_shortfall_ok(measured: f64, expect_dur_s: f64, slack: f64) -> bool {
+    let short = expect_dur_s - measured;
+    if short <= 0.0 {
+        return false;
+    }
+    let max_tail = INPUT_TAIL_WINDOW_S
+        .min(expect_dur_s * 0.25)
+        .max(slack);
+    short <= max_tail
 }
 
 /// One input/output pair integrity check (same rules as directory Check).
@@ -1697,5 +1722,26 @@ frame=  10649 fps=145 q=18.0 Lsize=  1KiB\n";
         let err = check_chunk_file(&p, 1.0).unwrap_err();
         assert!(err.contains("chunk empty"), "{err}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frame_shortfall_allows_nal_eof_not_surplus() {
+        // Remux/ensure-out: −60 / −1 frames with duration OK (Invalid NAL tail).
+        assert!(frame_shortfall_ok(256795, 256855));
+        assert!(frame_shortfall_ok(458114, 458115));
+        // Surplus still rejected (wrong slice / padded IVF).
+        assert!(!frame_shortfall_ok(256856, 256855));
+        assert!(!frame_shortfall_ok(458115, 458115));
+    }
+
+    #[test]
+    fn last_chunk_duration_shortfall_matches_nal_tail() {
+        // Typical NAL/EOF tail: expect 94.017s, got 90.300s (−3.717s within input-tail window).
+        let slack = CHUNK_DUR_SLACK_S.max(94.017 * CHUNK_DUR_SLACK_FRAC);
+        assert!(duration_shortfall_ok(90.300, 94.017, slack));
+        // Surplus / wrong longer slice.
+        assert!(!duration_shortfall_ok(98.0, 94.017, slack));
+        // Truncated too hard (beyond 25% / 30s window).
+        assert!(!duration_shortfall_ok(10.0, 94.017, slack));
     }
 }
