@@ -894,10 +894,75 @@ fn build_cmd(
         );
     }
 
+    // MP4: lock CFR + fps-divisible track timescale (OBS uses time_base=1/fps; Lavf default 1/16000 makes AME/Influx warn "VFR").
+    if out_container == OutContainer::Mp4 {
+        append_mp4_cfr_timing(&mut cmd, info, true);
+    }
+
     cmd.push("-avoid_negative_ts".into());
     cmd.push("make_zero".into());
     cmd.push(output.to_string_lossy().into_owned());
     cmd
+}
+
+/// Raw ffprobe `r_frame_rate` / `avg_frame_rate` (`60/1`), if present.
+fn probe_video_fps_rate(info: &serde_json::Value) -> Option<String> {
+    let v = first_video_stream(info)?;
+    let rate = v
+        .get("r_frame_rate")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("avg_frame_rate").and_then(|x| x.as_str()))?
+        .trim();
+    if rate.is_empty() || rate == "0/0" || rate.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    Some(rate.to_string())
+}
+
+/// Reduced `num/den` from an ffprobe rate string.
+fn parse_fps_ratio(rate: &str) -> Option<(u32, u32)> {
+    let (num, den) = rate.trim().split_once('/')?;
+    let n: u32 = num.parse().ok()?;
+    let d: u32 = den.parse().ok()?;
+    if n == 0 || d == 0 {
+        return None;
+    }
+    let g = gcd_u32(n, d);
+    Some((n / g, d / g))
+}
+
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a.max(1)
+}
+
+/// MP4 `-video_track_timescale`: reduced fps numerator so 60/1 → 60 (exact 1-tick frames).
+fn video_track_timescale_for_rate(rate: &str) -> Option<u32> {
+    let (n, _) = parse_fps_ratio(rate)?;
+    Some(n)
+}
+
+/// AME-friendly MP4 timing: always set fps-divisible `-video_track_timescale`; when `reencode`, also `-fps_mode cfr -r`.
+fn append_mp4_cfr_timing(cmd: &mut Vec<String>, info: &serde_json::Value, reencode: bool) {
+    let Some(rate) = probe_video_fps_rate(info) else {
+        return;
+    };
+    let Some(ts) = video_track_timescale_for_rate(&rate) else {
+        return;
+    };
+    if reencode {
+        cmd.extend([
+            "-fps_mode".into(),
+            "cfr".into(),
+            "-r".into(),
+            rate.clone(),
+        ]);
+    }
+    cmd.extend(["-video_track_timescale".into(), ts.to_string()]);
 }
 
 /// Stamp GigaMux_* / encoder tags. MP4 needs `use_metadata_tags` or custom keys stay invisible to ffprobe (Lavf still owns `encoder`).
@@ -1844,6 +1909,10 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
     }
     // Stage container = deliver when safe (MP4 gets movflags here); MKV bridge otherwise.
     append_gigamux_metadata(&mut mux_argv, stage_container, &gigamux_meta_tags);
+    // Re-stamp fps-divisible timescale on MP4 stage mux (copy path; chunks already CFR-encoded).
+    if stage_container == OutContainer::Mp4 {
+        append_mp4_cfr_timing(&mut mux_argv, &info, false);
+    }
     mux_argv.push(vmux_path.to_string_lossy().into_owned());
 
     // Separate Flamenco remux task: promote (rename) when stage==deliver, else `-c copy` bridge.
@@ -1867,6 +1936,9 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
             remux.extend(["-bsf:a".into(), "setts=ts=TS-STARTPTS".into()]);
         }
         append_gigamux_metadata(&mut remux, container, &gigamux_meta_tags);
+        if container == OutContainer::Mp4 {
+            append_mp4_cfr_timing(&mut remux, &info, false);
+        }
         remux.push(final_output.to_string_lossy().into_owned());
         remux
     } else {
@@ -2651,6 +2723,23 @@ mod tests {
             None,
             false,
         )
+    }
+
+    #[test]
+    fn opaque_mp4_locks_cfr_and_track_timescale() {
+        // 60/1 → -r 60/1 and timescale 60 (AME-friendly; avoids Lavf 1/16000 jitter).
+        let info = stub_hevc_aac_info(serde_json::json!({
+            "major_brand": "isom",
+            "compatible_brands": "isomiso2mp41",
+        }));
+        let argv = opaque_hevc_argv(&info);
+        assert!(argv.windows(2).any(|w| w[0] == "-fps_mode" && w[1] == "cfr"));
+        assert!(argv.windows(2).any(|w| w[0] == "-r" && w[1] == "60/1"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-video_track_timescale" && w[1] == "60"));
+        assert_eq!(video_track_timescale_for_rate("30000/1001"), Some(30000));
+        assert_eq!(video_track_timescale_for_rate("60/1"), Some(60));
     }
 
     #[test]
