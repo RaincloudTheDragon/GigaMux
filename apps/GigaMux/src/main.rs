@@ -2914,6 +2914,7 @@ impl GigaMuxApp {
             for &b in &TestBatch::ALL {
                 self.prefs.slot_mut(b).maxrate_override_k = d.slot(b).maxrate_override_k;
                 self.prefs.slot_mut(b).cq_override = d.slot(b).cq_override;
+                self.prefs.slot_mut(b).no_b_frames = d.slot(b).no_b_frames;
             }
             self.maxrate_override_edit = Default::default();
             self.cq_override_edit = Default::default();
@@ -6922,7 +6923,7 @@ impl GigaMuxApp {
         ui.horizontal(|ui| {
             self.ui_use_hardware_checkbox(ui, batch, |s| s.save_targets());
             self.ui_maxrate_override(ui, batch);
-            // CQ stays prefs-only (advanced); not exposed in the shell UI.
+            // CQ / no_b_frames stay prefs-only (advanced); not exposed in the shell UI.
         });
         self.ui_slot_gpu_picker(ui, batch);
         if let Some(warn) = self.chroma_convert_warning_for(batch) {
@@ -8576,7 +8577,7 @@ impl GigaMuxApp {
     }
 
     /// Encode tab: hardware, GPU, maxrate, peak ceiling (active test slots when test mode).
-    /// CQ is prefs-only (advanced); not shown here.
+    /// CQ / no_b_frames are prefs-only (advanced); not shown here.
     fn ui_settings_encode(&mut self, ui: &mut egui::Ui) {
         if self.prefs.test_mode {
             let batches: Vec<TestBatch> = self.prefs.active_batches().to_vec();

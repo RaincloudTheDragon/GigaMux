@@ -639,6 +639,19 @@ fn append_nvenc_profile(cmd: &mut Vec<String>, opaque: OpaqueVideo, pix: &str) {
     }
 }
 
+/// Disable B-frames on opaque HEVC/H.264/AV1 paths (AME/Influx-friendly; skips edit-list delay).
+fn append_no_b_frames(cmd: &mut Vec<String>, opaque_video: OpaqueVideo, use_nvenc: bool, has_alpha: bool) {
+    // libvpx / α / QSV-VP9 do not use the HEVC-style B-frame + elst packing Influx warns about.
+    if has_alpha || opaque_video.is_libvpx() {
+        return;
+    }
+    cmd.extend(["-bf".into(), "0".into()]);
+    // NVENC H.264/HEVC: also kill B-refs so the bitstream stays I/P-only.
+    if use_nvenc && matches!(opaque_video, OpaqueVideo::Hevc | OpaqueVideo::H264) {
+        cmd.extend(["-b_ref_mode".into(), "disabled".into()]);
+    }
+}
+
 fn build_cmd(
     input: &Path,
     output: &Path,
@@ -659,6 +672,7 @@ fn build_cmd(
     hw_meta: Option<String>,
     // Flamenco deliver: stamp `GigaMux[flam]` / `GigaMux_farm=1`.
     farm_meta: bool,
+    no_b_frames: bool,
 ) -> Vec<String> {
     let ceiling = format!("{bitrate_k}k");
     let bufsize = format!("{}k", bitrate_k * 2);
@@ -897,6 +911,10 @@ fn build_cmd(
     // MP4: lock CFR + fps-divisible track timescale (OBS uses time_base=1/fps; Lavf default 1/16000 makes AME/Influx warn "VFR").
     if out_container == OutContainer::Mp4 {
         append_mp4_cfr_timing(&mut cmd, info, true);
+    }
+
+    if no_b_frames {
+        append_no_b_frames(&mut cmd, opaque_video, use_nvenc, has_alpha);
     }
 
     cmd.push("-avoid_negative_ts".into());
@@ -1437,8 +1455,9 @@ pub fn run_batch(
         } else {
             format!("[{pass_label}] ")
         };
+        let bf_tag = if slot.no_b_frames { ", bf=0" } else { "" };
         on_event(EncodeEvent::Log(format!(
-            "{pass_tag}{name}: {path_label} → {out_name}, {bitrate_k}k ({src_label}), cq={cq}, {device}",
+            "{pass_tag}{name}: {path_label} → {out_name}, {bitrate_k}k ({src_label}), cq={cq}{bf_tag}, {device}",
         )));
 
         // Live preview: grab source frames at out-time on a side thread (throttled).
@@ -1518,6 +1537,7 @@ pub fn run_batch(
                         None,
                         None,
                         false,
+                        slot.no_b_frames,
                     );
                     run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
                 }
@@ -1554,6 +1574,7 @@ pub fn run_batch(
                 None,
                 hw_meta,
                 false,
+                slot.no_b_frames,
             );
             run_ffmpeg(&argv, &cancel, &mut on_ffmpeg_line)
         };
@@ -1666,6 +1687,7 @@ pub fn build_farm_ffmpeg_argv(req: &FarmEncodeRequest) -> Result<FarmFfmpegComma
         None,
         hw_meta,
         true,
+        req.slot.no_b_frames,
     );
     farm_argv_never_overwrite(&mut argv);
     Ok(FarmFfmpegCommand {
@@ -1778,6 +1800,7 @@ pub fn build_farm_chunked_job(req: &FarmEncodeRequest) -> Result<FarmChunkedJob,
             }),
             None,
             true,
+            req.slot.no_b_frames,
         );
         // Submitted as `-n`; `gigamux-check ensure-chunk` only forces `-y` when re-encoding a bad/missing file.
         farm_argv_never_overwrite(&mut argv);
@@ -2704,6 +2727,10 @@ mod tests {
     }
 
     fn opaque_hevc_argv(info: &serde_json::Value) -> Vec<String> {
+        opaque_hevc_argv_opts(info, false)
+    }
+
+    fn opaque_hevc_argv_opts(info: &serde_json::Value, no_b_frames: bool) -> Vec<String> {
         build_cmd(
             Path::new("/tmp/in.mp4"),
             Path::new("/tmp/out.mp4"),
@@ -2722,6 +2749,7 @@ mod tests {
             None,
             None,
             false,
+            no_b_frames,
         )
     }
 
@@ -2740,6 +2768,21 @@ mod tests {
             .any(|w| w[0] == "-video_track_timescale" && w[1] == "60"));
         assert_eq!(video_track_timescale_for_rate("30000/1001"), Some(30000));
         assert_eq!(video_track_timescale_for_rate("60/1"), Some(60));
+        // Default keeps encoder B-frames.
+        assert!(!argv.windows(2).any(|w| w[0] == "-bf" && w[1] == "0"));
+    }
+
+    #[test]
+    fn opaque_hevc_no_b_frames_sets_bf_and_b_ref_mode() {
+        let info = stub_hevc_aac_info(serde_json::json!({
+            "major_brand": "isom",
+            "compatible_brands": "isomiso2mp41",
+        }));
+        let argv = opaque_hevc_argv_opts(&info, true);
+        assert!(argv.windows(2).any(|w| w[0] == "-bf" && w[1] == "0"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-b_ref_mode" && w[1] == "disabled"));
     }
 
     #[test]

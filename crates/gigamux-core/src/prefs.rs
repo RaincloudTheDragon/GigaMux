@@ -38,6 +38,9 @@ pub struct EncodeSlot {
     /// When set, replaces default CQ0/CRF0 (`-cq` / `-crf`). Scales differ by codec — not cross-calibrated.
     #[serde(default)]
     pub cq_override: Option<u32>,
+    /// Prefs-only (advanced): force `-bf 0` (+ NVENC `-b_ref_mode disabled`) so MP4s skip B-frame edit-list delay that AME/Influx flags as VFR. Default on.
+    #[serde(default = "default_true")]
+    pub no_b_frames: bool,
     #[serde(default)]
     pub opaque_video: OpaqueVideo,
     #[serde(default)]
@@ -56,6 +59,7 @@ impl Default for EncodeSlot {
             nvenc_gen: None,
             maxrate_override_k: None,
             cq_override: None,
+            no_b_frames: true,
             opaque_video: OpaqueVideo::Av1,
             opaque_container: OutContainer::Mp4,
             alpha_video: AlphaVideo::Vp9,
