@@ -680,6 +680,19 @@ const DELETE_UNDO_CAP: usize = 50;
 /// Pointer travel before a press becomes a marquee instead of a click.
 const BOX_SELECT_SLOP: f32 = 5.0;
 
+/// True when `pos` is over egui’s vertical scrollbar hit strip for a [`ScrollArea`] whose outer rect is `outer`.
+/// Floating bars overlay the content, so marquee must ignore this strip or a bar drag also starts a selection.
+fn pointer_on_v_scroll_bar(ui: &egui::Ui, outer: egui::Rect, pos: egui::Pos2) -> bool {
+    let scroll = ui.spacing().scroll;
+    // Match egui’s bar sense width (`bar_width`), not the thin idle floating stroke.
+    let w = scroll.bar_width + scroll.bar_outer_margin;
+    let strip = egui::Rect::from_x_y_ranges(
+        egui::Rangef::new(outer.max.x - w, outer.max.x),
+        outer.y_range(),
+    );
+    strip.contains(pos)
+}
+
 /// In-progress drag rectangle for multi-select in a folder list.
 struct BoxSelect {
     side: FileSide,
@@ -7411,6 +7424,8 @@ impl GigaMuxApp {
         id_salt: &str,
     ) {
         // Wheel scrolls; primary-drag is marquee (ScrollSource drag defaults to touch-only).
+        // Capture outer rect before show; floating scrollbars overlay this and must not start a marquee.
+        let scroll_outer = ui.available_rect_before_wrap();
         egui::ScrollArea::vertical()
             .id_salt(id_salt)
             .auto_shrink([false, false])
@@ -7795,25 +7810,34 @@ impl GigaMuxApp {
                     )
                 });
 
-                // Begin marquee on primary press inside this list only.
+                // Begin marquee on primary press inside this list only (not on the scrollbar).
                 if pressed {
                     if let Some(pos) = pointer.filter(|p| list_rect.contains(*p)) {
-                        let on_row = row_rects.iter().any(|(_, r)| r.contains(pos));
-                        let baseline = if additive {
-                            self.selected.clone()
+                        if pointer_on_v_scroll_bar(ui, scroll_outer, pos) {
+                            // Bar drag owns the gesture; drop any stale press tracking for this list.
+                            if self.box_select.as_ref().is_some_and(|b| {
+                                b.side == side && b.list_id == id_salt && !b.active
+                            }) {
+                                self.box_select = None;
+                            }
                         } else {
-                            HashSet::new()
-                        };
-                        self.box_select = Some(BoxSelect {
-                            side,
-                            list_id: id_salt.to_string(),
-                            origin: pos,
-                            current: pos,
-                            additive,
-                            baseline,
-                            active: false,
-                            started_on_row: on_row,
-                        });
+                            let on_row = row_rects.iter().any(|(_, r)| r.contains(pos));
+                            let baseline = if additive {
+                                self.selected.clone()
+                            } else {
+                                HashSet::new()
+                            };
+                            self.box_select = Some(BoxSelect {
+                                side,
+                                list_id: id_salt.to_string(),
+                                origin: pos,
+                                current: pos,
+                                additive,
+                                baseline,
+                                active: false,
+                                started_on_row: on_row,
+                            });
+                        }
                     }
                 }
 
